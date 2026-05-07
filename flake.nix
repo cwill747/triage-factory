@@ -51,7 +51,7 @@
       in
       {
         packages.default = pkgs.buildGoModule {
-          pname = "triage-factory";
+          pname = "triagefactory";
           version = (builtins.fromJSON (builtins.readFile ./.github/release-please-manifest.json)).".";
           inherit src;
           vendorHash = "sha256-lYYe5UaP1ohDK8hXLZFIpxksa9liVr76Yt0xOjwt884=";
@@ -77,9 +77,13 @@
             cp -r ${frontend}/* frontend/dist/
           '';
 
+          postInstall = ''
+            mv $out/bin/triage-factory $out/bin/triagefactory
+          '';
+
           meta = {
             description = "AI-powered issue triage";
-            mainProgram = "triage-factory";
+            mainProgram = "triagefactory";
           };
         };
 
