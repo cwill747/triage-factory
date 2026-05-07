@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/chain"
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/gh"
 	jiraexec "github.com/sky-ai-eng/triage-factory/cmd/exec/jira"
 	"github.com/sky-ai-eng/triage-factory/cmd/exec/workspace"
@@ -92,6 +93,12 @@ func Handle(args []string) {
 		// validated inside the subcommand.
 		workspace.Handle(database, cmdArgs)
 
+	case "chain":
+		// No credentials needed — chain verdict only writes a row in
+		// run_artifacts keyed by TRIAGE_FACTORY_RUN_ID. The orchestrator
+		// reads it back to decide whether to proceed.
+		chain.Handle(database, cmdArgs)
+
 	default:
 		fmt.Fprintf(os.Stderr, "unknown exec command: %s\nRun 'triagefactory exec --help' for usage.\n", cmd)
 		os.Exit(1)
@@ -108,5 +115,5 @@ func isHelp(args []string) bool {
 }
 
 func printHelp() {
-	fmt.Printf("Usage: triagefactory exec <command> [args]\n\n%s\n\n%s\n\n%s\n\nCommands print their result to stdout on success and errors to stderr. Most commands print JSON; workspace add prints a raw path.\n", gh.HelpText, jiraexec.HelpText, workspace.HelpText)
+	fmt.Printf("Usage: triagefactory exec <command> [args]\n\n%s\n\n%s\n\n%s\n\n%s\n\nCommands print their result to stdout on success and errors to stderr. Most commands print JSON; workspace add prints a raw path.\n", gh.HelpText, jiraexec.HelpText, workspace.HelpText, chain.HelpText)
 }

@@ -53,6 +53,7 @@ func (s *Server) handlePromptGet(w http.ResponseWriter, r *http.Request) {
 type createPromptRequest struct {
 	Name string `json:"name"`
 	Body string `json:"body"`
+	Kind string `json:"kind"`
 }
 
 func (s *Server) handlePromptCreate(w http.ResponseWriter, r *http.Request) {
@@ -61,8 +62,16 @@ func (s *Server) handlePromptCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	if req.Name == "" || req.Body == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and body are required"})
+	kind := normalizePromptKind(req.Kind)
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	// Leaf prompts must carry a body (the mission). Chain prompts may
+	// store a description in body or leave it empty — the steps are
+	// the real definition and live in prompt_chain_steps.
+	if kind == domain.PromptKindLeaf && req.Body == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body is required for leaf prompts"})
 		return
 	}
 
@@ -72,6 +81,7 @@ func (s *Server) handlePromptCreate(w http.ResponseWriter, r *http.Request) {
 		Name:   req.Name,
 		Body:   req.Body,
 		Source: "user",
+		Kind:   kind,
 	}
 
 	if err := s.prompts.Create(r.Context(), runmode.LocalDefaultOrg, prompt); err != nil {
@@ -86,6 +96,7 @@ func (s *Server) handlePromptCreate(w http.ResponseWriter, r *http.Request) {
 type updatePromptRequest struct {
 	Name string `json:"name"`
 	Body string `json:"body"`
+	Kind string `json:"kind"`
 }
 
 func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
@@ -96,18 +107,34 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	if req.Name == "" || req.Body == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and body are required"})
+	kind := normalizePromptKind(req.Kind)
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	if kind == domain.PromptKindLeaf && req.Body == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "body is required for leaf prompts"})
 		return
 	}
 
-	if err := s.prompts.Update(r.Context(), runmode.LocalDefaultOrg, id, req.Name, req.Body); err != nil {
+	if err := s.prompts.Update(r.Context(), runmode.LocalDefaultOrg, id, req.Name, req.Body, kind); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
 	updated, _ := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, id)
 	writeJSON(w, http.StatusOK, updated)
+}
+
+// normalizePromptKind defaults to leaf for blank or unknown values so
+// legacy clients that don't send `kind` keep working.
+func normalizePromptKind(k string) string {
+	switch k {
+	case domain.PromptKindChain:
+		return domain.PromptKindChain
+	default:
+		return domain.PromptKindLeaf
+	}
 }
 
 func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +159,21 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 	if len(triggers) > 0 {
 		writeJSON(w, http.StatusConflict, map[string]string{
 			"error": "This prompt is used by an auto-delegation trigger. Remove the trigger first.",
+		})
+		return
+	}
+
+	// Block deletion if this prompt is a step inside any chain. The FK
+	// is ON DELETE RESTRICT so the underlying constraint would fire
+	// anyway; we surface a friendlier message and the count of chains.
+	chainRefs, err := db.CountChainStepReferences(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if chainRefs > 0 {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "This prompt is used as a step in one or more chains. Remove it from those chains first.",
 		})
 		return
 	}

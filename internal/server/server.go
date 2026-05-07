@@ -212,6 +212,9 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/prompts/{id}", s.handlePromptPut)
 	s.mux.HandleFunc("DELETE /api/prompts/{id}", s.handlePromptDelete)
 	s.mux.HandleFunc("GET /api/prompts/{id}/stats", s.handlePromptStats)
+	s.mux.HandleFunc("GET /api/prompts/{id}/chain-steps", s.handleChainStepsGet)
+	s.mux.HandleFunc("PUT /api/prompts/{id}/chain-steps", s.handleChainStepsPut)
+	s.mux.HandleFunc("GET /api/chain-runs/{id}", s.handleChainRunGet)
 
 	// Frontend: serve embedded SPA, with fallback to index.html for client-side routing
 	s.mux.HandleFunc("/", s.handleFrontend)

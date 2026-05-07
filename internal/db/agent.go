@@ -16,10 +16,15 @@ func CreateAgentRun(database *sql.DB, run domain.AgentRun) error {
 	if triggerType == "" {
 		triggerType = "manual"
 	}
+	var stepIdx interface{}
+	if run.ChainStepIndex != nil {
+		stepIdx = *run.ChainStepIndex
+	}
 	_, err := database.Exec(`
-		INSERT INTO runs (id, task_id, prompt_id, status, model, worktree_path, trigger_type, trigger_id)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, run.ID, run.TaskID, nullIfEmpty(run.PromptID), run.Status, run.Model, run.WorktreePath, triggerType, nullIfEmpty(run.TriggerID))
+		INSERT INTO runs (id, task_id, prompt_id, status, model, worktree_path, trigger_type, trigger_id, chain_run_id, chain_step_index)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, run.ID, run.TaskID, nullIfEmpty(run.PromptID), run.Status, run.Model, run.WorktreePath,
+		triggerType, nullIfEmpty(run.TriggerID), nullIfEmpty(run.ChainRunID), stepIdx)
 	return err
 }
 
@@ -129,7 +134,7 @@ func GetAgentRun(database *sql.DB, runID string) (*domain.AgentRun, error) {
 	row := database.QueryRow(`
 		SELECT r.id, r.task_id, r.status, r.model, r.started_at, r.completed_at,
 		       r.total_cost_usd, r.duration_ms, r.num_turns, r.stop_reason, r.worktree_path,
-		       r.result_summary, r.session_id,
+		       r.result_summary, r.session_id, r.chain_run_id, r.chain_step_index,
 		       (NULLIF(TRIM(rm.agent_content, ' ' || char(9) || char(10) || char(13)), '') IS NULL) AS memory_missing
 		FROM runs r
 		LEFT JOIN run_memory rm ON rm.run_id = r.id
@@ -139,12 +144,12 @@ func GetAgentRun(database *sql.DB, runID string) (*domain.AgentRun, error) {
 	var r domain.AgentRun
 	var completedAt sql.NullTime
 	var costUSD sql.NullFloat64
-	var durationMs, numTurns sql.NullInt64
-	var stopReason, worktreePath, model, resultSummary, sessionID sql.NullString
+	var durationMs, numTurns, chainStep sql.NullInt64
+	var stopReason, worktreePath, model, resultSummary, sessionID, chainRunID sql.NullString
 
 	err := row.Scan(&r.ID, &r.TaskID, &r.Status, &model, &r.StartedAt, &completedAt,
 		&costUSD, &durationMs, &numTurns, &stopReason, &worktreePath,
-		&resultSummary, &sessionID, &r.MemoryMissing)
+		&resultSummary, &sessionID, &chainRunID, &chainStep, &r.MemoryMissing)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -157,6 +162,13 @@ func GetAgentRun(database *sql.DB, runID string) (*domain.AgentRun, error) {
 	r.WorktreePath = worktreePath.String
 	r.ResultSummary = resultSummary.String
 	r.SessionID = sessionID.String
+	if chainRunID.Valid {
+		r.ChainRunID = chainRunID.String
+	}
+	if chainStep.Valid {
+		v := int(chainStep.Int64)
+		r.ChainStepIndex = &v
+	}
 	if completedAt.Valid {
 		r.CompletedAt = &completedAt.Time
 	}

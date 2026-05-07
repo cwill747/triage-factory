@@ -11,6 +11,7 @@ type Prompt struct {
 	Name         string    `json:"name"`
 	Body         string    `json:"body"`
 	Source       string    `json:"source"`        // "system", "user", "imported"
+	Kind         string    `json:"kind"`          // PromptKindLeaf | PromptKindChain (defaults to "leaf")
 	AllowedTools string    `json:"allowed_tools"` // comma-separated extra tools parsed from SKILL.md/agent frontmatter
 	UsageCount   int       `json:"usage_count"`   // how many agent runs have used this prompt
 	CreatedAt    time.Time `json:"created_at"`

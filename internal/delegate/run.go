@@ -37,6 +37,9 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 				// dir is gone.
 				return
 			}
+			if cfg.isChainStep {
+				return
+			}
 			// Capture the RemoveAt error rather than discarding it.
 			// If the worktree dir failed to remove, the worktree is
 			// still on disk and still attached to the bare's branch
@@ -66,6 +69,9 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 		// the gate is defensive rather than load-bearing.
 		defer func() {
 			if s.wasTakenOver(runID) {
+				return
+			}
+			if cfg.isChainStep {
 				return
 			}
 			rows, err := db.GetRunWorktrees(s.database, runID)
@@ -101,6 +107,9 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 	// is the conversation state the resumed `claude --resume` reads.
 	defer func() {
 		if s.wasTakenOver(runID) {
+			return
+		}
+		if cfg.isChainStep {
 			return
 		}
 		worktree.RemoveClaudeProjectDir(claudeCwd)
@@ -171,6 +180,7 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 		MaxTurns:     100,
 		ExtraEnv:     extraEnv,
 		TraceID:      runID,
+		SystemPrompt: cfg.appendSysPrompt,
 	}, newRunSink(s, runID))
 
 	// If Takeover() flipped the takenOver flag while we were streaming,

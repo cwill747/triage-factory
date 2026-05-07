@@ -63,10 +63,10 @@ type PromptStore interface {
 	// Caller-provided ID — the handler generates UUIDs upstream.
 	Create(ctx context.Context, orgID string, p domain.Prompt) error
 
-	// Update changes name + body and stamps user_modified=true. The
+	// Update changes name + body + kind and stamps user_modified=true. The
 	// flag tells SeedOrUpdate to leave the row alone on subsequent
-	// shipped-content updates.
-	Update(ctx context.Context, orgID string, id, name, body string) error
+	// shipped-content updates. kind is normalized to "leaf" when blank.
+	Update(ctx context.Context, orgID string, id, name, body, kind string) error
 
 	// UpdateImported updates a re-imported skill's metadata + body
 	// + allowed_tools WITHOUT setting user_modified, because the

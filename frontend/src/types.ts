@@ -149,14 +149,46 @@ export interface DomainEvent {
   created_at?: string
 }
 
+export type PromptKind = 'leaf' | 'chain'
+
 export interface Prompt {
   id: string
   name: string
   body: string
   source: string
+  kind: PromptKind
   usage_count: number
   created_at: string
   updated_at: string
+}
+
+export interface ChainStep {
+  chain_prompt_id: string
+  step_index: number
+  step_prompt_id: string
+  brief: string
+  created_at: string
+}
+
+export interface ChainVerdict {
+  proceed: boolean
+  reason: string
+  notes?: string
+  synthetic?: boolean
+}
+
+export interface ChainRun {
+  id: string
+  chain_prompt_id: string
+  task_id: string
+  trigger_type: string
+  trigger_id?: string
+  status: 'running' | 'completed' | 'aborted' | 'failed' | 'cancelled'
+  abort_reason?: string
+  aborted_at_step?: number
+  worktree_path: string
+  started_at: string
+  completed_at?: string
 }
 
 export interface EventType {
