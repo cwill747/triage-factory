@@ -49,6 +49,8 @@ export interface AgentRun {
   // PendingPROverlay (title/body editor + Open-PR button). Empty /
   // undefined for non-pending runs.
   pending_kind?: 'review' | 'pr'
+  ChainRunID?: string
+  ChainStepIndex?: number | null
 }
 
 export interface HeldTakeover {

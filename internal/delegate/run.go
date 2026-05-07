@@ -7,6 +7,7 @@ package delegate
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"log"
@@ -331,8 +332,37 @@ func (s *Spawner) processCompletion(
 	}
 
 	if status == "completed" {
-		if _, err := s.database.Exec(`UPDATE tasks SET status = 'done' WHERE id = ?`, task.ID); err != nil {
-			log.Printf("[delegate] warning: failed to update task %s to done: %v", task.ID, err)
+		// Two guards prevent a stale completion from flipping the task:
+		//
+		// 1. Chain step: the chain orchestrator owns task lifecycle —
+		//    individual step completions must not close the task.
+		//
+		// 2. Re-delegation race: a newer run already exists on this task
+		//    (the user re-delegated while this run was in flight). The
+		//    newer run's CreateAgentRun row is already in the DB by the
+		//    time the old run reaches processCompletion, so the EXISTS
+		//    check is deterministic. Chain step runs are excluded from
+		//    the active-run check because the chain orchestrator creates
+		//    them sequentially (step N+1's row doesn't exist yet when
+		//    step N completes).
+		var chainRunID sql.NullString
+		_ = s.database.QueryRow(`SELECT chain_run_id FROM runs WHERE id = ?`, runID).Scan(&chainRunID)
+		if chainRunID.Valid {
+			// Chain step — skip; terminateChain handles task closure.
+		} else {
+			var hasOtherActiveRun bool
+			_ = s.database.QueryRow(`
+				SELECT EXISTS(
+					SELECT 1 FROM runs
+					WHERE task_id = ? AND id != ?
+					AND status NOT IN ('completed','failed','cancelled','task_unsolvable','taken_over','pending_approval')
+				)
+			`, task.ID, runID).Scan(&hasOtherActiveRun)
+			if !hasOtherActiveRun {
+				if _, err := s.database.Exec(`UPDATE tasks SET status = 'done' WHERE id = ?`, task.ID); err != nil {
+					log.Printf("[delegate] warning: failed to update task %s to done: %v", task.ID, err)
+				}
+			}
 		}
 	}
 	s.broadcastRunUpdate(runID, status)

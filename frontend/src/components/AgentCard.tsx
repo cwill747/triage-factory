@@ -9,12 +9,13 @@ import YieldModal, { type YieldRequest } from './YieldModal'
 interface Props {
   task: Task
   run: AgentRun
+  chainSteps?: AgentRun[]
   messages: AgentMessage[]
   onRequeue?: () => void
   onReview?: () => void
 }
 
-export default function AgentCard({ task, run, messages, onRequeue, onReview }: Props) {
+export default function AgentCard({ task, run, chainSteps, messages, onRequeue, onReview }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const [now, setNow] = useState(() => Date.now())
   const [takeoverInfo, setTakeoverInfo] = useState<TakeoverInfo | null>(null)
@@ -230,6 +231,55 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
           <span className="truncate">{task.source_id}</span>
         </div>
       </div>
+
+      {/* Chain step progress */}
+      {chainSteps && chainSteps.length > 1 && (
+        <div className="mx-5 mb-3">
+          <div className="flex items-center gap-1">
+            {chainSteps.map((step, i) => {
+              const isStepActive = [
+                'cloning',
+                'fetching',
+                'worktree_created',
+                'agent_starting',
+                'running',
+                'initializing',
+              ].includes(step.Status)
+              const isStepDone = step.Status === 'completed'
+              const isStepFailed = ['failed', 'cancelled', 'task_unsolvable'].includes(step.Status)
+              const isStepCurrent = step.ID === run.ID
+              return (
+                <div key={step.ID} className="flex items-center gap-1 flex-1 min-w-0">
+                  {i > 0 && (
+                    <div
+                      className={`h-px flex-shrink-0 w-2 ${isStepDone || isStepActive ? 'bg-accent/40' : isStepFailed ? 'bg-dismiss/40' : 'bg-border-subtle'}`}
+                    />
+                  )}
+                  <div
+                    className={`flex items-center justify-center rounded-full text-[9px] font-bold leading-none transition-all ${
+                      isStepCurrent ? 'w-5 h-5 ring-1 ring-accent/30' : 'w-4 h-4'
+                    } ${
+                      isStepDone
+                        ? 'bg-claim/15 text-claim'
+                        : isStepActive
+                          ? 'bg-delegate/15 text-delegate'
+                          : isStepFailed
+                            ? 'bg-dismiss/15 text-dismiss'
+                            : 'bg-black/[0.04] text-text-tertiary'
+                    }`}
+                    title={`Step ${i + 1}: ${formatStatus(step.Status)}`}
+                  >
+                    {isStepDone ? '✓' : isStepFailed ? '✗' : i + 1}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+          <div className="mt-1 text-[10px] text-text-tertiary">
+            Step {(run.ChainStepIndex ?? 0) + 1} of {chainSteps.length}
+          </div>
+        </div>
+      )}
 
       {/* Activity log + optional pending-takeover overlay */}
       <div className="relative mx-3 mb-3">

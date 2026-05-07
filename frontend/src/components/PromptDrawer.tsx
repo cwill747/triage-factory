@@ -403,19 +403,13 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
                 </div>
               )}
 
-              {kind === 'chain' && !isNew && promptId && (
+              {kind === 'chain' && (
                 <ChainStepEditor
-                  chainPromptId={promptId}
+                  chainPromptId={promptId ?? ''}
                   steps={chainDraft}
                   onChange={setChainDraft}
                   busy={saving}
                 />
-              )}
-
-              {kind === 'chain' && (isNew || !promptId) && (
-                <div className="text-[12px] text-text-tertiary border border-dashed border-border-subtle rounded-lg px-3 py-4">
-                  Save the chain prompt first; you can add steps once it has an id.
-                </div>
               )}
 
               {/* Template variables reference — leaf prompts only.

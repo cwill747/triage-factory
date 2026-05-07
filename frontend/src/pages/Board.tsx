@@ -41,6 +41,7 @@ export default function Board() {
   // Agent run state
   const [agentRuns, setAgentRuns] = useState<Record<string, AgentRun>>({})
   const [agentMessages, setAgentMessages] = useState<Record<string, AgentMessage[]>>({})
+  const [chainStepRuns, setChainStepRuns] = useState<Record<string, AgentRun[]>>({})
 
   // Sidebar state
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -90,11 +91,39 @@ export default function Board() {
           const runs: AgentRun[] = await runsRes.json()
           if (runs.length > 0) {
             const latestRun = runs[0]
-            setAgentRuns((prev) => ({ ...prev, [task.id]: latestRun }))
-            const msgsRes = await fetch(`/api/agent/runs/${latestRun.ID}/messages`)
-            if (!msgsRes.ok) continue
-            const msgs: AgentMessage[] = await msgsRes.json()
-            setAgentMessages((prev) => ({ ...prev, [latestRun.ID]: msgs }))
+
+            // Chain runs: collect all step runs and use the active step
+            // (or the latest) as the "main" run for the AgentCard.
+            const chainRunID = latestRun.ChainRunID
+            if (chainRunID) {
+              const stepRuns = runs
+                .filter((r) => r.ChainRunID === chainRunID)
+                .sort((a, b) => (a.ChainStepIndex ?? 0) - (b.ChainStepIndex ?? 0))
+              setChainStepRuns((prev) => ({ ...prev, [task.id]: stepRuns }))
+              const activeStep =
+                stepRuns.find((r) =>
+                  [
+                    'running',
+                    'cloning',
+                    'fetching',
+                    'worktree_created',
+                    'agent_starting',
+                    'initializing',
+                  ].includes(r.Status),
+                ) ?? stepRuns[stepRuns.length - 1]
+              setAgentRuns((prev) => ({ ...prev, [task.id]: activeStep }))
+              const msgsRes = await fetch(`/api/agent/runs/${activeStep.ID}/messages`)
+              if (msgsRes.ok) {
+                const msgs: AgentMessage[] = await msgsRes.json()
+                setAgentMessages((prev) => ({ ...prev, [activeStep.ID]: msgs }))
+              }
+            } else {
+              setAgentRuns((prev) => ({ ...prev, [task.id]: latestRun }))
+              const msgsRes = await fetch(`/api/agent/runs/${latestRun.ID}/messages`)
+              if (!msgsRes.ok) continue
+              const msgs: AgentMessage[] = await msgsRes.json()
+              setAgentMessages((prev) => ({ ...prev, [latestRun.ID]: msgs }))
+            }
           }
         } catch {
           // Individual agent run fetch failed — skip
@@ -116,10 +145,12 @@ export default function Board() {
       (event: WSEvent) => {
         if (event.type === 'agent_run_update') {
           // Optimistic status update for an already-tracked run.
+          let matched = false
           setAgentRuns((prev) => {
             const updated = { ...prev }
             for (const [taskId, run] of Object.entries(updated)) {
               if (run.ID === event.run_id) {
+                matched = true
                 updated[taskId] = { ...run, Status: event.data.status }
                 break
               }
@@ -149,6 +180,21 @@ export default function Board() {
               })
             })
             .catch(() => {})
+
+          // Chain step run that isn't the active step: a new step
+          // just started or a prior step changed. Refetch to pick up
+          // the new active step.
+          if (!matched) {
+            setChainStepRuns((prev) => {
+              for (const steps of Object.values(prev)) {
+                if (steps.some((r) => r.ChainRunID && r.ID === event.run_id)) {
+                  fetchTasks()
+                  break
+                }
+              }
+              return prev
+            })
+          }
           // 'cancelled' triggers a task refetch so the
           // pending_approval-cleanup broadcast (SKY-206) collapses
           // the AgentCard and swaps in the queued SortableTaskCard
@@ -674,6 +720,7 @@ export default function Board() {
                       key={task.id}
                       task={task}
                       run={agentRuns[task.id]}
+                      chainSteps={chainStepRuns[task.id]}
                       messages={agentMessages[agentRuns[task.id].ID] || []}
                       onRequeue={() => handleRequeue(task.id)}
                       onReview={() => {
@@ -714,6 +761,7 @@ export default function Board() {
                       key={task.id}
                       task={task}
                       run={agentRuns[task.id]}
+                      chainSteps={chainStepRuns[task.id]}
                       messages={agentMessages[agentRuns[task.id].ID] || []}
                       onRequeue={() => handleRequeue(task.id)}
                       onReview={() => {
@@ -751,6 +799,7 @@ export default function Board() {
                       key={task.id}
                       task={task}
                       run={agentRuns[task.id]}
+                      chainSteps={chainStepRuns[task.id]}
                       messages={agentMessages[agentRuns[task.id].ID] || []}
                       onRequeue={() => handleRequeue(task.id)}
                       onReview={() => {
@@ -894,12 +943,14 @@ const draggableRunStatuses = new Set([
 function SortableAgentCard({
   task,
   run,
+  chainSteps,
   messages,
   onRequeue,
   onReview,
 }: {
   task: Task
   run: AgentRun
+  chainSteps?: AgentRun[]
   messages: AgentMessage[]
   onRequeue?: () => void
   onReview?: () => void
@@ -917,11 +968,6 @@ function SortableAgentCard({
     cursor: draggable ? 'grab' : undefined,
   }
 
-  // Spread listeners on the outer wrapper so the whole card surface is
-  // a drag handle — except buttons inside, which @dnd-kit's pointer
-  // sensor leaves alone via its 5px activation distance (a click stays
-  // a click). Active-state cards skip this entirely so the Cancel and
-  // Take over buttons keep their normal hover/click semantics.
   return (
     <div
       ref={setNodeRef}
@@ -932,6 +978,7 @@ function SortableAgentCard({
       <AgentCard
         task={task}
         run={run}
+        chainSteps={chainSteps}
         messages={messages}
         onRequeue={onRequeue}
         onReview={onReview}

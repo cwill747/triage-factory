@@ -242,6 +242,7 @@ func (s *Spawner) runChain(
 			TriggerType:    triggerType,
 			ChainRunID:     chainRunID,
 			ChainStepIndex: &stepIdxCopy,
+			WorktreePath:   cfg.wtPath,
 		}); err != nil {
 			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusFailed,
 				fmt.Sprintf("create step %d run: %s", i, err.Error()), &step.StepIndex, false)
