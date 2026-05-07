@@ -1,6 +1,9 @@
 # Binary
 triagefactory
 
+# Nix
+result
+
 # Frontend
 frontend/node_modules/
 frontend/dist/
