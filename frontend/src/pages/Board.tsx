@@ -181,19 +181,33 @@ export default function Board() {
             })
             .catch(() => {})
 
-          // Chain step run that isn't the active step: a new step
-          // just started or a prior step changed. Refetch to pick up
-          // the new active step.
           if (!matched) {
+            // Chain step run that isn't the active step: a new step
+            // just started or a prior step changed. Refetch to pick
+            // up the new active step. Otherwise seed agentRuns by
+            // run_id so an auto-delegation / cross-tab / swipe
+            // response we haven't tracked yet renders immediately.
+            let isChainStep = false
             setChainStepRuns((prev) => {
               for (const steps of Object.values(prev)) {
                 if (steps.some((r) => r.ChainRunID && r.ID === event.run_id)) {
-                  fetchTasks()
+                  isChainStep = true
                   break
                 }
               }
               return prev
             })
+            if (isChainStep) {
+              fetchTasks()
+            } else {
+              fetch(`/api/agent/runs/${event.run_id}`)
+                .then((r) => (r.ok ? r.json() : null))
+                .then((fullRun: AgentRun | null) => {
+                  if (!fullRun) return
+                  setAgentRuns((p) => ({ ...p, [fullRun.TaskID]: fullRun }))
+                })
+                .catch(() => {})
+            }
           }
           // 'cancelled' triggers a task refetch so the
           // pending_approval-cleanup broadcast (SKY-206) collapses
