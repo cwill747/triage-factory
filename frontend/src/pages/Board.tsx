@@ -65,6 +65,37 @@ export default function Board() {
     kind: 'review' | 'pr'
   } | null>(null)
 
+  // Fetch the chain definition + per-step runs from
+  // /api/chains/runs/{id} and pad into a length-N array with synthetic
+  // 'pending' placeholders where no run exists yet. Called both on
+  // initial load and when a WS event surfaces a previously-unseen
+  // chain run (e.g. step 1 of a brand new chain).
+  const seedChainStepRuns = useCallback(async (taskID: string, chainRunID: string) => {
+    try {
+      const res = await fetch(`/api/chains/runs/${chainRunID}`)
+      if (!res.ok) return
+      const data: {
+        steps?: Array<{ step: { step_index: number }; run?: AgentRun | null }>
+      } = await res.json()
+      const total = data.steps?.length ?? 0
+      if (total === 0) return
+      const padded: AgentRun[] = Array.from({ length: total }, (_, i) => {
+        const existing = data.steps?.[i]?.run
+        if (existing) return existing
+        return {
+          ID: `__pending-${chainRunID}-${i}`,
+          Status: 'pending',
+          ChainRunID: chainRunID,
+          ChainStepIndex: i,
+        } as unknown as AgentRun
+      })
+      setChainStepRuns((prev) => ({ ...prev, [taskID]: padded }))
+    } catch {
+      // Network error — leave chain indicator empty for now; the
+      // next fetchTasks pass will retry.
+    }
+  }, [])
+
   const fetchTasks = useCallback(async () => {
     try {
       const [queuedRes, claimedRes, delegatedRes, doneRes] = await Promise.all([
@@ -99,7 +130,7 @@ export default function Board() {
               const stepRuns = runs
                 .filter((r) => r.ChainRunID === chainRunID)
                 .sort((a, b) => (a.ChainStepIndex ?? 0) - (b.ChainStepIndex ?? 0))
-              setChainStepRuns((prev) => ({ ...prev, [task.id]: stepRuns }))
+              await seedChainStepRuns(task.id, chainRunID)
               const activeStep =
                 stepRuns.find((r) =>
                   [
@@ -134,7 +165,7 @@ export default function Board() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [seedChainStepRuns])
 
   useEffect(() => {
     fetchTasks()
@@ -178,6 +209,12 @@ export default function Board() {
                 }
                 return { ...p, [fullRun.TaskID]: fullRun }
               })
+              // First WS update for a chain step seeds the chain
+              // indicator. Without this, the first step of a brand-new
+              // chain renders alone until step 2 starts.
+              if (fullRun.ChainRunID) {
+                seedChainStepRuns(fullRun.TaskID, fullRun.ChainRunID)
+              }
             })
             .catch(() => {})
 
@@ -205,6 +242,9 @@ export default function Board() {
                 .then((fullRun: AgentRun | null) => {
                   if (!fullRun) return
                   setAgentRuns((p) => ({ ...p, [fullRun.TaskID]: fullRun }))
+                  if (fullRun.ChainRunID) {
+                    seedChainStepRuns(fullRun.TaskID, fullRun.ChainRunID)
+                  }
                 })
                 .catch(() => {})
             }
@@ -232,7 +272,7 @@ export default function Board() {
           fetchTasks()
         }
       },
-      [fetchTasks],
+      [fetchTasks, seedChainStepRuns],
     ),
   )
 
