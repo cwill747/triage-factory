@@ -306,7 +306,7 @@ export default function AgentCard({ task, run, chainSteps, messages, onRequeue, 
             })}
           </div>
           <div className="mt-1.5 text-[10px] text-text-tertiary">
-            Step {(run.ChainStepIndex ?? 0) + 1} of {chainSteps.length}
+            Step {(run.chain_step_index ?? 0) + 1} of {chainSteps.length}
           </div>
         </div>
       )}

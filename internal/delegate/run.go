@@ -335,7 +335,7 @@ func (s *Spawner) processCompletion(
 			allow := true
 			if s.isNonFinalChainStep(runID) {
 				verdict, _ := db.GetLatestChainVerdict(s.database, runID)
-				if verdict == nil || !verdict.Final {
+				if verdict == nil || verdict.Outcome != domain.ChainVerdictFinal {
 					allow = false
 				}
 			}

@@ -61,8 +61,8 @@ func runResponse(database *sql.DB, run *domain.AgentRun) map[string]any {
 		"MemoryMissing":  run.MemoryMissing,
 		"TriggerType":    run.TriggerType,
 		"TriggerID":      run.TriggerID,
-		"ChainRunID":     run.ChainRunID,
-		"ChainStepIndex": run.ChainStepIndex,
+		"chain_run_id":    run.ChainRunID,
+		"chain_step_index": run.ChainStepIndex,
 	}
 	// pending_kind only relevant when the run is parked.
 	if run.Status == "pending_approval" {

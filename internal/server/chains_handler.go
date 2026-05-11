@@ -3,11 +3,14 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
+
+const maxChainSteps = 50
 
 // handleChainStepsGet returns the ordered step list for a chain prompt.
 // Always returns an array (never null) so frontend code can iterate
@@ -73,6 +76,13 @@ func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if len(req.Steps) > maxChainSteps {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"error": "chain may not exceed " + strconv.Itoa(maxChainSteps) + " steps",
+		})
+		return
+	}
+
 	stepIDs := make([]string, 0, len(req.Steps))
 	briefs := make([]string, 0, len(req.Steps))
 	for i, step := range req.Steps {
@@ -89,7 +99,7 @@ func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
 		}
 		if stepPrompt == nil {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-				"error": "step " + jitoa(i) + " references a non-existent prompt",
+				"error": "step " + strconv.Itoa(i) + " references a non-existent prompt",
 			})
 			return
 		}
@@ -98,7 +108,7 @@ func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
 		// cycles if a chain referenced itself transitively.
 		if stepPrompt.Kind == domain.PromptKindChain {
 			writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
-				"error": "step " + jitoa(i) + " references another chain prompt; nested chains aren't supported",
+				"error": "step " + strconv.Itoa(i) + " references another chain prompt; nested chains aren't supported",
 			})
 			return
 		}
@@ -153,17 +163,24 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Pull the per-step run row by chain_run_id + chain_step_index.
 	stepRuns, err := db.RunsForChain(s.db, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 	runByStep := map[int]*domain.AgentRun{}
+	runIDs := make([]string, 0, len(stepRuns))
 	for i := range stepRuns {
 		if stepRuns[i].ChainStepIndex != nil {
 			runByStep[*stepRuns[i].ChainStepIndex] = &stepRuns[i]
+			runIDs = append(runIDs, stepRuns[i].ID)
 		}
+	}
+
+	verdictsByRun, err := db.LatestChainVerdictsForRuns(s.db, runIDs)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
 
 	views := make([]chainRunStepView, 0, len(steps))
@@ -171,9 +188,7 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 		view := chainRunStepView{Step: step}
 		if run, ok := runByStep[step.StepIndex]; ok {
 			view.Run = run
-			if verdict, err := db.GetLatestChainVerdict(s.db, run.ID); err == nil && verdict != nil {
-				view.Verdict = verdict
-			}
+			view.Verdict = verdictsByRun[run.ID]
 		}
 		views = append(views, view)
 	}
@@ -181,27 +196,29 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, chainRunResponse{ChainRun: cr, Steps: views})
 }
 
-// jitoa is a tiny strconv.Itoa replacement that avoids pulling strconv
-// into this file (and matches the rest of the package's style of
-// minimal imports in handler files).
-func jitoa(i int) string {
-	if i == 0 {
-		return "0"
+func (s *Server) handleChainRunCancel(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+
+	cr, err := db.GetChainRun(s.db, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
-	neg := i < 0
-	if neg {
-		i = -i
+	if cr == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "chain run not found"})
+		return
 	}
-	var buf [20]byte
-	pos := len(buf)
-	for i > 0 {
-		pos--
-		buf[pos] = byte('0' + i%10)
-		i /= 10
+
+	switch cr.Status {
+	case domain.ChainRunStatusCompleted, domain.ChainRunStatusFailed,
+		domain.ChainRunStatusAborted, domain.ChainRunStatusCancelled:
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "chain run already terminal"})
+		return
 	}
-	if neg {
-		pos--
-		buf[pos] = '-'
+
+	if err := s.spawner.CancelChain(id); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
 	}
-	return string(buf[pos:])
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "cancelling"})
 }

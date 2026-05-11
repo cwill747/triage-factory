@@ -211,7 +211,7 @@ func (s *promptStore) Update(ctx context.Context, orgID string, id, name, body, 
 		return err
 	}
 	if kind == "" {
-		kind = domain.PromptKindLeaf
+		kind = string(domain.PromptKindLeaf)
 	}
 	_, err := s.q.ExecContext(ctx, `
 		UPDATE prompts SET name = ?, body = ?, kind = ?, user_modified = 1, updated_at = ? WHERE id = ?

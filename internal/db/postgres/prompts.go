@@ -246,10 +246,8 @@ func (s *promptStore) Create(ctx context.Context, orgID string, p domain.Prompt)
 }
 
 func (s *promptStore) Update(ctx context.Context, orgID string, id, name, body, kind string) error {
-	// kind is intentionally unused: chain prompts are SQLite-only for
-	// now (no `kind` column in the Postgres schema). The parameter is
-	// accepted to satisfy the interface; switching kind on Postgres
-	// would require a schema migration first.
+	// Postgres schema has no kind column; chain prompts are SQLite-only.
+	// Update the schema before honoring this parameter.
 	_ = kind
 	_, err := s.app.ExecContext(ctx, `
 		UPDATE prompts SET name = $1, body = $2, user_modified = TRUE, updated_at = now()

@@ -49,8 +49,8 @@ export interface AgentRun {
   // PendingPROverlay (title/body editor + Open-PR button). Empty /
   // undefined for non-pending runs.
   pending_kind?: 'review' | 'pr'
-  ChainRunID?: string
-  ChainStepIndex?: number | null
+  chain_run_id?: string
+  chain_step_index?: number | null
 }
 
 export interface HeldTakeover {
@@ -172,11 +172,24 @@ export interface ChainStep {
   created_at: string
 }
 
+export type ChainVerdictOutcome = 'advance' | 'abort' | 'final'
+
 export interface ChainVerdict {
-  proceed: boolean
+  outcome: ChainVerdictOutcome
   reason: string
   notes?: string
-  synthetic?: boolean
+  // synthetic is internal-only (json:"-" in Go) — not on the wire
+}
+
+export interface ChainRunStepView {
+  step: ChainStep
+  run?: AgentRun
+  verdict?: ChainVerdict
+}
+
+export interface ChainRunResponse {
+  chain_run: ChainRun
+  steps: ChainRunStepView[]
 }
 
 export interface ChainRun {

@@ -84,7 +84,6 @@ func runVerdict(database *db.DB, args []string) {
 	if err := fs.Parse(args); err != nil {
 		exitErr("parse flags: " + err.Error())
 	}
-	// Exactly one of the three modes must be set.
 	set := 0
 	if proceed {
 		set++
@@ -118,9 +117,17 @@ func runVerdict(database *db.DB, args []string) {
 		exitErr(fmt.Sprintf("chain run %s is %s; cannot record a verdict", chainRun.ID, chainRun.Status))
 	}
 
+	var outcome domain.ChainVerdictOutcome
+	switch {
+	case proceed:
+		outcome = domain.ChainVerdictAdvance
+	case abort:
+		outcome = domain.ChainVerdictAbort
+	case final:
+		outcome = domain.ChainVerdictFinal
+	}
 	verdict := domain.ChainVerdict{
-		Proceed: proceed,
-		Final:   final,
+		Outcome: outcome,
 		Reason:  reason,
 		Notes:   notes,
 	}
@@ -135,8 +142,7 @@ func runVerdict(database *db.DB, args []string) {
 	out := map[string]interface{}{
 		"recorded": true,
 		"step":     stepIdx,
-		"proceed":  proceed,
-		"final":    final,
+		"outcome":  outcome,
 	}
 	enc := json.NewEncoder(os.Stdout)
 	if err := enc.Encode(out); err != nil {

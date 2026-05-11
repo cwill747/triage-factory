@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/google/uuid"
@@ -117,7 +118,52 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.prompts.Update(r.Context(), runmode.LocalDefaultOrg, id, req.Name, req.Body, kind); err != nil {
+	existing, err := s.prompts.Get(r.Context(), runmode.LocalDefaultOrg, id)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if existing == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "prompt not found"})
+		return
+	}
+
+	if existing.Kind != kind {
+		if existing.Kind == domain.PromptKindChain {
+			// Reject chain→leaf if any chain steps exist.
+			steps, err := db.ListChainSteps(s.db, id)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			if len(steps) > 0 {
+				writeJSON(w, http.StatusConflict, map[string]string{
+					"error": fmt.Sprintf("cannot change kind: prompt has %d chain step(s)", len(steps)),
+				})
+				return
+			}
+		} else {
+			// Reject leaf→chain if triggers or runs reference this prompt.
+			triggers, err := s.triggers.ListForPrompt(r.Context(), runmode.LocalDefaultOrg, id)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			runCount, err := db.CountPromptRunReferences(s.db, id)
+			if err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+				return
+			}
+			if len(triggers) > 0 || runCount > 0 {
+				writeJSON(w, http.StatusConflict, map[string]string{
+					"error": fmt.Sprintf("cannot change kind: prompt is referenced by %d trigger(s) and %d run(s)", len(triggers), runCount),
+				})
+				return
+			}
+		}
+	}
+
+	if err := s.prompts.Update(r.Context(), runmode.LocalDefaultOrg, id, req.Name, req.Body, string(kind)); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -128,8 +174,8 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 
 // normalizePromptKind defaults to leaf for blank or unknown values so
 // legacy clients that don't send `kind` keep working.
-func normalizePromptKind(k string) string {
-	switch k {
+func normalizePromptKind(k string) domain.PromptKind {
+	switch domain.PromptKind(k) {
 	case domain.PromptKindChain:
 		return domain.PromptKindChain
 	default:

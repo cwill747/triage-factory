@@ -21,8 +21,8 @@ type AgentRun struct {
 	MemoryMissing bool   // true if the pre-complete memory-file gate was exhausted without the agent writing a memory file
 	TriggerType   string // "manual" | "event" (matches prompt_triggers.trigger_type vocabulary)
 	TriggerID     string // FK to prompt_triggers.id — populated for auto runs only
-	ChainRunID    string // FK to chain_runs.id — populated for runs that are a step inside a chain
-	ChainStepIndex *int  // 0-based step index within the chain; nil for non-chain runs
+	ChainRunID     string `json:"chain_run_id,omitempty"`     // FK to chain_runs.id — populated for runs that are a step inside a chain
+	ChainStepIndex *int   `json:"chain_step_index,omitempty"` // 0-based step index within the chain; nil for non-chain runs
 }
 
 // AgentMessage represents a single message within an agent run.

@@ -2,23 +2,26 @@ package domain
 
 import "time"
 
-// PromptKindLeaf and PromptKindChain are the two values of Prompt.Kind.
-// Leaf is the existing single-prompt model; chain is an ordered list of
-// leaf prompts executed sequentially against a shared worktree.
-const (
-	PromptKindLeaf  = "leaf"
-	PromptKindChain = "chain"
-)
+// ChainRunStatus is the lifecycle state of a ChainRun.
+type ChainRunStatus string
 
 // ChainRun statuses. running until any terminal; aborted when a step
 // records --abort or omits a verdict; failed for infrastructure errors;
 // cancelled when the user cancels mid-chain.
 const (
-	ChainRunStatusRunning   = "running"
-	ChainRunStatusCompleted = "completed"
-	ChainRunStatusAborted   = "aborted"
-	ChainRunStatusFailed    = "failed"
-	ChainRunStatusCancelled = "cancelled"
+	ChainRunStatusRunning   ChainRunStatus = "running"
+	ChainRunStatusCompleted ChainRunStatus = "completed"
+	ChainRunStatusAborted   ChainRunStatus = "aborted"
+	ChainRunStatusFailed    ChainRunStatus = "failed"
+	ChainRunStatusCancelled ChainRunStatus = "cancelled"
+)
+
+// ChainTriggerType distinguishes how a chain was initiated.
+type ChainTriggerType string
+
+const (
+	ChainTriggerManual ChainTriggerType = "manual"
+	ChainTriggerEvent  ChainTriggerType = "event"
 )
 
 // ChainStep is one position in a chain prompt's ordered step list.
@@ -35,37 +38,42 @@ type ChainStep struct {
 // call. Owns the shared worktree across all steps. Per-step state
 // lives on the runs table linked back via runs.chain_run_id.
 type ChainRun struct {
-	ID             string     `json:"id"`
-	ChainPromptID  string     `json:"chain_prompt_id"`
-	TaskID         string     `json:"task_id"`
-	TriggerType    string     `json:"trigger_type"`
-	TriggerID      string     `json:"trigger_id,omitempty"`
-	Status         string     `json:"status"`
-	AbortReason    string     `json:"abort_reason,omitempty"`
-	AbortedAtStep  *int       `json:"aborted_at_step,omitempty"`
-	WorktreePath   string     `json:"worktree_path"`
-	StartedAt      time.Time  `json:"started_at"`
-	CompletedAt    *time.Time `json:"completed_at,omitempty"`
+	ID            string         `json:"id"`
+	ChainPromptID string         `json:"chain_prompt_id"`
+	TaskID        string         `json:"task_id"`
+	TriggerType   ChainTriggerType `json:"trigger_type"`
+	TriggerID     string         `json:"trigger_id,omitempty"`
+	Status        ChainRunStatus `json:"status"`
+	AbortReason   string         `json:"abort_reason,omitempty"`
+	AbortedAtStep *int           `json:"aborted_at_step,omitempty"`
+	WorktreePath  string         `json:"worktree_path"`
+	StartedAt     time.Time      `json:"started_at"`
+	CompletedAt   *time.Time     `json:"completed_at,omitempty"`
 }
+
+// ChainVerdictOutcome is the tri-state result of a chain step's verdict.
+type ChainVerdictOutcome string
+
+const (
+	ChainVerdictAdvance ChainVerdictOutcome = "advance"
+	ChainVerdictAbort   ChainVerdictOutcome = "abort"
+	ChainVerdictFinal   ChainVerdictOutcome = "final"
+)
 
 // ChainVerdict is the structured handoff a chain step records via
 // `triagefactory exec chain verdict`. Stored as run_artifacts.metadata_json
 // with kind='chain:verdict'. Latest by created_at wins per step (idempotent
 // re-recording within a step).
 //
-// Tri-state semantics encoded in (Proceed, Final):
-//   - Proceed=true,  Final=false → advance to next step
-//   - Proceed=false, Final=false → abort the chain; leave task open for human
-//   - Proceed=false, Final=true  → end the chain successfully at this step;
-//     close the task. The step is allowed one terminal external action
-//     (e.g., posting a SKIP review) which still flows through the existing
-//     human-approval gate.
+// Outcome semantics (replaces old Proceed/Final bool pair):
+//   - ChainVerdictAdvance → advance to next step  (was Proceed=true,  Final=false)
+//   - ChainVerdictAbort   → abort the chain; leave task open for human (was Proceed=false, Final=false)
+//   - ChainVerdictFinal   → end the chain successfully at this step; close the task (was Proceed=false, Final=true)
 //
-// Final=true with Proceed=true is invalid; the CLI rejects it.
+// The old Proceed=true, Final=true combination was invalid and is now unrepresentable.
 type ChainVerdict struct {
-	Proceed   bool   `json:"proceed"`
-	Final     bool   `json:"final,omitempty"`
-	Reason    string `json:"reason"`
-	Notes     string `json:"notes,omitempty"`
-	Synthetic bool   `json:"synthetic,omitempty"` // set when the orchestrator inserts a no-verdict default
+	Outcome   ChainVerdictOutcome `json:"outcome"`
+	Reason    string              `json:"reason"`
+	Notes     string              `json:"notes,omitempty"`
+	Synthetic bool                `json:"-"` // internal flag, never on wire
 }

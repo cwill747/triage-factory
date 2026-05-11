@@ -94,12 +94,19 @@ func ensureFrontmatterName(body, slug, promptName, brief string) string {
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "name:") {
+			// Fix 1: if the existing name already matches, return the body unchanged.
+			existing := strings.TrimSpace(strings.TrimPrefix(trimmed, "name:"))
+			if existing == slug {
+				return body
+			}
 			lines[i] = "name: " + slug
 			hasName = true
 			break
 		}
 	}
 	if !hasName {
+		// name: goes first in the frontmatter content; splitFrontmatter already
+		// strips the surrounding "---" delimiters, so a plain prepend is correct.
 		lines = append([]string{"name: " + slug}, lines...)
 	}
 	rebuilt := strings.Join(lines, "\n")
@@ -124,8 +131,8 @@ func synthesizeSkillFile(slug, promptName, body, brief string) string {
 		b.WriteString(strings.TrimSpace(promptName))
 		b.WriteString(" -->\n\n")
 	}
-	b.WriteString(strings.TrimSpace(body))
-	b.WriteString("\n")
+	// Fix 3: do not trim trailing whitespace; preserve body byte-identical.
+	b.WriteString(body)
 	return b.String()
 }
 

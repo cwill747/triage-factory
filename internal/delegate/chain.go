@@ -24,8 +24,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
 
-type sqlDB = sql.DB
-
 //go:embed prompts/chain-step-system.txt
 var chainStepSystemPrompt string
 
@@ -89,12 +87,12 @@ func (s *Spawner) delegateChain(task domain.Task, chainPrompt *domain.Prompt, tr
 				ID:            chainRunID,
 				ChainPromptID: chainPrompt.ID,
 				TaskID:        task.ID,
-				TriggerType:   triggerType,
+				TriggerType:   domain.ChainTriggerType(triggerType),
 				TriggerID:     triggerID,
 				Status:        domain.ChainRunStatusFailed,
 				WorktreePath:  "",
 			})
-			_ = db.MarkChainRunStatus(s.database, chainRunID, domain.ChainRunStatusFailed, setupErr.Error(), nil)
+			_, _ = db.MarkChainRunStatus(s.database, chainRunID, domain.ChainRunStatusFailed, setupErr.Error(), nil)
 			return
 		}
 
@@ -102,7 +100,7 @@ func (s *Spawner) delegateChain(task domain.Task, chainPrompt *domain.Prompt, tr
 			ID:            chainRunID,
 			ChainPromptID: chainPrompt.ID,
 			TaskID:        task.ID,
-			TriggerType:   triggerType,
+			TriggerType:   domain.ChainTriggerType(triggerType),
 			TriggerID:     triggerID,
 			Status:        domain.ChainRunStatusRunning,
 			WorktreePath:  cfg.wtPath,
@@ -130,17 +128,6 @@ func (s *Spawner) delegateChain(task domain.Task, chainPrompt *domain.Prompt, tr
 // step terminates, it reads the latest chain:verdict artifact and
 // decides whether to advance, abort, or fail.
 //
-// Per-step lifecycle in the loop:
-//  1. Re-materialize <wt>/.claude/skills/<slug>/SKILL.md from the
-//     step prompt (wiping any prior step's skill first).
-//  2. Build the wrapper user prompt and the chain protocol
-//     --append-system-prompt.
-//  3. Call runAgent with isChainStep=true so its cleanup defers are
-//     skipped — the chain orchestrator runs cleanup once at terminal.
-//  4. After natural completion, read the latest verdict; advance on
-//     proceed=true + step status=completed, otherwise terminate the
-//     chain and decide whether the task should be marked done.
-//
 // Yield mid-chain and pending_approval mid-chain are handled
 // separately via ResumeChainAfterYield / ResumeChainAfterApproval —
 // the orchestrator returns early when the step lands in awaiting_input
@@ -163,31 +150,8 @@ func (s *Spawner) runChain(
 		return
 	}
 
-	// Defense-in-depth recursion guard: server-side validation already
-	// rejects nested chains, but a chain that was authored before its
-	// step prompts were converted to chains could still slip through.
-	for _, step := range steps {
-		stepPrompt, err := s.prompts.Get(context.Background(), runmode.LocalDefaultOrg, step.StepPromptID)
-		if err != nil {
-			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusFailed,
-				"load step prompt: "+err.Error(), &step.StepIndex, false)
-			return
-		}
-		if stepPrompt == nil {
-			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusFailed,
-				fmt.Sprintf("step %d prompt %q not found", step.StepIndex, step.StepPromptID), &step.StepIndex, false)
-			return
-		}
-		if stepPrompt.Kind == domain.PromptKindChain {
-			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusAborted,
-				"nested_chain_step", &step.StepIndex, false)
-			return
-		}
-	}
-
 	for i, step := range steps {
-		// Cancellation between steps. ctx.Err() is set when the caller
-		// canceled either the per-step run or the whole chain.
+		// Cancellation between steps.
 		if ctx.Err() != nil {
 			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusCancelled,
 				"cancelled", &step.StepIndex, false)
@@ -196,9 +160,7 @@ func (s *Spawner) runChain(
 
 		// Worktree-corruption guard: the chain orchestrator owns the
 		// shared worktree, but a misbehaving step (or external rm)
-		// could remove it out from under us. os.Stat lets us bail with
-		// a friendly abort_reason instead of the next step crashing on
-		// "no such file or directory" inside Claude Code's cwd handling.
+		// could remove it out from under us.
 		if cfg.wtPath != "" {
 			if _, err := os.Stat(cfg.wtPath); err != nil {
 				s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusFailed,
@@ -207,17 +169,20 @@ func (s *Spawner) runChain(
 			}
 		}
 
-		stepPrompt, err := s.prompts.Get(context.Background(), runmode.LocalDefaultOrg, step.StepPromptID)
+		stepPrompt, err := s.prompts.Get(ctx, runmode.LocalDefaultOrg, step.StepPromptID)
 		if err != nil || stepPrompt == nil {
 			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusFailed,
 				fmt.Sprintf("step %d prompt fetch failed", i), &step.StepIndex, false)
 			return
 		}
+		if stepPrompt.Kind == domain.PromptKindChain {
+			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusAborted,
+				"nested_chain_step", &step.StepIndex, false)
+			return
+		}
 
 		// Wipe any prior step's materialized skill so step N+1 only
-		// sees its own SKILL.md. The whole .claude/skills/ subtree is
-		// nuked — chains run on PRs/Jira where no other materialized
-		// skills are at play.
+		// sees its own SKILL.md.
 		if err := skills.WipeChainSkills(cfg.wtPath); err != nil {
 			log.Printf("[chain] run %s step %d: wipe skills: %v", chainRunID, i, err)
 		}
@@ -249,7 +214,7 @@ func (s *Spawner) runChain(
 			return
 		}
 		s.broadcastRunUpdate(stepRunID, "initializing")
-		if err := s.prompts.IncrementUsage(context.Background(), runmode.LocalDefaultOrg, stepPrompt.ID); err != nil {
+		if err := s.prompts.IncrementUsage(ctx, runmode.LocalDefaultOrg, stepPrompt.ID); err != nil {
 			log.Printf("[chain] warning: failed to increment usage for step prompt %s: %v", stepPrompt.ID, err)
 		}
 
@@ -269,7 +234,7 @@ func (s *Spawner) runChain(
 
 		var nextStepName string
 		if i+1 < len(steps) {
-			if np, err := s.prompts.Get(context.Background(), runmode.LocalDefaultOrg, steps[i+1].StepPromptID); err == nil && np != nil {
+			if np, err := s.prompts.Get(ctx, runmode.LocalDefaultOrg, steps[i+1].StepPromptID); err == nil && np != nil {
 				nextStepName = np.Name
 			}
 		}
@@ -334,20 +299,23 @@ func (s *Spawner) runChain(
 			// Synthetic abort — record so the UI shows the same shape
 			// as a real verdict, then halt.
 			synthetic := domain.ChainVerdict{
-				Proceed:   false,
+				Outcome:   domain.ChainVerdictAbort,
 				Reason:    "no-verdict",
 				Synthetic: true,
 			}
 			if payload, err := json.Marshal(synthetic); err == nil {
-				_ = db.InsertRunArtifact(s.database, stepRunID, "chain:verdict", string(payload))
+				if insertErr := db.InsertRunArtifact(s.database, stepRunID, "chain:verdict", string(payload)); insertErr != nil {
+					log.Printf("[chain] run %s step %d: insert synthetic verdict artifact: %v", chainRunID, i, insertErr)
+				}
 			}
 			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusAborted,
 				"no-verdict", &step.StepIndex, false)
 			return
 		}
-		if verdict.Final {
-			// --final: step decided the chain's intended outcome is reached
-			// here. Terminate as completed (closes the task) and record the
+		switch verdict.Outcome {
+		case domain.ChainVerdictFinal:
+			// Step decided the chain's intended outcome is reached here.
+			// Terminate as completed (closes the task) and record the
 			// step index so the UI can show "exited early at step N".
 			reason := verdict.Reason
 			if reason == "" {
@@ -356,8 +324,7 @@ func (s *Spawner) runChain(
 			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusCompleted,
 				reason, &step.StepIndex, false)
 			return
-		}
-		if !verdict.Proceed {
+		case domain.ChainVerdictAbort:
 			reason := verdict.Reason
 			if reason == "" {
 				reason = "step recorded --abort"
@@ -365,11 +332,16 @@ func (s *Spawner) runChain(
 			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusAborted,
 				reason, &step.StepIndex, false)
 			return
+		case domain.ChainVerdictAdvance:
+			// Advance to next step.
+		default:
+			// Unknown outcome — treat as abort.
+			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusAborted,
+				"unknown verdict outcome: "+string(verdict.Outcome), &step.StepIndex, false)
+			return
 		}
-		// proceed: loop to next step.
 	}
 
-	// All steps completed with proceed verdicts.
 	s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusCompleted,
 		"", nil, false)
 }
@@ -384,12 +356,14 @@ func (s *Spawner) terminateChain(
 	chainRunID, taskID, triggerType string,
 	startTime time.Time,
 	cfg runConfig,
-	status, abortReason string,
+	status domain.ChainRunStatus,
+	abortReason string,
 	abortedAtStep *int,
 	skipCleanup bool,
 ) {
-	if err := db.MarkChainRunStatus(s.database, chainRunID, status, abortReason, abortedAtStep); err != nil {
-		log.Printf("[chain] mark chain_run %s status=%s: %v", chainRunID, status, err)
+	if _, err := db.MarkChainRunStatus(s.database, chainRunID, status, abortReason, abortedAtStep); err != nil {
+		log.Printf("[chain] FATAL: mark chain_run %s status=%s: %v — skipping cleanup to keep chain row consistent", chainRunID, status, err)
+		return
 	}
 
 	if status == domain.ChainRunStatusCompleted {
@@ -448,12 +422,13 @@ func (s *Spawner) runChainWorktreeCleanup(chainRunID string, cfg runConfig) {
 			rows, err := db.GetRunWorktrees(s.database, sr.ID)
 			if err != nil {
 				log.Printf("[chain] run %s: list run_worktrees for step %s: %v", chainRunID, sr.ID, err)
-				continue
+				// Log but continue to attempt DB row deletion below.
+				rows = nil
 			}
 			for _, w := range rows {
 				if err := worktree.RemoveAt(w.Path, sr.ID); err != nil && !errors.Is(err, os.ErrNotExist) {
 					log.Printf("[chain] run %s: remove worktree %s: %v", chainRunID, w.Path, err)
-					continue
+					// Still attempt the DB row deletion even if the worktree remove failed.
 				}
 				if _, err := s.database.ExecContext(cleanupCtx,
 					"DELETE FROM run_worktrees WHERE run_id = ? AND path = ?", sr.ID, w.Path); err != nil {
@@ -468,25 +443,24 @@ func (s *Spawner) runChainWorktreeCleanup(chainRunID string, cfg runConfig) {
 
 // taskEntityID resolves the entity_id for a task. Used to drain the
 // per-entity firing queue at chain terminal.
-func taskEntityID(database *sqlDB, taskID string) string {
+func taskEntityID(database *sql.DB, taskID string) string {
 	var entityID string
 	if err := database.QueryRow(`SELECT entity_id FROM tasks WHERE id = ?`, taskID).Scan(&entityID); err != nil {
+		log.Printf("[chain] taskEntityID: failed to resolve entity for task %s: %v", taskID, err)
 		return ""
 	}
 	return entityID
 }
 
-// buildChainStepWrapperPrompt produces the thin user prompt for one
-// step. Skills stay byte-identical: the wrapper names the slug and
-// the brief, the chain protocol lives in --append-system-prompt, and
-// the SKILL.md materialized into .claude/skills/<slug>/ carries the
-// real mission.
+// buildChainStepWrapperPrompt produces the per-step user prompt carrying
+// step-specific data. The system prompt (chain-step-system.txt) owns the
+// protocol contract; this wrapper supplies only the step's context.
 func buildChainStepWrapperPrompt(task domain.Task, step domain.ChainStep, stepPrompt *domain.Prompt, slug string, total int, nextStepName string) string {
 	mission := strings.TrimSpace(step.Brief)
 	if mission == "" {
 		mission = stepPrompt.Name
 	}
-	binaryPath, _ := os.Executable() // best-effort; falls back to "triagefactory" below
+	binaryPath, _ := os.Executable()
 	if binaryPath == "" {
 		binaryPath = "triagefactory"
 	}
@@ -496,48 +470,18 @@ func buildChainStepWrapperPrompt(task domain.Task, step domain.ChainStep, stepPr
 	fmt.Fprintf(&b, "You are step %d of %d in a chain firing on this task.\n\n", step.StepIndex+1, total)
 	fmt.Fprintf(&b, "Task: %s\n", strings.TrimSpace(task.Title))
 	fmt.Fprintf(&b, "Mission for this step: %s\n\n", mission)
-	fmt.Fprintf(&b, "A skill named %q has been materialized into ./.claude/skills/%s/SKILL.md.\n", slug, slug)
-	b.WriteString("Read its SKILL.md and follow its guidance to do this step's work.\n\n")
-	b.WriteString("Prior steps wrote handoff notes to ./_scratch/handoff.md (relative to your\n")
-	b.WriteString("cwd). Read that file FIRST — it carries the verdicts and notes from steps\n")
-	b.WriteString("that ran before you. If the file does not exist, you are step 1 and there\n")
-	b.WriteString("is no prior context.\n\n")
+	fmt.Fprintf(&b, "Skill slug: %q (materialized at ./.claude/skills/%s/SKILL.md)\n", slug, slug)
 	isFinal := step.StepIndex+1 == total
-	if isFinal {
-		b.WriteString("You are the FINAL step. You may take external actions (submit reviews,\n")
-		b.WriteString("create PRs, post comments) as your skill directs.\n\n")
-	} else {
+	fmt.Fprintf(&b, "Is final step: %v\n", isFinal)
+	if !isFinal {
 		nextLabel := nextStepName
 		if nextLabel == "" {
 			nextLabel = fmt.Sprintf("step %d", step.StepIndex+2)
 		}
-		fmt.Fprintf(&b, "You are NOT the final step — %q follows you.\n", nextLabel)
-		b.WriteString("Do NOT take external actions: do not submit reviews, create PRs, post\n")
-		b.WriteString("comments, or push branches. Write your findings to _scratch/handoff.md\n")
-		b.WriteString("only. The next step will handle the external action.\n\n")
-		b.WriteString("EARLY-EXIT EXCEPTION: if you determine the chain's intended outcome\n")
-		b.WriteString("can be achieved here without later steps (e.g., this PR doesn't need\n")
-		b.WriteString("review and you should post a SKIP review to clear the queue), you MAY\n")
-		b.WriteString("take that single terminal action — and you MUST then record --final\n")
-		b.WriteString("(see verdict block below). The action still flows through the normal\n")
-		b.WriteString("human-approval gate.\n\n")
+		fmt.Fprintf(&b, "Next step: %q\n", nextLabel)
 	}
-
-	b.WriteString("Before emitting the completion envelope:\n")
-	b.WriteString("  1. Append a section to ./_scratch/handoff.md describing what you did,\n")
-	b.WriteString("     what you found, and any signals the next step should know about.\n")
-	b.WriteString("  2. Record a chain verdict by running EXACTLY one of:\n")
-	fmt.Fprintf(&b, "        %s exec chain verdict --proceed --reason \"<one line>\"\n", binaryPath)
-	fmt.Fprintf(&b, "        %s exec chain verdict --abort   --reason \"<why>\"\n", binaryPath)
-	fmt.Fprintf(&b, "        %s exec chain verdict --final   --reason \"<why>\"\n", binaryPath)
-	b.WriteString("     --proceed: advance to the next step.\n")
-	b.WriteString("     --abort:   stop the chain; the task stays open for human review.\n")
-	b.WriteString("     --final:   stop the chain successfully; the task closes. Use this\n")
-	b.WriteString("                when you took (or are about to take) the terminal\n")
-	b.WriteString("                external action that resolves the task.\n")
-	b.WriteString("     The verdict is required. Skipping it is treated as --abort with\n")
-	b.WriteString("     reason \"no-verdict\".\n\n")
-	b.WriteString("Then emit the standard completion JSON envelope.\n")
+	fmt.Fprintf(&b, "Binary path for verdict commands: %s\n", binaryPath)
+	b.WriteString("Handoff notes from prior steps: ./_scratch/handoff.md\n")
 	return b.String()
 }
 
@@ -558,8 +502,9 @@ func (s *Spawner) CancelChain(chainRunID string) error {
 
 	// Cancel any cancel handles registered by the orchestrator for this
 	// chain. The orchestrator stores per-step cancels under the step
-	// run_id, not the chain id; we sweep all active step runs for the
-	// chain and cancel them.
+	// run_id; we sweep all active step runs and cancel them. We also
+	// cancel the chain's own ctx so the setup phase and inter-step
+	// checks see the cancellation.
 	rows, err := s.database.Query(`SELECT id FROM runs WHERE chain_run_id = ? AND status NOT IN
 		('completed','failed','cancelled','task_unsolvable','pending_approval','taken_over','awaiting_input')`,
 		chainRunID)
@@ -574,33 +519,43 @@ func (s *Spawner) CancelChain(chainRunID string) error {
 				}
 			}
 		}
+		// Also cancel the chain-level context registered at delegateChain.
+		if chainCancel, ok := s.cancels[chainRunID]; ok {
+			chainCancel()
+		}
 		s.mu.Unlock()
 	}
 
-	// MarkChainRunStatus is idempotent enough — if a step is racing the
-	// orchestrator's terminal write, the loser's update is a no-op
-	// because the orchestrator goroutine itself ultimately writes the
-	// final status.
-	return db.MarkChainRunStatus(s.database, chainRunID, domain.ChainRunStatusCancelled, "user_cancelled", nil)
+	_, err = db.MarkChainRunStatus(s.database, chainRunID, domain.ChainRunStatusCancelled, "user_cancelled", nil)
+	return err
 }
 
 // ResumeChainAfterYield re-enters the orchestrator loop for the
-// remaining steps after a yield-resume completes successfully. The
-// caller (the existing ResumeAfterYield path) invokes this after the
-// resumed run reaches a non-yield terminal status.
-//
-// Implementation note: a full re-entry loop would need to rebuild the
-// per-step worktree config and the model selection. v1 wires this as a
-// log-and-no-op so the chain visibly stalls rather than silently
-// continuing without the user's response being honored. SKY-followup
-// to thread the resume into runChain is captured in the comments
-// inside ResumeAfterYield.
+// remaining steps after a yield-resume completes successfully.
+// Currently not fully implemented: marks the chain aborted so it
+// doesn't silently stall in 'running'.
 func (s *Spawner) ResumeChainAfterYield(stepRunID string) {
-	cr, _, err := db.GetChainRunForRun(s.database, stepRunID)
+	cr, stepIdx, err := db.GetChainRunForRun(s.database, stepRunID)
 	if err != nil || cr == nil {
 		return
 	}
-	log.Printf("[chain] yield-resume completed for chain_run %s step run %s; chain advance not yet automatic", cr.ID, stepRunID)
+	if cr.Status != domain.ChainRunStatusRunning {
+		return
+	}
+	log.Printf("[chain] yield-resume not yet implemented for chain_run %s step run %s; aborting chain", cr.ID, stepRunID)
+	task, err := db.GetTask(s.database, cr.TaskID)
+	if err != nil || task == nil {
+		log.Printf("[chain] yield-resume: load task for chain_run %s: %v", cr.ID, err)
+		// Fall back to a bare MarkChainRunStatus without full cleanup.
+		_, _ = db.MarkChainRunStatus(s.database, cr.ID, domain.ChainRunStatusAborted, "yield_resume_not_implemented", stepIdx)
+		return
+	}
+	cfg := runConfig{wtPath: cr.WorktreePath}
+	if task.EntitySource == "github" {
+		cfg.hasWT = true
+	}
+	s.terminateChain(cr.ID, cr.TaskID, string(cr.TriggerType), cr.StartedAt, cfg,
+		domain.ChainRunStatusAborted, "yield_resume_not_implemented", stepIdx, false)
 }
 
 // ResumeChainAfterApproval is invoked by the reviews / pending-PR
@@ -628,7 +583,7 @@ func (s *Spawner) ResumeChainAfterApproval(stepRunID string) {
 		log.Printf("[chain] approval-resume run %s: read verdict: %v", stepRunID, err)
 		return
 	}
-	if verdict == nil || !verdict.Final {
+	if verdict == nil || verdict.Outcome != domain.ChainVerdictFinal {
 		log.Printf("[chain] approval-resume chain_run %s step run %s: verdict not --final (%+v); chain left running", cr.ID, stepRunID, verdict)
 		return
 	}
@@ -646,7 +601,7 @@ func (s *Spawner) ResumeChainAfterApproval(stepRunID string) {
 	// stored on chain_runs; CleanupPRConfig is best-effort and skipped
 	// here — leaves a few stale git config entries but no user-visible
 	// effect.
-	cfg := runConfig{wtPath: cr.WorktreePath, runRoot: cr.WorktreePath}
+	cfg := runConfig{wtPath: cr.WorktreePath}
 	if task.EntitySource == "github" {
 		cfg.hasWT = true
 	}
@@ -655,30 +610,40 @@ func (s *Spawner) ResumeChainAfterApproval(stepRunID string) {
 	if reason == "" {
 		reason = "step recorded --final"
 	}
-	s.terminateChain(cr.ID, cr.TaskID, cr.TriggerType, cr.StartedAt, cfg,
+	s.terminateChain(cr.ID, cr.TaskID, string(cr.TriggerType), cr.StartedAt, cfg,
 		domain.ChainRunStatusCompleted, reason, stepIdx, false)
 }
 
 // isNonFinalChainStep returns true when the run is a chain step that
 // is not the last step in the chain. Used as a guard in
 // processCompletion to prevent mid-chain approval stalls.
+//
+// Returns true (safe default) on DB error: treating an unknown step as
+// non-final ensures the pending-approval guard still engages even when
+// the DB is flaky, preventing unintended mid-chain external actions.
 func (s *Spawner) isNonFinalChainStep(runID string) bool {
 	var chainRunID sql.NullString
 	var stepIndex sql.NullInt64
 	if err := s.database.QueryRow(
 		`SELECT chain_run_id, chain_step_index FROM runs WHERE id = ?`, runID,
 	).Scan(&chainRunID, &stepIndex); err != nil || !chainRunID.Valid || !stepIndex.Valid {
+		if err != nil && err != sql.ErrNoRows {
+			log.Printf("[chain] isNonFinalChainStep: query run %s: %v", runID, err)
+			return true
+		}
 		return false
 	}
 	var chainPromptID string
 	if err := s.database.QueryRow(
 		`SELECT chain_prompt_id FROM chain_runs WHERE id = ?`, chainRunID.String,
 	).Scan(&chainPromptID); err != nil {
-		return false
+		log.Printf("[chain] isNonFinalChainStep: query chain_run %s for run %s: %v", chainRunID.String, runID, err)
+		return true
 	}
 	steps, err := db.ListChainSteps(s.database, chainPromptID)
 	if err != nil {
-		return false
+		log.Printf("[chain] isNonFinalChainStep: list steps for chain %s run %s: %v", chainRunID.String, runID, err)
+		return true
 	}
 	return int(stepIndex.Int64)+1 < len(steps)
 }

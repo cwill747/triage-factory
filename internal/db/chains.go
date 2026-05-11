@@ -3,7 +3,9 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -99,7 +101,7 @@ func CreateChainRun(database *sql.DB, cr domain.ChainRun) (string, error) {
 		cr.Status = domain.ChainRunStatusRunning
 	}
 	if cr.TriggerType == "" {
-		cr.TriggerType = "manual"
+		return "", errors.New("chain run trigger type required")
 	}
 	var triggerID interface{}
 	if cr.TriggerID != "" {
@@ -186,7 +188,12 @@ func GetChainRunForRun(database *sql.DB, runID string) (*domain.ChainRun, *int, 
 // MarkChainRunStatus transitions a chain run to a terminal status and
 // records optional abort metadata. completed_at is set on every
 // transition out of 'running' so the lifetime is queryable.
-func MarkChainRunStatus(database *sql.DB, id, status, abortReason string, abortedAtStep *int) error {
+//
+// The WHERE clause guards against lost-update races: only transitions
+// from non-terminal statuses are accepted. Returns (true, nil) when the
+// row was updated, (false, nil) when the guard rejected the write (race
+// loss or already terminal), and (false, err) on DB error.
+func MarkChainRunStatus(database *sql.DB, id string, status domain.ChainRunStatus, abortReason string, abortedAtStep *int) (changed bool, err error) {
 	var (
 		reasonArg interface{}
 		stepArg   interface{}
@@ -198,24 +205,33 @@ func MarkChainRunStatus(database *sql.DB, id, status, abortReason string, aborte
 		stepArg = *abortedAtStep
 	}
 	completedAt := time.Now()
-	_, err := database.Exec(`
+	res, execErr := database.Exec(`
 		UPDATE chain_runs
 		SET status = ?, abort_reason = ?, aborted_at_step = ?, completed_at = ?
-		WHERE id = ?
-	`, status, reasonArg, stepArg, completedAt, id)
-	return err
+		WHERE id = ? AND status IN ('running','pending_approval','awaiting_input')
+	`, string(status), reasonArg, stepArg, completedAt, id)
+	if execErr != nil {
+		return false, execErr
+	}
+	n, rowsErr := res.RowsAffected()
+	if rowsErr != nil {
+		return false, rowsErr
+	}
+	return n > 0, nil
 }
 
 // GetLatestChainVerdict reads the most recent chain:verdict artifact
 // recorded by the step's run. Returns (nil, nil) when no verdict
 // exists — the orchestrator treats that as the "no-verdict" abort
 // default.
+//
+// Ordering: created_at DESC then id DESC. id is a UUID and is NOT a
+// real tie-breaker for UUIDs; we rely on InsertRunArtifact writing
+// sub-second precision timestamps so created_at alone is sufficient
+// within any realistic write burst. The id clause is retained only as
+// a last-resort stable sort.
 func GetLatestChainVerdict(database *sql.DB, runID string) (*domain.ChainVerdict, error) {
 	var raw string
-	// created_at has second-level precision (CURRENT_TIMESTAMP), so two
-	// verdict writes inside the same second can tie. Break the tie with
-	// id DESC so the newest insert deterministically wins — keeping the
-	// CLI's "most recent verdict wins" contract.
 	err := database.QueryRow(`
 		SELECT metadata_json FROM run_artifacts
 		WHERE run_id = ? AND kind = 'chain:verdict'
@@ -235,6 +251,65 @@ func GetLatestChainVerdict(database *sql.DB, runID string) (*domain.ChainVerdict
 		return nil, fmt.Errorf("decode verdict: %w", err)
 	}
 	return &v, nil
+}
+
+// LatestChainVerdictsForRuns fetches the most-recent chain:verdict artifact
+// for each of the supplied run IDs in a single query. Returns a map keyed by
+// runID; runs with no verdict are omitted. Used by chains_handler.go to avoid
+// an N+1 query when rendering the chain-detail page.
+func LatestChainVerdictsForRuns(database *sql.DB, runIDs []string) (map[string]*domain.ChainVerdict, error) {
+	if len(runIDs) == 0 {
+		return map[string]*domain.ChainVerdict{}, nil
+	}
+
+	placeholders := strings.Repeat("?,", len(runIDs))
+	placeholders = placeholders[:len(placeholders)-1] // trim trailing comma
+
+	args := make([]interface{}, len(runIDs))
+	for i, id := range runIDs {
+		args[i] = id
+	}
+
+	// Window function: rank artifacts per run by created_at DESC, then
+	// id DESC (id is UUID — not a real tie-breaker, but gives stable sort).
+	// Return only rank=1 rows (the latest per run).
+	query := fmt.Sprintf(`
+		SELECT run_id, metadata_json
+		FROM (
+			SELECT run_id, metadata_json,
+			       ROW_NUMBER() OVER (PARTITION BY run_id ORDER BY created_at DESC, id DESC) AS rn
+			FROM run_artifacts
+			WHERE run_id IN (%s) AND kind = 'chain:verdict'
+		)
+		WHERE rn = 1
+	`, placeholders)
+
+	rows, err := database.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query latest verdicts: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]*domain.ChainVerdict)
+	for rows.Next() {
+		var (
+			runID string
+			raw   string
+		)
+		if err := rows.Scan(&runID, &raw); err != nil {
+			return nil, err
+		}
+		if raw == "" {
+			out[runID] = &domain.ChainVerdict{}
+			continue
+		}
+		var v domain.ChainVerdict
+		if err := json.Unmarshal([]byte(raw), &v); err != nil {
+			return nil, fmt.Errorf("decode verdict for run %s: %w", runID, err)
+		}
+		out[runID] = &v
+	}
+	return out, rows.Err()
 }
 
 // RunsForChain returns every step run linked to a chain instance,
@@ -312,10 +387,13 @@ func RunsForChain(database *sql.DB, chainRunID string) ([]domain.AgentRun, error
 // by the chain-verdict pipeline (both the exec subcommand and the
 // synthetic no-verdict default written by the orchestrator).
 //
-// We pass our own sub-second-precision timestamp instead of relying on
-// CURRENT_TIMESTAMP (which has second-level granularity) so that two
-// verdict writes inside the same second can be deterministically
-// ordered by GetLatestChainVerdict.
+// IMPORTANT: we format our own sub-second timestamp (microsecond precision)
+// rather than relying on CURRENT_TIMESTAMP (second-level granularity in
+// SQLite). This is load-bearing for verdict ordering: GetLatestChainVerdict
+// and LatestChainVerdictsForRuns both ORDER BY created_at DESC and depend on
+// strict insertion order being recoverable from the timestamp when two
+// verdicts land within the same wall-clock second. Do not replace with
+// CURRENT_TIMESTAMP.
 func InsertRunArtifact(database *sql.DB, runID, kind, metadataJSON string) error {
 	id := uuid.New().String()
 	now := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
