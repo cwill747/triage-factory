@@ -21,6 +21,7 @@ type Prompt struct {
 	Source       string     `json:"source"`        // "system", "user", "imported"
 	Kind         PromptKind `json:"kind"`          // PromptKindLeaf | PromptKindChain (defaults to "leaf")
 	AllowedTools string    `json:"allowed_tools"` // comma-separated extra tools parsed from SKILL.md/agent frontmatter
+	Model        string    `json:"model"`         // per-prompt model override; "" = inherit settings.AI.Model at dispatch
 	UsageCount   int       `json:"usage_count"`   // how many agent runs have used this prompt
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`

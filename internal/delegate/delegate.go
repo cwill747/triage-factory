@@ -69,7 +69,7 @@ type runConfig struct {
 func (s *Spawner) Delegate(task domain.Task, explicitPromptID string, triggerType string, triggerID string) (string, error) {
 	s.mu.Lock()
 	ghClient := s.ghClient
-	model := s.model
+	defaultModel := s.model
 	s.mu.Unlock()
 
 	// Resolve prompt
@@ -79,6 +79,11 @@ func (s *Spawner) Delegate(task domain.Task, explicitPromptID string, triggerTyp
 	}
 	promptID := resolved.ID
 	mission := resolved.Body
+
+	model := defaultModel
+	if resolved.Model != "" {
+		model = resolved.Model
+	}
 
 	extraTools := s.collectExtraTools(resolved.AllowedTools)
 
