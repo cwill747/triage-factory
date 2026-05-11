@@ -235,7 +235,7 @@ export default function AgentCard({ task, run, chainSteps, messages, onRequeue, 
       {/* Chain step progress */}
       {chainSteps && chainSteps.length > 1 && (
         <div className="mx-5 mb-3">
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-2">
             {chainSteps.map((step, i) => {
               const isStepActive = [
                 'cloning',
@@ -249,15 +249,18 @@ export default function AgentCard({ task, run, chainSteps, messages, onRequeue, 
               const isStepFailed = ['failed', 'cancelled', 'task_unsolvable'].includes(step.Status)
               const isStepCurrent = step.ID === run.ID
               return (
-                <div key={step.ID} className="flex items-center gap-1 flex-1 min-w-0">
+                <div
+                  key={step.ID}
+                  className="flex items-center gap-2 first:flex-none flex-1 min-w-0"
+                >
                   {i > 0 && (
                     <div
-                      className={`h-px flex-shrink-0 w-2 ${isStepDone || isStepActive ? 'bg-accent/40' : isStepFailed ? 'bg-dismiss/40' : 'bg-border-subtle'}`}
+                      className={`h-0.5 flex-1 rounded-full ${isStepDone || isStepActive ? 'bg-accent/40' : isStepFailed ? 'bg-dismiss/40' : 'bg-border-subtle'}`}
                     />
                   )}
                   <div
-                    className={`flex items-center justify-center rounded-full text-[9px] font-bold leading-none transition-all ${
-                      isStepCurrent ? 'w-5 h-5 ring-1 ring-accent/30' : 'w-4 h-4'
+                    className={`shrink-0 flex items-center justify-center rounded-full text-[10px] font-bold leading-none transition-all ${
+                      isStepCurrent ? 'w-6 h-6 ring-2 ring-accent/30' : 'w-5 h-5'
                     } ${
                       isStepDone
                         ? 'bg-claim/15 text-claim'
@@ -275,7 +278,7 @@ export default function AgentCard({ task, run, chainSteps, messages, onRequeue, 
               )
             })}
           </div>
-          <div className="mt-1 text-[10px] text-text-tertiary">
+          <div className="mt-1.5 text-[10px] text-text-tertiary">
             Step {(run.ChainStepIndex ?? 0) + 1} of {chainSteps.length}
           </div>
         </div>
