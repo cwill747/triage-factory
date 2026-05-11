@@ -106,10 +106,18 @@ func (s *chainStore) CreateRun(ctx context.Context, orgID string, cr domain.Chai
 	if cr.TriggerID != "" {
 		triggerID = cr.TriggerID
 	}
+	var abortReason any
+	if cr.AbortReason != "" {
+		abortReason = cr.AbortReason
+	}
+	var completedAt any
+	if cr.CompletedAt != nil {
+		completedAt = cr.CompletedAt.UTC()
+	}
 	if _, err := s.q.ExecContext(ctx, `
-		INSERT INTO chain_runs (id, chain_prompt_id, task_id, trigger_type, trigger_id, status, worktree_path, started_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-	`, cr.ID, cr.ChainPromptID, cr.TaskID, cr.TriggerType, triggerID, cr.Status, cr.WorktreePath); err != nil {
+		INSERT INTO chain_runs (id, chain_prompt_id, task_id, trigger_type, trigger_id, status, worktree_path, abort_reason, completed_at, started_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	`, cr.ID, cr.ChainPromptID, cr.TaskID, cr.TriggerType, triggerID, cr.Status, cr.WorktreePath, abortReason, completedAt); err != nil {
 		return "", fmt.Errorf("insert chain_run: %w", err)
 	}
 	return cr.ID, nil

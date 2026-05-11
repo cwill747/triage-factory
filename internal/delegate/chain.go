@@ -82,7 +82,9 @@ func (s *Spawner) delegateChain(task domain.Task, chainPrompt *domain.Prompt, tr
 		}
 		if setupErr != nil {
 			// Persist a chain_runs row anyway so the UI has something to
-			// show; mark it failed with the setup error as abort_reason.
+			// show; write abort_reason and completed_at directly in the
+			// insert — MarkRunStatus won't match a row that isn't 'running'.
+			now := time.Now().UTC()
 			_, _ = s.chains.CreateRun(ctx, runmode.LocalDefaultOrg, domain.ChainRun{
 				ID:            chainRunID,
 				ChainPromptID: chainPrompt.ID,
@@ -90,9 +92,13 @@ func (s *Spawner) delegateChain(task domain.Task, chainPrompt *domain.Prompt, tr
 				TriggerType:   domain.ChainTriggerType(triggerType),
 				TriggerID:     triggerID,
 				Status:        domain.ChainRunStatusFailed,
+				AbortReason:   setupErr.Error(),
+				CompletedAt:   &now,
 				WorktreePath:  "",
 			})
-			_, _ = s.chains.MarkRunStatus(ctx, runmode.LocalDefaultOrg, chainRunID, domain.ChainRunStatusFailed, setupErr.Error(), nil)
+			if cfgEntity := taskEntityID(s.database, task.ID); cfgEntity != "" {
+				s.notifyDrainer(triggerType, cfgEntity)
+			}
 			return
 		}
 
@@ -106,6 +112,10 @@ func (s *Spawner) delegateChain(task domain.Task, chainPrompt *domain.Prompt, tr
 			WorktreePath:  cfg.wtPath,
 		}); err != nil {
 			log.Printf("[chain] failed to persist chain_run %s: %v", chainRunID, err)
+			s.runChainWorktreeCleanup(chainRunID, cfg)
+			if cfgEntity := taskEntityID(s.database, task.ID); cfgEntity != "" {
+				s.notifyDrainer(triggerType, cfgEntity)
+			}
 			return
 		}
 

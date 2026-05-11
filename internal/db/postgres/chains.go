@@ -109,20 +109,28 @@ func (s *chainStore) CreateRun(ctx context.Context, orgID string, cr domain.Chai
 	if cr.TriggerID != "" {
 		triggerID = cr.TriggerID
 	}
+	var abortReason any
+	if cr.AbortReason != "" {
+		abortReason = cr.AbortReason
+	}
+	var completedAt any
+	if cr.CompletedAt != nil {
+		completedAt = cr.CompletedAt.UTC()
+	}
 	// creator_user_id resolution mirrors PromptStore / TaskRuleStore /
 	// TriggerStore: prefer the JWT-bound caller, fall back to org owner
 	// so system-context writes still satisfy the NOT NULL FK.
 	if _, err := s.app.ExecContext(ctx, `
 		INSERT INTO chain_runs
 			(id, org_id, creator_user_id, chain_prompt_id, task_id, trigger_type, trigger_id,
-			 status, worktree_path, started_at)
+			 status, worktree_path, abort_reason, completed_at, started_at)
 		VALUES (
 			$1, $2,
 			COALESCE(tf.current_user_id(), (SELECT owner_user_id FROM orgs WHERE id = $2)),
 			$3, $4, $5, $6,
-			$7, $8, now()
+			$7, $8, $9, $10, now()
 		)
-	`, cr.ID, orgID, cr.ChainPromptID, cr.TaskID, cr.TriggerType, triggerID, cr.Status, cr.WorktreePath); err != nil {
+	`, cr.ID, orgID, cr.ChainPromptID, cr.TaskID, cr.TriggerType, triggerID, cr.Status, cr.WorktreePath, abortReason, completedAt); err != nil {
 		return "", fmt.Errorf("insert chain_run: %w", err)
 	}
 	return cr.ID, nil
