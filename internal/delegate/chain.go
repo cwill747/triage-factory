@@ -433,19 +433,30 @@ func (s *Spawner) runChainWorktreeCleanup(chainRunID string, cfg runConfig) {
 			worktree.CleanupPRConfig(cfg.owner, cfg.repo, cfg.headRef, cfg.prNumber)
 		}
 	} else if cfg.runRoot != "" {
-		rows, err := db.GetRunWorktrees(s.database, chainRunID)
+		// Jira chains materialize worktrees lazily via `workspace add`,
+		// which keys run_worktrees rows by each *step's* run_id (the
+		// agent's TRIAGE_FACTORY_RUN_ID), not by the chain_run_id.
+		// Iterate every step run in the chain so we actually find and
+		// remove their reservations.
+		stepRuns, err := db.RunsForChain(s.database, chainRunID)
 		if err != nil {
-			log.Printf("[chain] run %s: list run_worktrees for cleanup: %v", chainRunID, err)
-		} else {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
+			log.Printf("[chain] run %s: list step runs for cleanup: %v", chainRunID, err)
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		for _, sr := range stepRuns {
+			rows, err := db.GetRunWorktrees(s.database, sr.ID)
+			if err != nil {
+				log.Printf("[chain] run %s: list run_worktrees for step %s: %v", chainRunID, sr.ID, err)
+				continue
+			}
 			for _, w := range rows {
-				if err := worktree.RemoveAt(w.Path, chainRunID); err != nil && !errors.Is(err, os.ErrNotExist) {
+				if err := worktree.RemoveAt(w.Path, sr.ID); err != nil && !errors.Is(err, os.ErrNotExist) {
 					log.Printf("[chain] run %s: remove worktree %s: %v", chainRunID, w.Path, err)
 					continue
 				}
 				if _, err := s.database.ExecContext(cleanupCtx,
-					"DELETE FROM run_worktrees WHERE run_id = ? AND path = ?", chainRunID, w.Path); err != nil {
+					"DELETE FROM run_worktrees WHERE run_id = ? AND path = ?", sr.ID, w.Path); err != nil {
 					log.Printf("[chain] run %s: delete run_worktrees row for %s: %v", chainRunID, w.Path, err)
 				}
 			}

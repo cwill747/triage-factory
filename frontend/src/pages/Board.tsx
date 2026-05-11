@@ -66,13 +66,13 @@ export default function Board() {
   } | null>(null)
 
   // Fetch the chain definition + per-step runs from
-  // /api/chains/runs/{id} and pad into a length-N array with synthetic
+  // /api/chain-runs/{id} and pad into a length-N array with synthetic
   // 'pending' placeholders where no run exists yet. Called both on
   // initial load and when a WS event surfaces a previously-unseen
   // chain run (e.g. step 1 of a brand new chain).
   const seedChainStepRuns = useCallback(async (taskID: string, chainRunID: string) => {
     try {
-      const res = await fetch(`/api/chains/runs/${chainRunID}`)
+      const res = await fetch(`/api/chain-runs/${chainRunID}`)
       if (!res.ok) return
       const data: {
         steps?: Array<{ step: { step_index: number }; run?: AgentRun | null }>

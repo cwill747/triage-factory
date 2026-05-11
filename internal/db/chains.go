@@ -212,10 +212,14 @@ func MarkChainRunStatus(database *sql.DB, id, status, abortReason string, aborte
 // default.
 func GetLatestChainVerdict(database *sql.DB, runID string) (*domain.ChainVerdict, error) {
 	var raw string
+	// created_at has second-level precision (CURRENT_TIMESTAMP), so two
+	// verdict writes inside the same second can tie. Break the tie with
+	// id DESC so the newest insert deterministically wins — keeping the
+	// CLI's "most recent verdict wins" contract.
 	err := database.QueryRow(`
 		SELECT metadata_json FROM run_artifacts
 		WHERE run_id = ? AND kind = 'chain:verdict'
-		ORDER BY created_at DESC LIMIT 1
+		ORDER BY created_at DESC, id DESC LIMIT 1
 	`, runID).Scan(&raw)
 	if err == sql.ErrNoRows {
 		return nil, nil
@@ -307,11 +311,17 @@ func RunsForChain(database *sql.DB, chainRunID string) ([]domain.AgentRun, error
 // InsertRunArtifact creates a non-primary artifact row. Currently used
 // by the chain-verdict pipeline (both the exec subcommand and the
 // synthetic no-verdict default written by the orchestrator).
+//
+// We pass our own sub-second-precision timestamp instead of relying on
+// CURRENT_TIMESTAMP (which has second-level granularity) so that two
+// verdict writes inside the same second can be deterministically
+// ordered by GetLatestChainVerdict.
 func InsertRunArtifact(database *sql.DB, runID, kind, metadataJSON string) error {
 	id := uuid.New().String()
+	now := time.Now().UTC().Format("2006-01-02 15:04:05.000000")
 	_, err := database.Exec(`
 		INSERT INTO run_artifacts (id, run_id, kind, metadata_json, is_primary, created_at)
-		VALUES (?, ?, ?, ?, 0, CURRENT_TIMESTAMP)
-	`, id, runID, kind, metadataJSON)
+		VALUES (?, ?, ?, ?, 0, ?)
+	`, id, runID, kind, metadataJSON, now)
 	return err
 }
