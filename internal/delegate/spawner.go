@@ -42,6 +42,7 @@ type QueueDrainer interface {
 type Spawner struct {
 	database *sql.DB
 	prompts  db.PromptStore
+	chains   db.ChainStore
 	wsHub    *websocket.Hub
 
 	mu                    sync.Mutex
@@ -56,10 +57,11 @@ type Spawner struct {
 	agentToolsCache string
 }
 
-func NewSpawner(database *sql.DB, prompts db.PromptStore, ghClient *ghclient.Client, wsHub *websocket.Hub, model string) *Spawner {
+func NewSpawner(database *sql.DB, prompts db.PromptStore, chains db.ChainStore, ghClient *ghclient.Client, wsHub *websocket.Hub, model string) *Spawner {
 	return &Spawner{
 		database:  database,
 		prompts:   prompts,
+		chains:    chains,
 		ghClient:  ghClient,
 		wsHub:     wsHub,
 		model:     model,

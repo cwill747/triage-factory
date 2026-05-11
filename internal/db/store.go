@@ -49,6 +49,12 @@ type Stores struct {
 	// now they ship as parallel stores with the same shape.
 	Triggers TriggerStore
 
+	// Chains owns prompt_chain_steps + chain_runs, plus the
+	// kind='chain:verdict' slice of run_artifacts. Read by the chain
+	// HTTP handlers; written by the delegate spawner and the exec
+	// verdict subcommand.
+	Chains ChainStore
+
 	// Agents owns the agents table — the org's workload identity.
 	// One row per org. Bootstrap-only Create (admin pool in Postgres);
 	// reads + admin-gated updates run on the app pool. See SKY-260.
@@ -80,6 +86,7 @@ type TxStores struct {
 	Secrets    SecretStore
 	TaskRules  TaskRuleStore
 	Triggers   TriggerStore
+	Chains     ChainStore
 	Agents     AgentStore
 	TeamAgents TeamAgentStore
 }

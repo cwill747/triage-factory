@@ -9,12 +9,13 @@ import YieldModal, { type YieldRequest } from './YieldModal'
 interface Props {
   task: Task
   run: AgentRun
+  chainSteps?: AgentRun[]
   messages: AgentMessage[]
   onRequeue?: () => void
   onReview?: () => void
 }
 
-export default function AgentCard({ task, run, messages, onRequeue, onReview }: Props) {
+export default function AgentCard({ task, run, chainSteps, messages, onRequeue, onReview }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const [now, setNow] = useState(() => Date.now())
   const [takeoverInfo, setTakeoverInfo] = useState<TakeoverInfo | null>(null)
@@ -230,6 +231,85 @@ export default function AgentCard({ task, run, messages, onRequeue, onReview }: 
           <span className="truncate">{task.source_id}</span>
         </div>
       </div>
+
+      {/* Chain step progress */}
+      {chainSteps && chainSteps.length > 1 && (
+        <div className="mx-5 mb-3">
+          <div className="flex items-center gap-2">
+            {chainSteps.map((step, i) => {
+              const isStepActive = [
+                'cloning',
+                'fetching',
+                'worktree_created',
+                'agent_starting',
+                'running',
+                'initializing',
+              ].includes(step.Status)
+              const isStepDone = step.Status === 'completed'
+              const isStepFailed = ['failed', 'cancelled', 'task_unsolvable'].includes(step.Status)
+              const isStepCurrent = step.ID === run.ID
+              return (
+                <div
+                  key={step.ID}
+                  className="flex items-center gap-2 first:flex-none flex-1 min-w-0"
+                >
+                  {i > 0 && (
+                    <div
+                      className={`h-0.5 flex-1 rounded-full ${isStepDone || isStepActive ? 'bg-accent/40' : isStepFailed ? 'bg-dismiss/40' : 'bg-border-subtle'}`}
+                    />
+                  )}
+                  <div
+                    className="relative shrink-0"
+                    title={`Step ${i + 1}: ${formatStatus(step.Status)}`}
+                  >
+                    {isStepActive && (
+                      <svg
+                        className="absolute -inset-1 animate-spin text-delegate"
+                        viewBox="0 0 32 32"
+                        fill="none"
+                        aria-hidden
+                      >
+                        <circle
+                          cx="16"
+                          cy="16"
+                          r="14"
+                          stroke="currentColor"
+                          strokeOpacity="0.2"
+                          strokeWidth="2"
+                        />
+                        <path
+                          d="M16 2 a14 14 0 0 1 14 14"
+                          stroke="currentColor"
+                          strokeWidth="2"
+                          strokeLinecap="round"
+                        />
+                      </svg>
+                    )}
+                    <div
+                      className={`flex items-center justify-center rounded-full text-[10px] font-bold leading-none transition-all ${
+                        isStepCurrent && !isStepActive ? 'w-6 h-6 ring-2 ring-accent/30' : 'w-5 h-5'
+                      } ${
+                        isStepDone
+                          ? 'bg-claim/15 text-claim'
+                          : isStepActive
+                            ? 'bg-delegate/15 text-delegate'
+                            : isStepFailed
+                              ? 'bg-dismiss/15 text-dismiss'
+                              : 'bg-black/[0.04] text-text-tertiary'
+                      }`}
+                    >
+                      {isStepDone ? '✓' : isStepFailed ? '✗' : i + 1}
+                    </div>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+          <div className="mt-1.5 text-[10px] text-text-tertiary">
+            Step {(run.chain_step_index ?? 0) + 1} of {chainSteps.length}
+          </div>
+        </div>
+      )}
 
       {/* Activity log + optional pending-takeover overlay */}
       <div className="relative mx-3 mb-3">

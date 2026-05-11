@@ -80,6 +80,10 @@ func New(admin, app *sql.DB) db.Stores {
 		// tf.user_is_org_admin() per 202605120001; Seed has no JWT
 		// claims and must run admin-side).
 		Triggers: newTriggerStore(app, admin),
+		// Chains has no admin/app split — chain rows are user-created,
+		// no boot-time seed needs to bypass RLS. All methods run on the
+		// app pool; RLS enforces the creator predicate on chain_runs.
+		Chains: newChainStore(app),
 		// Agents.Create routes through admin (bootstrap has no JWT
 		// claims and the agents_insert policy gates on
 		// tf.user_is_org_admin); every other method on app. Same
@@ -125,6 +129,7 @@ func NewForTx(tx *sql.Tx) db.TxStores {
 		Secrets:    newSecretStore(tx),
 		TaskRules:  newTxTaskRuleStore(tx),
 		Triggers:   newTxTriggerStore(tx),
+		Chains:     newChainStore(tx),
 		Agents:     newTxAgentStore(tx),
 		TeamAgents: newTxTeamAgentStore(tx),
 	}

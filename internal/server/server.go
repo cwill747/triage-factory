@@ -26,6 +26,7 @@ type Server struct {
 	dashboard          db.DashboardStore
 	taskRules          db.TaskRuleStore
 	triggers           db.TriggerStore
+	chains             db.ChainStore
 	mux                *http.ServeMux
 	static             fs.FS
 	ws                 *websocket.Hub
@@ -77,7 +78,7 @@ func (s *Server) projectMutex(id string) *sync.Mutex {
 // argument list grows one store at a time as their callers migrate;
 // raw *sql.DB stays available for handlers that haven't been ported
 // to a store yet.
-func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, taskRules db.TaskRuleStore, triggers db.TriggerStore) *Server {
+func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboard db.DashboardStore, taskRules db.TaskRuleStore, triggers db.TriggerStore, chains db.ChainStore) *Server {
 	s := &Server{
 		db:        database,
 		prompts:   prompts,
@@ -85,6 +86,7 @@ func New(database *sql.DB, prompts db.PromptStore, swipes db.SwipeStore, dashboa
 		dashboard: dashboard,
 		taskRules: taskRules,
 		triggers:  triggers,
+		chains:    chains,
 		mux:       http.NewServeMux(),
 		ws:        websocket.NewHub(),
 	}
@@ -212,6 +214,10 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("PUT /api/prompts/{id}", s.handlePromptPut)
 	s.mux.HandleFunc("DELETE /api/prompts/{id}", s.handlePromptDelete)
 	s.mux.HandleFunc("GET /api/prompts/{id}/stats", s.handlePromptStats)
+	s.mux.HandleFunc("GET /api/prompts/{id}/chain-steps", s.handleChainStepsGet)
+	s.mux.HandleFunc("PUT /api/prompts/{id}/chain-steps", s.handleChainStepsPut)
+	s.mux.HandleFunc("GET /api/chain-runs/{id}", s.handleChainRunGet)
+	s.mux.HandleFunc("POST /api/chain-runs/{id}/cancel", s.handleChainRunCancel)
 
 	// Frontend: serve embedded SPA, with fallback to index.html for client-side routing
 	s.mux.HandleFunc("/", s.handleFrontend)

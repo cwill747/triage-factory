@@ -49,6 +49,19 @@ type runConfig struct {
 	projectID *string // entity's project assignment (nil for un-assigned); SKY-219 uses this to copy the project's knowledge-base into ./_scratch/project-knowledge/
 
 	extraAllowedTools string // comma-separated extra tools from prompt.AllowedTools + agent scans; merged into --allowedTools at spawn time
+
+	// Chain-mode toggles. When isChainStep is true the chain
+	// orchestrator owns the worktree lifecycle: runAgent's cleanup
+	// defers (RemoveAt, RemoveRunRoot, RemoveClaudeProjectDir) all
+	// short-circuit so the worktree survives across steps. The
+	// orchestrator runs the equivalent cleanup once after the chain
+	// terminates. appendSysPrompt is forwarded to agentproc as
+	// --append-system-prompt so the chain protocol reaches the model
+	// without modifying the step's prompt body.
+	chainRunID      string
+	chainStep       int
+	isChainStep     bool
+	appendSysPrompt string
 }
 
 // Delegate kicks off an async agent run for any task type.
@@ -81,6 +94,11 @@ func (s *Spawner) Delegate(task domain.Task, explicitPromptID string, triggerTyp
 	if triggerType == "" {
 		triggerType = "manual"
 	}
+
+	if resolved.Kind == domain.PromptKindChain {
+		return s.delegateChain(task, resolved, triggerType, triggerID, ghClient, model)
+	}
+
 	runID := uuid.New().String()
 	if err := db.CreateAgentRun(s.database, domain.AgentRun{
 		ID:          runID,

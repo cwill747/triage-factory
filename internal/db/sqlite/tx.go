@@ -37,6 +37,7 @@ func (s *Store) WithTx(ctx context.Context, orgID, userID string, fn func(db.TxS
 		Secrets:    newSecretStore(),
 		TaskRules:  newTaskRuleStore(tx),
 		Triggers:   newTriggerStore(tx),
+		Chains:     newChainStore(tx),
 		Agents:     newAgentStore(tx),
 		TeamAgents: newTeamAgentStore(tx),
 	}
