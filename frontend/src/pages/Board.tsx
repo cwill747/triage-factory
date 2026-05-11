@@ -85,7 +85,7 @@ export default function Board() {
         return {
           ID: `__pending-${chainRunID}-${i}`,
           Status: 'pending',
-          ChainRunID: chainRunID,
+          chain_run_id: chainRunID,
           ChainStepIndex: i,
         } as unknown as AgentRun
       })
@@ -125,11 +125,11 @@ export default function Board() {
 
             // Chain runs: collect all step runs and use the active step
             // (or the latest) as the "main" run for the AgentCard.
-            const chainRunID = latestRun.ChainRunID
+            const chainRunID = latestRun.chain_run_id
             if (chainRunID) {
               const stepRuns = runs
-                .filter((r) => r.ChainRunID === chainRunID)
-                .sort((a, b) => (a.ChainStepIndex ?? 0) - (b.ChainStepIndex ?? 0))
+                .filter((r) => r.chain_run_id === chainRunID)
+                .sort((a, b) => (a.chain_step_index ?? 0) - (b.chain_step_index ?? 0))
               await seedChainStepRuns(task.id, chainRunID)
               const activeStep =
                 stepRuns.find((r) =>
@@ -212,8 +212,8 @@ export default function Board() {
               // First WS update for a chain step seeds the chain
               // indicator. Without this, the first step of a brand-new
               // chain renders alone until step 2 starts.
-              if (fullRun.ChainRunID) {
-                seedChainStepRuns(fullRun.TaskID, fullRun.ChainRunID)
+              if (fullRun.chain_run_id) {
+                seedChainStepRuns(fullRun.TaskID, fullRun.chain_run_id)
               }
             })
             .catch(() => {})
@@ -227,7 +227,7 @@ export default function Board() {
             let isChainStep = false
             setChainStepRuns((prev) => {
               for (const steps of Object.values(prev)) {
-                if (steps.some((r) => r.ChainRunID && r.ID === event.run_id)) {
+                if (steps.some((r) => r.chain_run_id && r.ID === event.run_id)) {
                   isChainStep = true
                   break
                 }
@@ -242,8 +242,8 @@ export default function Board() {
                 .then((fullRun: AgentRun | null) => {
                   if (!fullRun) return
                   setAgentRuns((p) => ({ ...p, [fullRun.TaskID]: fullRun }))
-                  if (fullRun.ChainRunID) {
-                    seedChainStepRuns(fullRun.TaskID, fullRun.ChainRunID)
+                  if (fullRun.chain_run_id) {
+                    seedChainStepRuns(fullRun.TaskID, fullRun.chain_run_id)
                   }
                 })
                 .catch(() => {})
