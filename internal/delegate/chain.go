@@ -265,8 +265,15 @@ func (s *Spawner) runChain(
 		stepCfg.chainRunID = chainRunID
 		stepCfg.chainStep = i
 		stepCfg.appendSysPrompt = chainStepSystemPrompt
+		stepCfg.extraAllowedTools = s.collectExtraTools(stepPrompt.AllowedTools)
 
-		mission := buildChainStepWrapperPrompt(task, step, stepPrompt, slug, len(steps))
+		var nextStepName string
+		if i+1 < len(steps) {
+			if np, err := s.prompts.Get(context.Background(), runmode.LocalDefaultOrg, steps[i+1].StepPromptID); err == nil && np != nil {
+				nextStepName = np.Name
+			}
+		}
+		mission := buildChainStepWrapperPrompt(task, step, stepPrompt, slug, len(steps), nextStepName)
 
 		toast.Info(s.wsHub, fmt.Sprintf("Chain step %d/%d: %s (%s)",
 			i+1, len(steps), truncateToastMsg(stepPrompt.Name, 60), shortRunID(stepRunID)))
@@ -336,6 +343,18 @@ func (s *Spawner) runChain(
 			}
 			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusAborted,
 				"no-verdict", &step.StepIndex, false)
+			return
+		}
+		if verdict.Final {
+			// --final: step decided the chain's intended outcome is reached
+			// here. Terminate as completed (closes the task) and record the
+			// step index so the UI can show "exited early at step N".
+			reason := verdict.Reason
+			if reason == "" {
+				reason = "step recorded --final"
+			}
+			s.terminateChain(chainRunID, task.ID, triggerType, startTime, cfg, domain.ChainRunStatusCompleted,
+				reason, &step.StepIndex, false)
 			return
 		}
 		if !verdict.Proceed {
@@ -451,7 +470,7 @@ func taskEntityID(database *sqlDB, taskID string) string {
 // the brief, the chain protocol lives in --append-system-prompt, and
 // the SKILL.md materialized into .claude/skills/<slug>/ carries the
 // real mission.
-func buildChainStepWrapperPrompt(task domain.Task, step domain.ChainStep, stepPrompt *domain.Prompt, slug string, total int) string {
+func buildChainStepWrapperPrompt(task domain.Task, step domain.ChainStep, stepPrompt *domain.Prompt, slug string, total int, nextStepName string) string {
 	mission := strings.TrimSpace(step.Brief)
 	if mission == "" {
 		mission = stepPrompt.Name
@@ -472,12 +491,39 @@ func buildChainStepWrapperPrompt(task domain.Task, step domain.ChainStep, stepPr
 	b.WriteString("cwd). Read that file FIRST — it carries the verdicts and notes from steps\n")
 	b.WriteString("that ran before you. If the file does not exist, you are step 1 and there\n")
 	b.WriteString("is no prior context.\n\n")
+	isFinal := step.StepIndex+1 == total
+	if isFinal {
+		b.WriteString("You are the FINAL step. You may take external actions (submit reviews,\n")
+		b.WriteString("create PRs, post comments) as your skill directs.\n\n")
+	} else {
+		nextLabel := nextStepName
+		if nextLabel == "" {
+			nextLabel = fmt.Sprintf("step %d", step.StepIndex+2)
+		}
+		fmt.Fprintf(&b, "You are NOT the final step — %q follows you.\n", nextLabel)
+		b.WriteString("Do NOT take external actions: do not submit reviews, create PRs, post\n")
+		b.WriteString("comments, or push branches. Write your findings to _scratch/handoff.md\n")
+		b.WriteString("only. The next step will handle the external action.\n\n")
+		b.WriteString("EARLY-EXIT EXCEPTION: if you determine the chain's intended outcome\n")
+		b.WriteString("can be achieved here without later steps (e.g., this PR doesn't need\n")
+		b.WriteString("review and you should post a SKIP review to clear the queue), you MAY\n")
+		b.WriteString("take that single terminal action — and you MUST then record --final\n")
+		b.WriteString("(see verdict block below). The action still flows through the normal\n")
+		b.WriteString("human-approval gate.\n\n")
+	}
+
 	b.WriteString("Before emitting the completion envelope:\n")
 	b.WriteString("  1. Append a section to ./_scratch/handoff.md describing what you did,\n")
 	b.WriteString("     what you found, and any signals the next step should know about.\n")
 	b.WriteString("  2. Record a chain verdict by running EXACTLY one of:\n")
 	fmt.Fprintf(&b, "        %s exec chain verdict --proceed --reason \"<one line>\"\n", binaryPath)
 	fmt.Fprintf(&b, "        %s exec chain verdict --abort   --reason \"<why>\"\n", binaryPath)
+	fmt.Fprintf(&b, "        %s exec chain verdict --final   --reason \"<why>\"\n", binaryPath)
+	b.WriteString("     --proceed: advance to the next step.\n")
+	b.WriteString("     --abort:   stop the chain; the task stays open for human review.\n")
+	b.WriteString("     --final:   stop the chain successfully; the task closes. Use this\n")
+	b.WriteString("                when you took (or are about to take) the terminal\n")
+	b.WriteString("                external action that resolves the task.\n")
 	b.WriteString("     The verdict is required. Skipping it is treated as --abort with\n")
 	b.WriteString("     reason \"no-verdict\".\n\n")
 	b.WriteString("Then emit the standard completion JSON envelope.\n")
@@ -546,13 +592,93 @@ func (s *Spawner) ResumeChainAfterYield(stepRunID string) {
 	log.Printf("[chain] yield-resume completed for chain_run %s step run %s; chain advance not yet automatic", cr.ID, stepRunID)
 }
 
-// ResumeChainAfterApproval is the analog of ResumeChainAfterYield for
-// the pending_approval gate. Same v1 limitation: the chain stalls
-// visibly and a human can manually delegate the next step.
+// ResumeChainAfterApproval is invoked by the reviews / pending-PR
+// approval handlers after they flip a step run from pending_approval
+// back to completed. It only handles the --final verdict case (the only
+// shape under which a chain step is allowed to land in pending_approval
+// — see the guard in spawner.processCompletion): terminate the chain
+// as completed, close the task, and clean the shared worktree.
+//
+// If the verdict is missing or is not Final, the chain stays in
+// 'running' on the assumption that something raced or the agent
+// recorded the wrong verdict; a human can inspect chain_runs and
+// resolve manually rather than have us guess.
 func (s *Spawner) ResumeChainAfterApproval(stepRunID string) {
-	cr, _, err := db.GetChainRunForRun(s.database, stepRunID)
+	cr, stepIdx, err := db.GetChainRunForRun(s.database, stepRunID)
 	if err != nil || cr == nil {
 		return
 	}
-	log.Printf("[chain] approval-resume completed for chain_run %s step run %s; chain advance not yet automatic", cr.ID, stepRunID)
+	if cr.Status != domain.ChainRunStatusRunning {
+		return
+	}
+
+	verdict, err := db.GetLatestChainVerdict(s.database, stepRunID)
+	if err != nil {
+		log.Printf("[chain] approval-resume run %s: read verdict: %v", stepRunID, err)
+		return
+	}
+	if verdict == nil || !verdict.Final {
+		log.Printf("[chain] approval-resume chain_run %s step run %s: verdict not --final (%+v); chain left running", cr.ID, stepRunID, verdict)
+		return
+	}
+
+	task, err := db.GetTask(s.database, cr.TaskID)
+	if err != nil || task == nil {
+		log.Printf("[chain] approval-resume chain_run %s: load task: %v", cr.ID, err)
+		return
+	}
+
+	// Reconstruct just enough runConfig for terminateChain's worktree
+	// cleanup. The original orchestrator goroutine (which held the full
+	// cfg) returned when the step landed in pending_approval, so we
+	// rebuild from durable state. owner/repo/prNumber/headRef are not
+	// stored on chain_runs; CleanupPRConfig is best-effort and skipped
+	// here — leaves a few stale git config entries but no user-visible
+	// effect.
+	cfg := runConfig{wtPath: cr.WorktreePath, runRoot: cr.WorktreePath}
+	if task.EntitySource == "github" {
+		cfg.hasWT = true
+	}
+
+	reason := verdict.Reason
+	if reason == "" {
+		reason = "step recorded --final"
+	}
+	s.terminateChain(cr.ID, cr.TaskID, cr.TriggerType, cr.StartedAt, cfg,
+		domain.ChainRunStatusCompleted, reason, stepIdx, false)
+}
+
+// isNonFinalChainStep returns true when the run is a chain step that
+// is not the last step in the chain. Used as a guard in
+// processCompletion to prevent mid-chain approval stalls.
+func (s *Spawner) isNonFinalChainStep(runID string) bool {
+	var chainRunID sql.NullString
+	var stepIndex sql.NullInt64
+	if err := s.database.QueryRow(
+		`SELECT chain_run_id, chain_step_index FROM runs WHERE id = ?`, runID,
+	).Scan(&chainRunID, &stepIndex); err != nil || !chainRunID.Valid || !stepIndex.Valid {
+		return false
+	}
+	var chainPromptID string
+	if err := s.database.QueryRow(
+		`SELECT chain_prompt_id FROM chain_runs WHERE id = ?`, chainRunID.String,
+	).Scan(&chainPromptID); err != nil {
+		return false
+	}
+	steps, err := db.ListChainSteps(s.database, chainPromptID)
+	if err != nil {
+		return false
+	}
+	return int(stepIndex.Int64)+1 < len(steps)
+}
+
+// discardPendingArtifacts removes pending_reviews and pending_prs rows
+// created by a chain step that should not have taken external actions.
+func (s *Spawner) discardPendingArtifacts(runID string) {
+	if err := db.DeletePendingReviewByRunID(s.database, runID); err != nil {
+		log.Printf("[delegate] discard pending review for run %s: %v", runID, err)
+	}
+	if err := db.DeletePendingPRByRunID(s.database, runID); err != nil {
+		log.Printf("[delegate] discard pending PR for run %s: %v", runID, err)
+	}
 }

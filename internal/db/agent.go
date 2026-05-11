@@ -197,7 +197,7 @@ func AgentRunsForTask(database *sql.DB, taskID string) ([]domain.AgentRun, error
 	rows, err := database.Query(`
 		SELECT r.id, r.task_id, r.status, r.model, r.started_at, r.completed_at,
 		       r.total_cost_usd, r.duration_ms, r.num_turns, r.stop_reason, r.worktree_path,
-		       r.result_summary, r.session_id,
+		       r.result_summary, r.session_id, r.chain_run_id, r.chain_step_index,
 		       (NULLIF(TRIM(rm.agent_content, ' ' || char(9) || char(10) || char(13)), '') IS NULL) AS memory_missing
 		FROM runs r
 		LEFT JOIN run_memory rm ON rm.run_id = r.id
@@ -214,12 +214,12 @@ func AgentRunsForTask(database *sql.DB, taskID string) ([]domain.AgentRun, error
 		var r domain.AgentRun
 		var completedAt sql.NullTime
 		var costUSD sql.NullFloat64
-		var durationMs, numTurns sql.NullInt64
-		var stopReason, worktreePath, model, resultSummary, sessionID sql.NullString
+		var durationMs, numTurns, chainStep sql.NullInt64
+		var stopReason, worktreePath, model, resultSummary, sessionID, chainRunID sql.NullString
 
 		if err := rows.Scan(&r.ID, &r.TaskID, &r.Status, &model, &r.StartedAt, &completedAt,
 			&costUSD, &durationMs, &numTurns, &stopReason, &worktreePath,
-			&resultSummary, &sessionID, &r.MemoryMissing); err != nil {
+			&resultSummary, &sessionID, &chainRunID, &chainStep, &r.MemoryMissing); err != nil {
 			return nil, err
 		}
 
@@ -228,6 +228,13 @@ func AgentRunsForTask(database *sql.DB, taskID string) ([]domain.AgentRun, error
 		r.WorktreePath = worktreePath.String
 		r.ResultSummary = resultSummary.String
 		r.SessionID = sessionID.String
+		if chainRunID.Valid {
+			r.ChainRunID = chainRunID.String
+		}
+		if chainStep.Valid {
+			v := int(chainStep.Int64)
+			r.ChainStepIndex = &v
+		}
 		if completedAt.Valid {
 			r.CompletedAt = &completedAt.Time
 		}

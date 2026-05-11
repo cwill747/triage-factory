@@ -270,14 +270,22 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 		if _, err := s.db.Exec(`UPDATE runs SET status = 'completed' WHERE id = ? AND status = 'pending_approval'`, pr.RunID); err != nil {
 			log.Printf("[pending-prs] warning: failed to update run %s status: %v", pr.RunID, err)
 		}
-		if _, err := s.db.Exec(`UPDATE tasks SET status = 'done' WHERE id = (SELECT task_id FROM runs WHERE id = ?)`, pr.RunID); err != nil {
-			log.Printf("[pending-prs] warning: failed to update task status for run %s: %v", pr.RunID, err)
+		// Skip the blanket task-mark-done for chain steps; terminateChain
+		// owns task closure so the chain_runs row finalizes first.
+		chainRun, _, _ := db.GetChainRunForRun(s.db, pr.RunID)
+		if chainRun == nil {
+			if _, err := s.db.Exec(`UPDATE tasks SET status = 'done' WHERE id = (SELECT task_id FROM runs WHERE id = ?)`, pr.RunID); err != nil {
+				log.Printf("[pending-prs] warning: failed to update task status for run %s: %v", pr.RunID, err)
+			}
 		}
 		s.ws.Broadcast(websocket.Event{
 			Type:  "agent_run_update",
 			RunID: pr.RunID,
 			Data:  map[string]string{"status": "completed"},
 		})
+		if chainRun != nil && s.spawner != nil {
+			s.spawner.ResumeChainAfterApproval(pr.RunID)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{

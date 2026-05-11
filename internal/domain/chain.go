@@ -52,8 +52,19 @@ type ChainRun struct {
 // `triagefactory exec chain verdict`. Stored as run_artifacts.metadata_json
 // with kind='chain:verdict'. Latest by created_at wins per step (idempotent
 // re-recording within a step).
+//
+// Tri-state semantics encoded in (Proceed, Final):
+//   - Proceed=true,  Final=false → advance to next step
+//   - Proceed=false, Final=false → abort the chain; leave task open for human
+//   - Proceed=false, Final=true  → end the chain successfully at this step;
+//     close the task. The step is allowed one terminal external action
+//     (e.g., posting a SKIP review) which still flows through the existing
+//     human-approval gate.
+//
+// Final=true with Proceed=true is invalid; the CLI rejects it.
 type ChainVerdict struct {
 	Proceed   bool   `json:"proceed"`
+	Final     bool   `json:"final,omitempty"`
 	Reason    string `json:"reason"`
 	Notes     string `json:"notes,omitempty"`
 	Synthetic bool   `json:"synthetic,omitempty"` // set when the orchestrator inserts a no-verdict default

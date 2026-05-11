@@ -317,6 +317,14 @@ func (s *Spawner) processCompletion(
 		// approves via the UI and the server flips back to completed.
 		// Frontend distinguishes by which side-table has a row (the
 		// /api/agent/runs/{id} response carries pending_kind).
+		//
+		// Non-final chain steps must not submit reviews/PRs (the wrapper
+		// prompt forbids it) UNLESS they recorded a --final verdict, which
+		// is the explicit early-exit channel: the step is allowed one
+		// terminal external action (e.g., a SKIP review) and the action
+		// still flows through this same human-approval gate. Without the
+		// --final escape hatch, a misfiring non-final step would stall the
+		// chain on approval, so we discard its pending artifacts.
 		hasPending := false
 		if pendingReview, _ := db.PendingReviewByRunID(s.database, runID); pendingReview != nil {
 			hasPending = true
@@ -324,9 +332,21 @@ func (s *Spawner) processCompletion(
 			hasPending = true
 		}
 		if hasPending {
-			status = "pending_approval"
-			if _, err := s.database.Exec(`UPDATE runs SET status = ? WHERE id = ?`, status, runID); err != nil {
-				log.Printf("[delegate] warning: failed to set pending_approval for run %s: %v", runID, err)
+			allow := true
+			if s.isNonFinalChainStep(runID) {
+				verdict, _ := db.GetLatestChainVerdict(s.database, runID)
+				if verdict == nil || !verdict.Final {
+					allow = false
+				}
+			}
+			if !allow {
+				log.Printf("[delegate] run %s is a non-final chain step without --final verdict but created pending artifacts; discarding to avoid mid-chain stall", runID)
+				s.discardPendingArtifacts(runID)
+			} else {
+				status = "pending_approval"
+				if _, err := s.database.Exec(`UPDATE runs SET status = ? WHERE id = ?`, status, runID); err != nil {
+					log.Printf("[delegate] warning: failed to set pending_approval for run %s: %v", runID, err)
+				}
 			}
 		}
 	}

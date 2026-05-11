@@ -24,11 +24,22 @@ import (
 const HelpText = `Chain Commands:
   chain verdict --proceed --reason <text> [--notes <text>]
   chain verdict --abort   --reason <text> [--notes <text>]
+  chain verdict --final   --reason <text> [--notes <text>]
 
 Records the chain step's verdict. Read by the orchestrator after the
-step's completion envelope. Exactly one of --proceed / --abort must be
-set. The verdict is persisted to run_artifacts(kind='chain:verdict');
+step's completion envelope. Exactly one of --proceed / --abort / --final
+must be set. The verdict is persisted to run_artifacts(kind='chain:verdict');
 the orchestrator picks the most recent verdict written by the step.
+
+  --proceed  advance to the next step
+  --abort    stop the chain; leave the task open for human inspection
+  --final    end the chain successfully at this step; close the task.
+             The step may take one terminal external action (post a
+             review, comment, or PR) before recording --final; that
+             action still passes through the standard human-approval
+             gate. Use this when the step decides the chain's intended
+             outcome can be achieved here without further steps (e.g.,
+             a preflight that posts a SKIP review and exits).
 
 Idempotency: re-running this command in the same step appends a new
 verdict artifact; the orchestrator reads the most recent. Use this if
@@ -61,19 +72,31 @@ func runVerdict(database *db.DB, args []string) {
 	var (
 		proceed bool
 		abort   bool
+		final   bool
 		reason  string
 		notes   string
 	)
 	fs.BoolVar(&proceed, "proceed", false, "advance the chain to the next step")
-	fs.BoolVar(&abort, "abort", false, "stop the chain")
+	fs.BoolVar(&abort, "abort", false, "stop the chain (leave task open)")
+	fs.BoolVar(&final, "final", false, "end the chain successfully at this step (close task)")
 	fs.StringVar(&reason, "reason", "", "one-line reason (required)")
 	fs.StringVar(&notes, "notes", "", "optional longer notes")
 	if err := fs.Parse(args); err != nil {
 		exitErr("parse flags: " + err.Error())
 	}
-	if proceed == abort {
-		// Both unset or both set — neither is a valid verdict.
-		exitErr("exactly one of --proceed / --abort is required")
+	// Exactly one of the three modes must be set.
+	set := 0
+	if proceed {
+		set++
+	}
+	if abort {
+		set++
+	}
+	if final {
+		set++
+	}
+	if set != 1 {
+		exitErr("exactly one of --proceed / --abort / --final is required")
 	}
 	if reason == "" {
 		exitErr("--reason is required")
@@ -97,6 +120,7 @@ func runVerdict(database *db.DB, args []string) {
 
 	verdict := domain.ChainVerdict{
 		Proceed: proceed,
+		Final:   final,
 		Reason:  reason,
 		Notes:   notes,
 	}
@@ -112,6 +136,7 @@ func runVerdict(database *db.DB, args []string) {
 		"recorded": true,
 		"step":     stepIdx,
 		"proceed":  proceed,
+		"final":    final,
 	}
 	enc := json.NewEncoder(os.Stdout)
 	if err := enc.Encode(out); err != nil {
