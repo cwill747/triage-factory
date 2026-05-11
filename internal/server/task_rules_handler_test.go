@@ -40,7 +40,7 @@ func newTestServer(t *testing.T) *Server {
 		t.Fatalf("config init: %v", err)
 	}
 	stores := sqlitestore.New(database)
-	return New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.TaskRules, stores.Triggers)
+	return New(database, stores.Prompts, stores.Swipes, stores.Dashboard, stores.TaskRules, stores.Triggers, stores.Chains)
 }
 
 // doJSON performs a JSON request against the server's mux and returns the

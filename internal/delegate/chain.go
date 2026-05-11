@@ -40,7 +40,7 @@ var chainStepSystemPrompt string
 // the chain row by id, so a synchronous error wouldn't be reflected
 // anywhere visible.
 func (s *Spawner) delegateChain(task domain.Task, chainPrompt *domain.Prompt, triggerType, triggerID string, gh *ghclient.Client, model string) (string, error) {
-	steps, err := db.ListChainSteps(s.database, chainPrompt.ID)
+	steps, err := s.chains.ListSteps(context.Background(), runmode.LocalDefaultOrg, chainPrompt.ID)
 	if err != nil {
 		return "", fmt.Errorf("load chain steps: %w", err)
 	}
@@ -83,7 +83,7 @@ func (s *Spawner) delegateChain(task domain.Task, chainPrompt *domain.Prompt, tr
 		if setupErr != nil {
 			// Persist a chain_runs row anyway so the UI has something to
 			// show; mark it failed with the setup error as abort_reason.
-			_, _ = db.CreateChainRun(s.database, domain.ChainRun{
+			_, _ = s.chains.CreateRun(ctx, runmode.LocalDefaultOrg, domain.ChainRun{
 				ID:            chainRunID,
 				ChainPromptID: chainPrompt.ID,
 				TaskID:        task.ID,
@@ -92,11 +92,11 @@ func (s *Spawner) delegateChain(task domain.Task, chainPrompt *domain.Prompt, tr
 				Status:        domain.ChainRunStatusFailed,
 				WorktreePath:  "",
 			})
-			_, _ = db.MarkChainRunStatus(s.database, chainRunID, domain.ChainRunStatusFailed, setupErr.Error(), nil)
+			_, _ = s.chains.MarkRunStatus(ctx, runmode.LocalDefaultOrg, chainRunID, domain.ChainRunStatusFailed, setupErr.Error(), nil)
 			return
 		}
 
-		if _, err := db.CreateChainRun(s.database, domain.ChainRun{
+		if _, err := s.chains.CreateRun(ctx, runmode.LocalDefaultOrg, domain.ChainRun{
 			ID:            chainRunID,
 			ChainPromptID: chainPrompt.ID,
 			TaskID:        task.ID,
@@ -291,7 +291,7 @@ func (s *Spawner) runChain(
 		}
 
 		// Step completed cleanly. Read the verdict.
-		verdict, err := db.GetLatestChainVerdict(s.database, stepRunID)
+		verdict, err := s.chains.GetLatestVerdict(ctx, runmode.LocalDefaultOrg, stepRunID)
 		if err != nil {
 			log.Printf("[chain] run %s step %d: read verdict: %v", chainRunID, i, err)
 		}
@@ -304,7 +304,7 @@ func (s *Spawner) runChain(
 				Synthetic: true,
 			}
 			if payload, err := json.Marshal(synthetic); err == nil {
-				if insertErr := db.InsertRunArtifact(s.database, stepRunID, "chain:verdict", string(payload)); insertErr != nil {
+				if insertErr := s.chains.InsertVerdict(ctx, runmode.LocalDefaultOrg, stepRunID, string(payload)); insertErr != nil {
 					log.Printf("[chain] run %s step %d: insert synthetic verdict artifact: %v", chainRunID, i, insertErr)
 				}
 			}
@@ -361,7 +361,7 @@ func (s *Spawner) terminateChain(
 	abortedAtStep *int,
 	skipCleanup bool,
 ) {
-	if _, err := db.MarkChainRunStatus(s.database, chainRunID, status, abortReason, abortedAtStep); err != nil {
+	if _, err := s.chains.MarkRunStatus(context.Background(), runmode.LocalDefaultOrg, chainRunID, status, abortReason, abortedAtStep); err != nil {
 		log.Printf("[chain] FATAL: mark chain_run %s status=%s: %v — skipping cleanup to keep chain row consistent", chainRunID, status, err)
 		return
 	}
@@ -412,7 +412,7 @@ func (s *Spawner) runChainWorktreeCleanup(chainRunID string, cfg runConfig) {
 		// agent's TRIAGE_FACTORY_RUN_ID), not by the chain_run_id.
 		// Iterate every step run in the chain so we actually find and
 		// remove their reservations.
-		stepRuns, err := db.RunsForChain(s.database, chainRunID)
+		stepRuns, err := s.chains.RunsForChain(context.Background(), runmode.LocalDefaultOrg, chainRunID)
 		if err != nil {
 			log.Printf("[chain] run %s: list step runs for cleanup: %v", chainRunID, err)
 		}
@@ -489,7 +489,7 @@ func buildChainStepWrapperPrompt(task domain.Task, step domain.ChainStep, stepPr
 // row cancelled, and lets the active step's runAgent return naturally.
 // Safe to call when the chain is already terminal.
 func (s *Spawner) CancelChain(chainRunID string) error {
-	cr, err := db.GetChainRun(s.database, chainRunID)
+	cr, err := s.chains.GetRun(context.Background(), runmode.LocalDefaultOrg, chainRunID)
 	if err != nil {
 		return fmt.Errorf("load chain run: %w", err)
 	}
@@ -526,7 +526,7 @@ func (s *Spawner) CancelChain(chainRunID string) error {
 		s.mu.Unlock()
 	}
 
-	_, err = db.MarkChainRunStatus(s.database, chainRunID, domain.ChainRunStatusCancelled, "user_cancelled", nil)
+	_, err = s.chains.MarkRunStatus(context.Background(), runmode.LocalDefaultOrg, chainRunID, domain.ChainRunStatusCancelled, "user_cancelled", nil)
 	return err
 }
 
@@ -535,7 +535,7 @@ func (s *Spawner) CancelChain(chainRunID string) error {
 // Currently not fully implemented: marks the chain aborted so it
 // doesn't silently stall in 'running'.
 func (s *Spawner) ResumeChainAfterYield(stepRunID string) {
-	cr, stepIdx, err := db.GetChainRunForRun(s.database, stepRunID)
+	cr, stepIdx, err := s.chains.GetRunForRun(context.Background(), runmode.LocalDefaultOrg, stepRunID)
 	if err != nil || cr == nil {
 		return
 	}
@@ -547,7 +547,7 @@ func (s *Spawner) ResumeChainAfterYield(stepRunID string) {
 	if err != nil || task == nil {
 		log.Printf("[chain] yield-resume: load task for chain_run %s: %v", cr.ID, err)
 		// Fall back to a bare MarkChainRunStatus without full cleanup.
-		_, _ = db.MarkChainRunStatus(s.database, cr.ID, domain.ChainRunStatusAborted, "yield_resume_not_implemented", stepIdx)
+		_, _ = s.chains.MarkRunStatus(context.Background(), runmode.LocalDefaultOrg, cr.ID, domain.ChainRunStatusAborted, "yield_resume_not_implemented", stepIdx)
 		return
 	}
 	cfg := runConfig{wtPath: cr.WorktreePath}
@@ -570,7 +570,7 @@ func (s *Spawner) ResumeChainAfterYield(stepRunID string) {
 // recorded the wrong verdict; a human can inspect chain_runs and
 // resolve manually rather than have us guess.
 func (s *Spawner) ResumeChainAfterApproval(stepRunID string) {
-	cr, stepIdx, err := db.GetChainRunForRun(s.database, stepRunID)
+	cr, stepIdx, err := s.chains.GetRunForRun(context.Background(), runmode.LocalDefaultOrg, stepRunID)
 	if err != nil || cr == nil {
 		return
 	}
@@ -578,7 +578,7 @@ func (s *Spawner) ResumeChainAfterApproval(stepRunID string) {
 		return
 	}
 
-	verdict, err := db.GetLatestChainVerdict(s.database, stepRunID)
+	verdict, err := s.chains.GetLatestVerdict(context.Background(), runmode.LocalDefaultOrg, stepRunID)
 	if err != nil {
 		log.Printf("[chain] approval-resume run %s: read verdict: %v", stepRunID, err)
 		return
@@ -640,7 +640,7 @@ func (s *Spawner) isNonFinalChainStep(runID string) bool {
 		log.Printf("[chain] isNonFinalChainStep: query chain_run %s for run %s: %v", chainRunID.String, runID, err)
 		return true
 	}
-	steps, err := db.ListChainSteps(s.database, chainPromptID)
+	steps, err := s.chains.ListSteps(context.Background(), runmode.LocalDefaultOrg, chainPromptID)
 	if err != nil {
 		log.Printf("[chain] isNonFinalChainStep: list steps for chain %s run %s: %v", chainRunID.String, runID, err)
 		return true

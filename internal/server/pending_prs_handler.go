@@ -10,6 +10,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/agentmeta"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -272,7 +273,7 @@ func (s *Server) handlePendingPRSubmit(w http.ResponseWriter, r *http.Request) {
 		}
 		// Skip the blanket task-mark-done for chain steps; terminateChain
 		// owns task closure so the chain_runs row finalizes first.
-		chainRun, _, _ := db.GetChainRunForRun(s.db, pr.RunID)
+		chainRun, _, _ := s.chains.GetRunForRun(r.Context(), runmode.LocalDefaultOrg, pr.RunID)
 		if chainRun == nil {
 			if _, err := s.db.Exec(`UPDATE tasks SET status = 'done' WHERE id = (SELECT task_id FROM runs WHERE id = ?)`, pr.RunID); err != nil {
 				log.Printf("[pending-prs] warning: failed to update task status for run %s: %v", pr.RunID, err)

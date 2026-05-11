@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
@@ -28,7 +27,7 @@ func (s *Server) handleChainStepsGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	steps, err := db.ListChainSteps(s.db, id)
+	steps, err := s.chains.ListSteps(r.Context(), runmode.LocalDefaultOrg, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -122,7 +121,7 @@ func (s *Server) handleChainStepsPut(w http.ResponseWriter, r *http.Request) {
 		briefs = append(briefs, step.Brief)
 	}
 
-	if err := db.ReplaceChainSteps(s.db, id, stepIDs, briefs); err != nil {
+	if err := s.chains.ReplaceSteps(r.Context(), runmode.LocalDefaultOrg, id, stepIDs, briefs); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
@@ -147,7 +146,7 @@ type chainRunStepView struct {
 func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	cr, err := db.GetChainRun(s.db, id)
+	cr, err := s.chains.GetRun(r.Context(), runmode.LocalDefaultOrg, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -157,13 +156,13 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	steps, err := db.ListChainSteps(s.db, cr.ChainPromptID)
+	steps, err := s.chains.ListSteps(r.Context(), runmode.LocalDefaultOrg, cr.ChainPromptID)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
 
-	stepRuns, err := db.RunsForChain(s.db, id)
+	stepRuns, err := s.chains.RunsForChain(r.Context(), runmode.LocalDefaultOrg, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -177,7 +176,7 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	verdictsByRun, err := db.LatestChainVerdictsForRuns(s.db, runIDs)
+	verdictsByRun, err := s.chains.LatestVerdictsForRuns(r.Context(), runmode.LocalDefaultOrg, runIDs)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
@@ -199,7 +198,7 @@ func (s *Server) handleChainRunGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleChainRunCancel(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 
-	cr, err := db.GetChainRun(s.db, id)
+	cr, err := s.chains.GetRun(r.Context(), runmode.LocalDefaultOrg, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

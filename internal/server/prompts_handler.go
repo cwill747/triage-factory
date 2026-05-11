@@ -131,7 +131,7 @@ func (s *Server) handlePromptPut(w http.ResponseWriter, r *http.Request) {
 	if existing.Kind != kind {
 		if existing.Kind == domain.PromptKindChain {
 			// Reject chain→leaf if any chain steps exist.
-			steps, err := db.ListChainSteps(s.db, id)
+			steps, err := s.chains.ListSteps(r.Context(), runmode.LocalDefaultOrg, id)
 			if err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 				return
@@ -212,7 +212,7 @@ func (s *Server) handlePromptDelete(w http.ResponseWriter, r *http.Request) {
 	// Block deletion if this prompt is a step inside any chain. The FK
 	// is ON DELETE RESTRICT so the underlying constraint would fire
 	// anyway; we surface a friendlier message and the count of chains.
-	chainRefs, err := db.CountChainStepReferences(s.db, id)
+	chainRefs, err := s.chains.CountStepReferences(r.Context(), runmode.LocalDefaultOrg, id)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return

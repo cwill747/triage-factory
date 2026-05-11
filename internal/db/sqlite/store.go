@@ -35,6 +35,7 @@ func New(conn *sql.DB) db.Stores {
 		Secrets:   newSecretStore(),
 		TaskRules: newTaskRuleStore(conn),
 		Triggers:  newTriggerStore(conn),
+		Chains:    newChainStore(conn),
 		Tx:        s,
 	}
 	return s.stores

@@ -8,6 +8,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/agentmeta"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -158,7 +159,7 @@ func (s *Server) handleReviewSubmit(w http.ResponseWriter, r *http.Request) {
 		// orchestrator owns task closure (single closer guarantees the
 		// chain_runs row terminates first, so the UI never shows a "done"
 		// task with a still-running chain).
-		chainRun, _, _ := db.GetChainRunForRun(s.db, review.RunID)
+		chainRun, _, _ := s.chains.GetRunForRun(r.Context(), runmode.LocalDefaultOrg, review.RunID)
 		if chainRun == nil {
 			if _, err := s.db.Exec(`UPDATE tasks SET status = 'done' WHERE id = (SELECT task_id FROM runs WHERE id = ?)`, review.RunID); err != nil {
 				log.Printf("[reviews] warning: failed to update task status for run %s: %v", review.RunID, err)

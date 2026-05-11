@@ -11,6 +11,7 @@
 package chain
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // HelpText is the help block for `chain` commands.
@@ -50,14 +52,14 @@ spawner). The command refuses to run when invoked outside a chain
 step (the run has no chain_run_id).`
 
 // Handle dispatches chain subcommands.
-func Handle(database *db.DB, args []string) {
+func Handle(chains db.ChainStore, args []string) {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		printHelp()
 		return
 	}
 	switch args[0] {
 	case "verdict":
-		runVerdict(database, args[1:])
+		runVerdict(chains, args[1:])
 	default:
 		exitErr("unknown chain command: " + args[0])
 	}
@@ -67,7 +69,7 @@ func printHelp() {
 	fmt.Printf("Usage: triagefactory exec chain <command> [args]\n\n%s\n", HelpText)
 }
 
-func runVerdict(database *db.DB, args []string) {
+func runVerdict(chains db.ChainStore, args []string) {
 	fs := flag.NewFlagSet("chain verdict", flag.ContinueOnError)
 	var (
 		proceed bool
@@ -106,7 +108,8 @@ func runVerdict(database *db.DB, args []string) {
 		exitErr("TRIAGE_FACTORY_RUN_ID not set; chain verdict can only be recorded inside a delegation run")
 	}
 
-	chainRun, stepIdx, err := db.GetChainRunForRun(database.Conn, runID)
+	ctx := context.Background()
+	chainRun, stepIdx, err := chains.GetRunForRun(ctx, runmode.LocalDefaultOrg, runID)
 	if err != nil {
 		exitErr("lookup chain run: " + err.Error())
 	}
@@ -135,7 +138,7 @@ func runVerdict(database *db.DB, args []string) {
 	if err != nil {
 		exitErr("encode verdict: " + err.Error())
 	}
-	if err := db.InsertRunArtifact(database.Conn, runID, "chain:verdict", string(payload)); err != nil {
+	if err := chains.InsertVerdict(ctx, runmode.LocalDefaultOrg, runID, string(payload)); err != nil {
 		exitErr("record verdict: " + err.Error())
 	}
 

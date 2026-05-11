@@ -17,6 +17,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/toast"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 )
@@ -334,7 +335,7 @@ func (s *Spawner) processCompletion(
 		if hasPending {
 			allow := true
 			if s.isNonFinalChainStep(runID) {
-				verdict, _ := db.GetLatestChainVerdict(s.database, runID)
+				verdict, _ := s.chains.GetLatestVerdict(ctx, runmode.LocalDefaultOrg, runID)
 				if verdict == nil || verdict.Outcome != domain.ChainVerdictFinal {
 					allow = false
 				}

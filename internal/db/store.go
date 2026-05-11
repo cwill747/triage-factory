@@ -49,6 +49,12 @@ type Stores struct {
 	// now they ship as parallel stores with the same shape.
 	Triggers TriggerStore
 
+	// Chains owns prompt_chain_steps + chain_runs, plus the
+	// kind='chain:verdict' slice of run_artifacts. Read by the chain
+	// HTTP handlers; written by the delegate spawner and the exec
+	// verdict subcommand.
+	Chains ChainStore
+
 	// Tx is the transaction runner — handlers that need atomic
 	// multi-store writes call Tx.WithTx and receive a TxStores with
 	// every field tx-bound. Postgres impl also sets the JWT claims
@@ -69,6 +75,7 @@ type TxStores struct {
 	Secrets   SecretStore
 	TaskRules TaskRuleStore
 	Triggers  TriggerStore
+	Chains    ChainStore
 }
 
 // TxRunner runs fn inside a single database transaction. Postgres

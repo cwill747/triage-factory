@@ -11,6 +11,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/config"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	jiraclient "github.com/sky-ai-eng/triage-factory/internal/jira"
 )
@@ -54,6 +55,9 @@ func Handle(args []string) {
 		fmt.Fprintf(os.Stderr, "warning: loading config: %v (proceeding with defaults)\n", err)
 	}
 	database := &db.DB{Conn: conn}
+	// exec always runs in local mode against SQLite — multi-mode agents
+	// never shell out to `triagefactory exec`.
+	stores := sqlite.New(conn)
 
 	cmd := args[0]
 	cmdArgs := args[1:]
@@ -97,7 +101,7 @@ func Handle(args []string) {
 		// No credentials needed — chain verdict only writes a row in
 		// run_artifacts keyed by TRIAGE_FACTORY_RUN_ID. The orchestrator
 		// reads it back to decide whether to proceed.
-		chain.Handle(database, cmdArgs)
+		chain.Handle(stores.Chains, cmdArgs)
 
 	default:
 		fmt.Fprintf(os.Stderr, "unknown exec command: %s\nRun 'triagefactory exec --help' for usage.\n", cmd)
