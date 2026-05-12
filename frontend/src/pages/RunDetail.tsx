@@ -154,6 +154,9 @@ export default function RunDetail() {
   }, [run?.chain_run_id, run?.TaskID])
 
   // Keyboard shortcuts: Esc → back, 1/2 → modes, t → take over.
+  // handleTakeover is declared below; capture via ref so the listener
+  // doesn't need to re-bind every time `run` updates.
+  const handleTakeoverRef = useRef<() => void>(() => {})
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLElement) {
@@ -167,11 +170,17 @@ export default function RunDetail() {
         setMode('conversation')
       } else if (e.key === '2') {
         setMode('commands')
+      } else if (e.key === 't' || e.key === 'T') {
+        const canTakeOverNow = run?.Status === 'running' && !!run.SessionID && !takeoverPending
+        if (canTakeOverNow) {
+          e.preventDefault()
+          handleTakeoverRef.current()
+        }
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [navigate])
+  }, [navigate, run?.Status, run?.SessionID, takeoverPending])
 
   const handleTakeover = useCallback(async () => {
     if (!run) return
@@ -189,6 +198,7 @@ export default function RunDetail() {
       setTakeoverPending(false)
     }
   }, [run])
+  handleTakeoverRef.current = handleTakeover
 
   const handleCancel = useCallback(async () => {
     if (!run) return
