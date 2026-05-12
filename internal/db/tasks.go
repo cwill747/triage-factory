@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // --- Column lists for task queries ----------------------------------------
@@ -71,11 +72,16 @@ func FindOrCreateTaskAt(db *sql.DB, entityID, eventType, dedupKey, primaryEventI
 	// WHERE status NOT IN ('done','dismissed') will reject the INSERT. In
 	// that case, re-read the winner's row.
 	id := uuid.New().String()
+	// team_id + visibility populated explicitly per SKY-262: post-migration
+	// the team-scoped queue derived filter requires team_id on every task,
+	// and 'team' is the canonical visibility. In local mode the team is
+	// the LocalDefaultTeamID sentinel from SKY-269.
 	_, err = db.Exec(`
 		INSERT INTO tasks (id, entity_id, event_type, dedup_key, primary_event_id,
-		                   status, priority_score, scoring_status, created_at)
-		VALUES (?, ?, ?, ?, ?, 'queued', ?, 'pending', ?)
-	`, id, entityID, eventType, dedupKey, primaryEventID, defaultPriority, createdAt)
+		                   status, priority_score, scoring_status, created_at,
+		                   team_id, visibility)
+		VALUES (?, ?, ?, ?, ?, 'queued', ?, 'pending', ?, ?, 'team')
+	`, id, entityID, eventType, dedupKey, primaryEventID, defaultPriority, createdAt, runmode.LocalDefaultTeamID)
 	if err != nil {
 		// Race: another goroutine created the task between our SELECT and
 		// INSERT. Re-read to return the winner's row.
@@ -284,15 +290,32 @@ func GetTask(db *sql.DB, id string) (*domain.Task, error) {
 	return &t, nil
 }
 
-// QueuedTasks returns queued tasks ordered by task_rules.sort_order (category
-// ordering) then priority_score DESC within each tier. JOINs entities for
-// display and task_rules for ordering.
+// QueuedTasks returns queued tasks ordered by the matching rule's
+// sort_order (category ordering) then priority_score DESC within each tier.
+// JOINs entities for display; the rule_order derived table picks the
+// MIN(sort_order) per (org_id, event_type) so the outer query stays
+// one-row-per-task and stays tenant-correct.
+//
+// A direct LEFT JOIN on event_handlers would multiply each task row by the
+// number of enabled kind='rule' handlers for its event_type — two rules on
+// the same event_type would surface every matching task twice with
+// nondeterministic ordering. The derived table collapses that to one row
+// per (org_id, event_type) before the join.
+//
+// org_id is part of the derived-table GROUP BY + the outer ON clause so
+// rules in one org can't influence task ordering in another (latent at
+// N=1 in local mode today, load-bearing once multi-mode shares a DB).
 func QueuedTasks(db *sql.DB) ([]domain.Task, error) {
 	return queryTasks(db, `
 		SELECT `+taskColumnsWithEntity+`
 		FROM tasks t
 		JOIN entities e ON t.entity_id = e.id
-		LEFT JOIN task_rules tr ON t.event_type = tr.event_type AND tr.enabled = 1
+		LEFT JOIN (
+			SELECT org_id, event_type, MIN(sort_order) AS sort_order
+			FROM event_handlers
+			WHERE enabled = 1 AND kind = 'rule'
+			GROUP BY org_id, event_type
+		) tr ON t.event_type = tr.event_type AND t.org_id = tr.org_id
 		WHERE t.status = 'queued'
 			AND (t.snooze_until IS NULL OR t.snooze_until <= datetime('now'))
 		ORDER BY COALESCE(tr.sort_order, 999) ASC, COALESCE(t.priority_score, 0.5) DESC

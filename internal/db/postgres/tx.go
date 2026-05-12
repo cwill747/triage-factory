@@ -44,16 +44,15 @@ func (s *Store) WithTx(ctx context.Context, orgID, userID string, fn func(db.TxS
 	}
 
 	txStores := db.TxStores{
-		Scores:     newScoreStore(tx),
-		Prompts:    newTxPromptStore(tx),
-		Swipes:     newSwipeStore(tx),
-		Dashboard:  newDashboardStore(tx),
-		Secrets:    newSecretStore(tx),
-		TaskRules:  newTxTaskRuleStore(tx),
-		Triggers:   newTxTriggerStore(tx),
-		Chains:     newChainStore(tx),
-		Agents:     newTxAgentStore(tx),
-		TeamAgents: newTxTeamAgentStore(tx),
+		Scores:        newScoreStore(tx),
+		Prompts:       newTxPromptStore(tx),
+		Swipes:        newSwipeStore(tx),
+		Dashboard:     newDashboardStore(tx),
+		Secrets:       newSecretStore(tx),
+		EventHandlers: newTxEventHandlerStore(tx),
+		Chains:        newChainStore(tx),
+		Agents:        newTxAgentStore(tx),
+		TeamAgents:    newTxTeamAgentStore(tx),
 	}
 	if err := fn(txStores); err != nil {
 		return err

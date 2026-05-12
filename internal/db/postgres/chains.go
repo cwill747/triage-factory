@@ -317,9 +317,9 @@ func (s *chainStore) InsertVerdict(ctx context.Context, orgID, runID, metadataJS
 		return fmt.Errorf("postgres chains: invalid run_id %q", runID)
 	}
 	_, err := s.app.ExecContext(ctx, `
-		INSERT INTO run_artifacts (id, run_id, kind, metadata_json, is_primary, created_at)
-		VALUES (gen_random_uuid(), $1, 'chain:verdict', $2::jsonb, FALSE, now())
-	`, runID, metadataJSON)
+		INSERT INTO run_artifacts (id, run_id, org_id, kind, metadata_json, is_primary, created_at)
+		VALUES (gen_random_uuid(), $1, $2, 'chain:verdict', $3::jsonb, FALSE, now())
+	`, runID, orgID, metadataJSON)
 	return err
 }
 

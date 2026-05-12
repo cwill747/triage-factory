@@ -69,17 +69,15 @@ func New(admin, app *sql.DB) db.Stores {
 		// request.jwt.claims before calling (the wrapper enforces
 		// p_org_id == tf.current_org_id()).
 		Secrets: newSecretStore(app),
-		// TaskRules needs both pools: Seed writes shipped rows
-		// without JWT claims, but the task_rules_modify RLS policy
-		// gates inserts on creator_user_id = tf.current_user_id().
-		// The impl routes Seed to admin (BYPASSRLS) and every CRUD
-		// method to app — same pool-split pattern PromptStore uses.
-		TaskRules: newTaskRuleStore(app, admin),
-		// Triggers follows the same pool-split for the same reason
-		// (prompt_triggers_update gates org-visible writes on
-		// tf.user_is_org_admin() per 202605120001; Seed has no JWT
-		// claims and must run admin-side).
-		Triggers: newTriggerStore(app, admin),
+		// EventHandlers needs both pools: Seed writes shipped rows
+		// without JWT claims, but event_handlers_insert /
+		// event_handlers_update RLS policies gate on either
+		// creator_user_id = tf.current_user_id() or
+		// tf.user_is_org_admin() on org-visible writes. The impl
+		// routes Seed to admin (BYPASSRLS) and every CRUD method to
+		// app — same pool-split pattern PromptStore + the predecessor
+		// stores used.
+		EventHandlers: newEventHandlerStore(app, admin),
 		// Chains has no admin/app split — chain rows are user-created,
 		// no boot-time seed needs to bypass RLS. All methods run on the
 		// app pool; RLS enforces the creator predicate on chain_runs.
@@ -122,15 +120,14 @@ func New(admin, app *sql.DB) db.Stores {
 // test-side door into it.
 func NewForTx(tx *sql.Tx) db.TxStores {
 	return db.TxStores{
-		Scores:     newScoreStore(tx),
-		Prompts:    newTxPromptStore(tx),
-		Swipes:     newSwipeStore(tx),
-		Dashboard:  newDashboardStore(tx),
-		Secrets:    newSecretStore(tx),
-		TaskRules:  newTxTaskRuleStore(tx),
-		Triggers:   newTxTriggerStore(tx),
-		Chains:     newChainStore(tx),
-		Agents:     newTxAgentStore(tx),
-		TeamAgents: newTxTeamAgentStore(tx),
+		Scores:        newScoreStore(tx),
+		Prompts:       newTxPromptStore(tx),
+		Swipes:        newSwipeStore(tx),
+		Dashboard:     newDashboardStore(tx),
+		Secrets:       newSecretStore(tx),
+		EventHandlers: newTxEventHandlerStore(tx),
+		Chains:        newChainStore(tx),
+		Agents:        newTxAgentStore(tx),
+		TeamAgents:    newTxTeamAgentStore(tx),
 	}
 }

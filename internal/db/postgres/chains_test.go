@@ -216,9 +216,11 @@ func seedPgOrgForChains(t *testing.T, h *pgtest.Harness) (orgID, userID string) 
 // surface SQLite uses.
 func seedPgPrompt(t *testing.T, h *pgtest.Harness, orgID, userID, id, kind string) {
 	t.Helper()
+	// visibility='private' avoids the prompts_team_visibility_requires_team
+	// CHECK (SKY-262) without needing to seed a team row for the test.
 	if _, err := h.AdminDB.Exec(`
-		INSERT INTO prompts (id, org_id, creator_user_id, name, body, source, kind, allowed_tools, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 'body', 'user', $5, '[]'::jsonb, now(), now())
+		INSERT INTO prompts (id, org_id, creator_user_id, name, body, source, kind, visibility, allowed_tools, created_at, updated_at)
+		VALUES ($1, $2, $3, $4, 'body', 'user', $5, 'private', '[]'::jsonb, now(), now())
 	`, id, orgID, userID, id, kind); err != nil {
 		t.Fatalf("seed prompt %s: %v", id, err)
 	}
@@ -229,25 +231,26 @@ func seedPgPrompt(t *testing.T, h *pgtest.Harness, orgID, userID, id, kind strin
 // to exist in the right org with the right creator.
 func seedPgTask(t *testing.T, h *pgtest.Harness, orgID, userID string) string {
 	t.Helper()
+	teamID := seedPgDefaultTeam(t, h, orgID, userID)
 	entityID := uuid.New().String()
 	if _, err := h.AdminDB.Exec(`
-		INSERT INTO entities (id, org_id, creator_user_id, source, source_id, kind, title, url, snapshot_json, created_at)
-		VALUES ($1, $2, $3, 'github', $4, 'pr', 'Chains Test Entity', 'https://example/x', '{}'::jsonb, now())
-	`, entityID, orgID, userID, "chains-test-"+entityID[:8]); err != nil {
+		INSERT INTO entities (id, org_id, source, source_id, kind, title, url, snapshot_json, created_at)
+		VALUES ($1, $2, 'github', $3, 'pr', 'Chains Test Entity', 'https://example/x', '{}'::jsonb, now())
+	`, entityID, orgID, "chains-test-"+entityID[:8]); err != nil {
 		t.Fatalf("seed entity: %v", err)
 	}
 	eventID := uuid.New().String()
 	if _, err := h.AdminDB.Exec(`
-		INSERT INTO events (id, org_id, creator_user_id, entity_id, event_type, dedup_key, metadata_json, created_at)
-		VALUES ($1, $2, $3, $4, $5, '', '{}'::jsonb, now())
-	`, eventID, orgID, userID, entityID, domain.EventGitHubPRCICheckFailed); err != nil {
+		INSERT INTO events (id, org_id, entity_id, event_type, dedup_key, metadata_json, created_at)
+		VALUES ($1, $2, $3, $4, '', '{}'::jsonb, now())
+	`, eventID, orgID, entityID, domain.EventGitHubPRCICheckFailed); err != nil {
 		t.Fatalf("seed event: %v", err)
 	}
 	taskID := uuid.New().String()
 	if _, err := h.AdminDB.Exec(`
-		INSERT INTO tasks (id, org_id, creator_user_id, entity_id, event_type, dedup_key, primary_event_id, status, default_priority, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, $5, '', $6, 'open', 0.5, now(), now())
-	`, taskID, orgID, userID, entityID, domain.EventGitHubPRCICheckFailed, eventID); err != nil {
+		INSERT INTO tasks (id, org_id, creator_user_id, team_id, visibility, entity_id, event_type, dedup_key, primary_event_id, status, created_at)
+		VALUES ($1, $2, $3, $4, 'team', $5, $6, '', $7, 'queued', now())
+	`, taskID, orgID, userID, teamID, entityID, domain.EventGitHubPRCICheckFailed, eventID); err != nil {
 		t.Fatalf("seed task: %v", err)
 	}
 	return taskID
@@ -258,10 +261,11 @@ func seedPgTask(t *testing.T, h *pgtest.Harness, orgID, userID string) string {
 func seedPgRun(t *testing.T, h *pgtest.Harness, orgID, userID, taskID, promptID, chainRunID string, stepIdx int) string {
 	t.Helper()
 	runID := uuid.New().String()
+	teamID := firstTeamForOrg(t, h, orgID)
 	if _, err := h.AdminDB.Exec(`
-		INSERT INTO runs (id, org_id, creator_user_id, task_id, prompt_id, status, model, started_at, chain_run_id, chain_step_index)
-		VALUES ($1, $2, $3, $4, $5, 'initializing', 'claude-sonnet-4-6', now(), $6, $7)
-	`, runID, orgID, userID, taskID, promptID, chainRunID, stepIdx); err != nil {
+		INSERT INTO runs (id, org_id, creator_user_id, team_id, visibility, task_id, prompt_id, status, model, started_at, chain_run_id, chain_step_index)
+		VALUES ($1, $2, $3, $4, 'team', $5, $6, 'initializing', 'claude-sonnet-4-6', now(), $7, $8)
+	`, runID, orgID, userID, teamID, taskID, promptID, chainRunID, stepIdx); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
 	return runID
