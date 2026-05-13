@@ -8,6 +8,7 @@ package delegate
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -323,9 +324,14 @@ func (s *Spawner) processCompletion(
 		// prompt forbids it) UNLESS they recorded a --final verdict, which
 		// is the explicit early-exit channel: the step is allowed one
 		// terminal external action (e.g., a SKIP review) and the action
-		// still flows through this same human-approval gate. Without the
-		// --final escape hatch, a misfiring non-final step would stall the
-		// chain on approval, so we discard its pending artifacts.
+		// still flows through this same human-approval gate.
+		//
+		// If a non-final step creates a pending artifact without recording
+		// --final, the agent mislabelled its verdict: the pending artifact
+		// IS the chain's terminal external action. Auto-promote to --final
+		// (writing a synthetic verdict that supersedes the agent's) so the
+		// chain terminates at this step on human approval instead of
+		// advancing past stale handoff narrative into a no-op step.
 		hasPending := false
 		if pendingReview, _ := db.PendingReviewByRunID(s.database, runID); pendingReview != nil {
 			hasPending = true
@@ -333,21 +339,26 @@ func (s *Spawner) processCompletion(
 			hasPending = true
 		}
 		if hasPending {
-			allow := true
 			if s.isNonFinalChainStep(runID) {
 				verdict, _ := s.chains.GetLatestVerdict(ctx, runmode.LocalDefaultOrg, runID)
 				if verdict == nil || verdict.Outcome != domain.ChainVerdictFinal {
-					allow = false
+					synthetic := domain.ChainVerdict{
+						Outcome:   domain.ChainVerdictFinal,
+						Reason:    "auto-promoted: non-final step submitted external action without --final",
+						Synthetic: true,
+					}
+					if payload, err := json.Marshal(synthetic); err == nil {
+						if insertErr := s.chains.InsertVerdict(ctx, runmode.LocalDefaultOrg, runID, string(payload)); insertErr != nil {
+							log.Printf("[delegate] warning: insert synthetic --final verdict for run %s: %v", runID, insertErr)
+						} else {
+							log.Printf("[delegate] run %s: non-final chain step submitted pending artifact; auto-promoted verdict to --final", runID)
+						}
+					}
 				}
 			}
-			if !allow {
-				log.Printf("[delegate] run %s is a non-final chain step without --final verdict but created pending artifacts; discarding to avoid mid-chain stall", runID)
-				s.discardPendingArtifacts(runID)
-			} else {
-				status = "pending_approval"
-				if _, err := s.database.Exec(`UPDATE runs SET status = ? WHERE id = ?`, status, runID); err != nil {
-					log.Printf("[delegate] warning: failed to set pending_approval for run %s: %v", runID, err)
-				}
+			status = "pending_approval"
+			if _, err := s.database.Exec(`UPDATE runs SET status = ? WHERE id = ?`, status, runID); err != nil {
+				log.Printf("[delegate] warning: failed to set pending_approval for run %s: %v", runID, err)
 			}
 		}
 	}

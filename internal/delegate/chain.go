@@ -658,13 +658,3 @@ func (s *Spawner) isNonFinalChainStep(runID string) bool {
 	return int(stepIndex.Int64)+1 < len(steps)
 }
 
-// discardPendingArtifacts removes pending_reviews and pending_prs rows
-// created by a chain step that should not have taken external actions.
-func (s *Spawner) discardPendingArtifacts(runID string) {
-	if err := db.DeletePendingReviewByRunID(s.database, runID); err != nil {
-		log.Printf("[delegate] discard pending review for run %s: %v", runID, err)
-	}
-	if err := db.DeletePendingPRByRunID(s.database, runID); err != nil {
-		log.Printf("[delegate] discard pending PR for run %s: %v", runID, err)
-	}
-}
