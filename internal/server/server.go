@@ -49,6 +49,7 @@ type Server struct {
 	teams         db.TeamsStore           // resolves the request org's default team for handlers that synthesize team-scoped rows (tasks, projects, prompts)
 	orgs          db.OrgsStore            // per-org settings (GitHub/Jira base URLs, poll intervals, clone protocol) post-internal/config deletion
 	jiraRules     db.JiraStatusRulesStore // per-team Jira status rules (replaces the deleted config.Jira.Projects view)
+	githubApps    db.GitHubAppsStore      // per-org GitHub App registrations (manifest flow)
 	// takeoverDir is the raw instance_config.server_takeover_dir
 	// value read once at boot — may be empty, "~/..." or an
 	// absolute path. Call sites (handleAgentTakeover, Spawner's
@@ -128,6 +129,12 @@ type Server struct {
 	// A's contribution is lost. Holding the per-project mutex
 	// across the read+write window closes that hole.
 	projectMutexes sync.Map // map[string]*sync.Mutex
+
+	// githubAppRegMu serializes per-org GitHub App registration so
+	// two concurrent callbacks can't both pass the existence check,
+	// both call GitHub's conversion endpoint, and leave an orphan
+	// App. Same sync.Map pattern as projectMutexes.
+	githubAppRegMu sync.Map // map[orgID]*sync.Mutex
 }
 
 // projectMutex returns the per-project mutex for serializing
@@ -267,6 +274,7 @@ func New(database *sql.DB, stores db.Stores, takeoverDir string, serverPort int)
 		teams:         stores.Teams,
 		orgs:          stores.Orgs,
 		jiraRules:     stores.JiraStatusRules,
+		githubApps:    stores.GitHubApps,
 		tx:            stores.Tx,
 		takeoverDir:   takeoverDir,
 		serverPort:    serverPort,
@@ -509,6 +517,13 @@ func (s *Server) routes() {
 	s.apiMutating("PUT /api/prompts/{id}/chain-steps", s.handleChainStepsPut)
 	s.api("GET /api/chain-runs/{id}", s.handleChainRunGet)
 	s.apiMutating("POST /api/chain-runs/{id}/cancel", s.handleChainRunCancel)
+
+	// GitHub App manifest registration. The start endpoint generates the
+	// manifest; the callback exchanges the temp code for App credentials.
+	// Both validate org membership + admin role inside the handler via
+	// r.PathValue("org_id"). Works in both local and multi mode.
+	s.apiMutating("POST /api/orgs/{org_id}/github-app/register/start", s.handleGitHubAppRegisterStart)
+	s.api("GET /api/orgs/{org_id}/github-app/register/callback", s.handleGitHubAppRegisterCallback)
 
 	// Frontend: serve embedded SPA, with fallback to index.html for client-side routing
 	s.mux.HandleFunc("/", s.handleFrontend)

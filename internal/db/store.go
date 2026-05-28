@@ -200,6 +200,13 @@ type Stores struct {
 	// (org_id, creator_user_id) pair. See SKY-298.
 	Curator CuratorStore
 
+	// GitHubApps owns the org_github_apps table — per-org GitHub
+	// App registrations created through the manifest flow. App pool
+	// in Postgres (RLS gates reads by org membership, writes by org
+	// admin). SQLite is also wired in local mode and reads/writes
+	// org_github_apps for the same manifest-flow path.
+	GitHubApps GitHubAppsStore
+
 	// Tx is the transaction runner — handlers that need atomic
 	// multi-store writes call Tx.WithTx and receive a TxStores with
 	// every field tx-bound. Postgres impl also sets the JWT claims
@@ -239,6 +246,7 @@ type TxStores struct {
 	Teams           TeamsStore
 	JiraStatusRules JiraStatusRulesStore
 	Curator         CuratorStore
+	GitHubApps      GitHubAppsStore
 }
 
 // TxRunner runs fn inside a single database transaction. Postgres
