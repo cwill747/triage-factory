@@ -76,6 +76,12 @@ type Server struct {
 	curator    *curator.Curator
 	ghClient   *ghclient.Client
 	jiraClient *jira.Client
+	// ghResolver picks the right GitHub credential (org App installation
+	// token → PAT) per request, given the org + target account. Replaces
+	// the raw NewClient(baseURL, pat) construction in the dashboard
+	// handlers. Built in New from the stores, so it's never nil — handlers
+	// don't need a guard.
+	ghResolver ghclient.Resolver
 	// Change callbacks accept the orgID of the tenant whose integration
 	// creds just rotated, so the closure can re-resolve via SecretStore.
 	// Local mode always passes runmode.LocalDefaultOrgID; multi-mode
@@ -293,6 +299,16 @@ func New(database *sql.DB, stores db.Stores, takeoverDir string, serverPort int)
 		serverPort:    serverPort,
 		mux:           http.NewServeMux(),
 		ws:            websocket.NewHub(),
+	}
+	// GitHub credential resolver + its installation-token cache, built from
+	// the same stores. Constructed here (not injected) so a Server is always
+	// usable without external wiring — tests that call New directly get a
+	// working resolver too. A verified installation.deleted webhook drops
+	// the dead token from the cache via onInstallationRemoved.
+	ghTokenCache := ghclient.NewMemoryTokenCache()
+	s.ghResolver = ghclient.NewResolver(stores.Secrets, stores.GitHubApps, stores.Orgs, stores.Agents, ghTokenCache)
+	s.onInstallationRemoved = func(orgID, installationID string) {
+		ghTokenCache.Invalidate(orgID, installationID)
 	}
 	s.routes()
 	return s
