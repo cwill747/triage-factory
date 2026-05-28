@@ -895,3 +895,201 @@ func TestCreateForPR_OwnRepoPR_FetchesViaPullRef(t *testing.T) {
 		t.Errorf("upstream's my-feature did not advance after agent push (still %q) — tracking didn't take effect", newTip)
 	}
 }
+
+// addLockedWorktree creates a real worktree on `branch` at the full path
+// `checkout` and locks it with `reason` (git's `worktree lock --reason`).
+// Returns the checkout path. The caller controls the location (TF's
+// ephemeral runs namespace via tfRunCheckout vs. an arbitrary
+// user/removable path) and whether to delete the checkout afterward.
+func addLockedWorktree(t *testing.T, bareDir, branch, checkout, reason string) string {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(checkout), 0o755); err != nil {
+		t.Fatalf("mkdir checkout parent: %v", err)
+	}
+	cmds := [][]string{
+		{"-C", bareDir, "worktree", "add", checkout, branch},
+		{"-C", bareDir, "worktree", "lock", "--reason", reason, checkout},
+	}
+	for _, c := range cmds {
+		if out, err := exec.Command("git", c...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", c, err, out)
+		}
+	}
+	return checkout
+}
+
+// makeGhost is addLockedWorktree + deleting the checkout: the exact
+// on-disk state of a cancel/kill mid-`git worktree add` — admin
+// registration present and locked, working tree gone. `git worktree
+// prune` skips it because it's locked, pinning the branch.
+func makeGhost(t *testing.T, bareDir, branch, checkout, reason string) string {
+	t.Helper()
+	addLockedWorktree(t, bareDir, branch, checkout, reason)
+	if err := os.RemoveAll(checkout); err != nil {
+		t.Fatalf("remove ghost checkout: %v", err)
+	}
+	return checkout
+}
+
+// tfRunCheckout returns a checkout path inside TF's ephemeral run
+// namespace (runDir = <TMPDIR>/triagefactory-runs/<id>) — the only paths
+// the startup ghost sweep is allowed to reclaim.
+func tfRunCheckout(id string) string {
+	return runDir(id)
+}
+
+func assertReAddWedged(t *testing.T, bareDir, branch string) {
+	t.Helper()
+	if out, err := exec.Command("git", "-C", bareDir, "worktree", "prune").CombinedOutput(); err != nil {
+		t.Fatalf("worktree prune: %v: %s", err, out)
+	}
+	dest := filepath.Join(t.TempDir(), "wedged")
+	if out, err := exec.Command("git", "-C", bareDir, "worktree", "add", dest, branch).CombinedOutput(); err == nil {
+		t.Fatalf("expected re-add of %s to be wedged by the ghost, but it succeeded:\n%s", branch, out)
+	}
+}
+
+func assertReAddSucceeds(t *testing.T, bareDir, branch string) {
+	t.Helper()
+	dest := filepath.Join(t.TempDir(), "re-add")
+	if out, err := exec.Command("git", "-C", bareDir, "worktree", "add", dest, branch).CombinedOutput(); err != nil {
+		t.Fatalf("re-add of %s should succeed after clearing the ghost: %v:\n%s", branch, err, out)
+	}
+}
+
+// TestRemoveWorktreeRegFor_UnwedgesAndIsolated is the core regression for
+// the in-process reclaim (CreateForPR's add-failure path): a half-built
+// add that plain prune can't reclaim pins its branch and blocks the next
+// run for the same PR. removeWorktreeRegFor must drop exactly that run's
+// registration — and, crucially, ONLY that one, so it's safe to call
+// without lockRepo while a concurrent add (e.g. CopyForTakeover's
+// lock-free overlay) is in flight against the same bare.
+func TestRemoveWorktreeRegFor_UnwedgesAndIsolated(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+	bareDir, err := EnsureBareClone(context.Background(), "owner", "repo", upstream)
+	if err != nil {
+		t.Fatalf("EnsureBareClone: %v", err)
+	}
+	// A second branch for the "concurrent" live worktree that must survive.
+	if out, err := exec.Command("git", "-C", bareDir, "branch", "feature", "main").CombinedOutput(); err != nil {
+		t.Fatalf("git branch feature: %v: %s", err, out)
+	}
+
+	ghost := makeGhost(t, bareDir, "main", tfRunCheckout("run-ghost"), "initializing")
+	live := addLockedWorktree(t, bareDir, "feature", tfRunCheckout("run-live"), "initializing")
+
+	assertReAddWedged(t, bareDir, "main")
+
+	removeWorktreeRegFor(bareDir, ghost)
+
+	// The ghost's branch is reclaimable; the concurrent live worktree's
+	// registration is untouched.
+	assertReAddSucceeds(t, bareDir, "main")
+	if _, err := os.Stat(filepath.Join(bareDir, "worktrees", filepath.Base(live))); err != nil {
+		t.Fatalf("removeWorktreeRegFor must not touch the concurrent worktree %q: %v", filepath.Base(live), err)
+	}
+}
+
+// TestClearStaleLockedWorktrees_ReclaimsLocalizedGhost is the startup
+// backstop's regression and the guard for the localized-Git case: git
+// writes the add lock reason through gettext (_("initializing")), so
+// detection must not depend on the English literal. A ghost locked with a
+// translated reason must still be reclaimed because its working tree is
+// gone.
+func TestClearStaleLockedWorktrees_ReclaimsLocalizedGhost(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+	bareDir, err := EnsureBareClone(context.Background(), "owner", "repo", upstream)
+	if err != nil {
+		t.Fatalf("EnsureBareClone: %v", err)
+	}
+
+	makeGhost(t, bareDir, "main", tfRunCheckout("run-loc"), "réinitialisation en cours") // non-English lock reason
+
+	assertReAddWedged(t, bareDir, "main")
+
+	if n := clearStaleLockedWorktrees(bareDir); n != 1 {
+		t.Fatalf("clearStaleLockedWorktrees cleared %d ghosts, want 1", n)
+	}
+	assertReAddSucceeds(t, bareDir, "main")
+}
+
+// TestClearStaleLockedWorktrees_PreservesLiveLockedWorktree guards the
+// blast-radius: a worktree that's locked but whose working tree still
+// exists is a real, in-use worktree and must never be swept.
+func TestClearStaleLockedWorktrees_PreservesLiveLockedWorktree(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+	bareDir, err := EnsureBareClone(context.Background(), "owner", "repo", upstream)
+	if err != nil {
+		t.Fatalf("EnsureBareClone: %v", err)
+	}
+
+	addLockedWorktree(t, bareDir, "main", tfRunCheckout("run-live"), "held by user for debugging") // checkout kept
+
+	if n := clearStaleLockedWorktrees(bareDir); n != 0 {
+		t.Fatalf("clearStaleLockedWorktrees cleared %d, want 0 (live locked worktree must survive)", n)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(bareDir, "worktrees", "*", "locked")); len(matches) != 1 {
+		t.Fatalf("expected the live locked registration to survive, found %d", len(matches))
+	}
+}
+
+// TestClearStaleLockedWorktrees_PreservesUnmountedUserWorktree is the
+// regression for the lock-contract fix: a worktree a user deliberately
+// locked because its checkout lives on a removable/network volume that's
+// currently unmounted also looks "locked + checkout-missing", but it is
+// NOT under TF's runs namespace, so the sweep must leave it alone.
+func TestClearStaleLockedWorktrees_PreservesUnmountedUserWorktree(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+	bareDir, err := EnsureBareClone(context.Background(), "owner", "repo", upstream)
+	if err != nil {
+		t.Fatalf("EnsureBareClone: %v", err)
+	}
+
+	// A locked worktree at a non-TF path (stands in for /Volumes/USB/...),
+	// then its checkout is removed to simulate the volume being unmounted.
+	userPath := filepath.Join(t.TempDir(), "removable", "myrepo")
+	makeGhost(t, bareDir, "main", userPath, "on the external SSD")
+
+	if n := clearStaleLockedWorktrees(bareDir); n != 0 {
+		t.Fatalf("clearStaleLockedWorktrees cleared %d, want 0 (user's locked off-volume worktree must survive)", n)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(bareDir, "worktrees", "*", "locked")); len(matches) != 1 {
+		t.Fatalf("expected the user's locked registration to survive, found %d", len(matches))
+	}
+}
+
+// TestCleanup_SweepsBareGhostWithoutRunsDir covers the runs-dir early
+// return fix: the bare-repo sweep must run at startup even when
+// /tmp/triagefactory-runs is absent (e.g. /tmp wiped on reboot) — the
+// precise scenario where a ghost survives in the persistent bare.
+func TestCleanup_SweepsBareGhostWithoutRunsDir(t *testing.T) {
+	withTestHome(t)
+	upstream := makeTestUpstream(t)
+	bareDir, err := EnsureBareClone(context.Background(), "owner", "repo", upstream)
+	if err != nil {
+		t.Fatalf("EnsureBareClone: %v", err)
+	}
+	makeGhost(t, bareDir, "main", tfRunCheckout("run-ghost"), "initializing")
+
+	// Simulate /tmp being wiped on reboot: remove the whole runs dir so it
+	// is absent, while the bare still records the ghost. The admin entry's
+	// gitdir keeps the (now non-existent) triagefactory-runs path string,
+	// which is what the sweep keys on.
+	if err := os.RemoveAll(filepath.Join(os.TempDir(), runsDir)); err != nil {
+		t.Fatalf("remove runs dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(os.TempDir(), runsDir)); !os.IsNotExist(err) {
+		t.Fatalf("test precondition: runs dir should be absent, stat err = %v", err)
+	}
+
+	Cleanup()
+
+	if matches, _ := filepath.Glob(filepath.Join(bareDir, "worktrees", "*", "locked")); len(matches) != 0 {
+		t.Fatalf("Cleanup left %d ghost(s) behind when runs dir was absent", len(matches))
+	}
+	assertReAddSucceeds(t, bareDir, "main")
+}
