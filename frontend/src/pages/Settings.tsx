@@ -72,6 +72,7 @@ interface SettingsData {
     preference_update_interval: number
     auto_delegate_enabled: boolean
   }
+  max_llm_model_tier: string
 }
 
 const emptyProject = (key = ''): JiraProjectConfig => ({
@@ -116,6 +117,7 @@ export default function Settings() {
     jira_projects: JiraProjectConfig[]
     ai_model: string
     ai_auto_delegate_enabled: boolean
+    max_llm_model_tier: string
   }>({
     github_enabled: true,
     github_url: '',
@@ -129,6 +131,7 @@ export default function Settings() {
     jira_projects: [],
     ai_model: 'sonnet',
     ai_auto_delegate_enabled: true,
+    max_llm_model_tier: '',
   })
   const [saving, setSaving] = useState(false)
   // Statuses keyed by project key so each project's picker pulls from
@@ -211,6 +214,7 @@ export default function Settings() {
           preference_update_interval: team.team_settings.AIPreferenceUpdateInterval,
           auto_delegate_enabled: team.team_settings.AutoDelegateEnabled,
         },
+        max_llm_model_tier: org.max_llm_model_tier || '',
       }
       setData(merged)
       setOrgMemberCount(org.member_count ?? 1)
@@ -229,6 +233,7 @@ export default function Settings() {
         jira_projects: projects,
         ai_model: merged.ai.model,
         ai_auto_delegate_enabled: merged.ai.auto_delegate_enabled,
+        max_llm_model_tier: merged.max_llm_model_tier,
       })
       const initialExpanded: Record<string, boolean> = {}
       if (projects.length === 1) {
@@ -432,6 +437,7 @@ export default function Settings() {
       toast.error(await readError(res, 'Failed to save team settings'))
       return false
     }
+    const body = (await res.json().catch(() => null)) as { warning?: string } | null
     setData((d) =>
       d
         ? {
@@ -445,6 +451,9 @@ export default function Settings() {
           }
         : d,
     )
+    // The org cap can clamp the team default; the save still succeeds, the
+    // warning just tells the team the effective model differs from the pick.
+    if (body?.warning) toast.info(body.warning)
     return true
   }
 
@@ -460,12 +469,14 @@ export default function Settings() {
         jira_base_url: form.jira_url,
         jira_pat: form.jira_pat || undefined,
         jira_poll_interval: form.jira_poll_interval,
+        max_llm_model_tier: form.max_llm_model_tier,
       }),
     })
     if (!res.ok) {
       toast.error(await readError(res, 'Failed to save settings'))
       return false
     }
+    const body = (await res.json().catch(() => null)) as { warning?: string } | null
     setData((d) =>
       d
         ? {
@@ -483,9 +494,13 @@ export default function Settings() {
               poll_interval: form.jira_poll_interval,
               has_token: d.jira.has_token || !!form.jira_pat,
             },
+            max_llm_model_tier: form.max_llm_model_tier,
           }
         : d,
     )
+    // Lowering the cap below the default team's preference still saves;
+    // the warning surfaces that its effective model dropped.
+    if (body?.warning) toast.info(body.warning)
     return true
   }
 
@@ -525,7 +540,8 @@ export default function Settings() {
       form.github_poll_interval !== data?.github.poll_interval ||
       form.github_clone_protocol !== data?.github.clone_protocol ||
       form.jira_url !== (data?.jira.base_url ?? '') ||
-      form.jira_poll_interval !== data?.jira.poll_interval
+      form.jira_poll_interval !== data?.jira.poll_interval ||
+      form.max_llm_model_tier !== (data?.max_llm_model_tier ?? '')
     const scopes: SettingsTab[] = []
     if (teamChanged) scopes.push('team')
     if (orgChanged) scopes.push('workspace')
@@ -906,6 +922,30 @@ export default function Settings() {
     </Section>
   )
 
+  // Workspace (org) scope: a hard ceiling over every team's model choice.
+  // The team default lives in renderAI (team scope); this caps it.
+  const renderModelCap = () => (
+    <Section>
+      <h2 className="text-[13px] font-medium text-text-secondary mb-4">AI</h2>
+      <Field label="Max model tier (workspace cap)">
+        <select
+          value={form.max_llm_model_tier}
+          onChange={update('max_llm_model_tier')}
+          className={inputClass}
+        >
+          <option value="">No cap</option>
+          <option value="haiku">Haiku</option>
+          <option value="sonnet">Sonnet</option>
+          <option value="opus">Opus</option>
+        </select>
+        <p className="text-[11px] text-text-tertiary mt-1">
+          Hard ceiling for the whole workspace. A team default above this cap is clamped down to it
+          — the team is told, but the cap wins.
+        </p>
+      </Field>
+    </Section>
+  )
+
   const renderAppearance = () => (
     <Section>
       <h2 className="text-[13px] font-medium text-text-secondary mb-4">Appearance</h2>
@@ -998,6 +1038,7 @@ export default function Settings() {
     <>
       {renderGitHub()}
       {renderJiraConnection()}
+      {renderModelCap()}
       {renderIntegrations()}
       {renderDanger()}
     </>
@@ -1021,6 +1062,7 @@ export default function Settings() {
           {renderJiraConnection()}
           {renderJiraProjects()}
           {renderAI()}
+          {renderModelCap()}
           {renderAppearance()}
           <button
             type="submit"

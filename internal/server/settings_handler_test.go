@@ -399,3 +399,52 @@ func TestSettingsGet_MemberCountAndRole(t *testing.T) {
 		t.Errorf("team role = %q, want admin (local sole member)", team.Role)
 	}
 }
+
+// --- SKY-359 model cap warnings --------------------------------------------
+//
+// EffectiveModel's unit behavior is covered in internal/domain. These cover
+// the handler wiring: the cap never blocks a save, it just surfaces a
+// warning so the admin/team know the effective model differs from the input.
+
+func postJSONResp(t *testing.T, s *Server, path string, body any) map[string]string {
+	t.Helper()
+	rec := doJSON(t, s, "POST", path, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST %s: %d: %s", path, rec.Code, rec.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode %s response: %v", path, err)
+	}
+	return resp
+}
+
+func TestTeamSettingsPost_ModelExceedsOrgCap_Warns(t *testing.T) {
+	s := newTestServer(t)
+	postJSONResp(t, s, "/api/settings/org", map[string]any{"max_llm_model_tier": "sonnet"})
+
+	resp := postJSONResp(t, s, "/api/settings/team/default", map[string]any{"ai_model": "opus"})
+	if !strings.Contains(resp["warning"], "exceeds the org cap") {
+		t.Errorf("expected org-cap warning, got warning=%q", resp["warning"])
+	}
+}
+
+func TestTeamSettingsPost_ModelWithinOrgCap_NoWarning(t *testing.T) {
+	s := newTestServer(t)
+	postJSONResp(t, s, "/api/settings/org", map[string]any{"max_llm_model_tier": "opus"})
+
+	resp := postJSONResp(t, s, "/api/settings/team/default", map[string]any{"ai_model": "sonnet"})
+	if resp["warning"] != "" {
+		t.Errorf("expected no warning when team default is within cap, got %q", resp["warning"])
+	}
+}
+
+func TestOrgSettingsPost_CapBelowTeamDefault_Warns(t *testing.T) {
+	s := newTestServer(t)
+	postJSONResp(t, s, "/api/settings/team/default", map[string]any{"ai_model": "opus"})
+
+	resp := postJSONResp(t, s, "/api/settings/org", map[string]any{"max_llm_model_tier": "sonnet"})
+	if !strings.Contains(resp["warning"], "exceeds the new cap") {
+		t.Errorf("expected cap-downgrade warning, got warning=%q", resp["warning"])
+	}
+}
