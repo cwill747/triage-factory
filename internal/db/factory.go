@@ -26,11 +26,20 @@ type FactoryReadStore interface {
 	// EventCountsSince counts events per event_type emitted after
 	// `since`. Used to compute station throughput; keys with zero
 	// counts are absent.
+	//
+	// In multi-mode (Postgres) the count is scoped to the viewer's
+	// teams by the same task-membership semi-join the entity belt
+	// uses, so the station header agrees with the belt and doesn't
+	// report another team's activity (events RLS is org-wide, unlike
+	// tasks/runs). Local mode (SQLite) is unscoped — see Entities.
 	EventCountsSince(ctx context.Context, orgID string, since time.Time) (map[string]int, error)
 
 	// LifetimeDistinctByEventType counts the distinct entities that
-	// have ever produced an event of each event_type, scoped to the
-	// given org. Read per snapshot request — the factory endpoint is
+	// have ever produced an event of each event_type. In multi-mode
+	// (Postgres) it is additionally scoped to the viewer's teams via
+	// the task-membership semi-join, matching EventCountsSince and the
+	// entity belt; local mode (SQLite) is org-only. Read per snapshot
+	// request — the factory endpoint is
 	// not a hot path. In Postgres the partial index
 	// idx_events_org_type_entity (org_id, event_type, entity_id) WHERE
 	// entity_id IS NOT NULL is an index-only scan: each org's groups
@@ -70,6 +79,29 @@ type FactoryReadStore interface {
 	// plus any entity closed within FactoryClosedGracePeriod (up to
 	// FactoryClosedGraceLimit) so the chip can finish animating to
 	// its terminal station before disappearing.
+	//
+	// Multi-mode (Postgres) scopes to the viewer's teams by
+	// membership: an entity is included iff a task for one of the
+	// viewer's teams has ever existed on it (a semi-join through
+	// tasks, over all task statuses). The org-level GitHub App polls
+	// org-wide, so polling produces cross-team entities; rather than
+	// fork the shared entity per team, the entity↔team relationship is
+	// derived through tasks (which carry team_id). The semi-join
+	// auto-scopes via tasks RLS under tf_app — no explicit team_id
+	// needed. An entity no team ever tasked belongs to no team's
+	// factory and is excluded.
+	//
+	// Local mode (SQLite, N=1) applies NO membership filter: the local
+	// tracker already scopes discovery to the user's own involvement
+	// (author / review-requested / reviewed-by), so every entity is
+	// personally relevant by construction. Filtering by task existence
+	// there would hide relevant-but-untriaged PRs the user expects to
+	// see, so the SQLite impl returns the full active set as before —
+	// local mode is unaffected by this scoping.
+	//
+	// The entity's station (latest-event derivation in the SELECT) is
+	// orthogonal to membership and computed from the shared event log,
+	// unaffected by task lifecycle.
 	//
 	// Implemented as two separate queries in both backends instead of
 	// a single OR'd WHERE: the OR spans two columns and forces a

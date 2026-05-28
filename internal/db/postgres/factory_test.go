@@ -196,6 +196,136 @@ func newPgFactorySeeder(conn *sql.DB, orgID, userID, promptID string) dbtest.Fac
 	}
 }
 
+// TestFactoryReadStore_Postgres_ExcludesUntaskedEntity pins the
+// multi-mode membership semi-join: an entity a team has tasked (over
+// any task status) rides the factory snapshot, while one no team ever
+// tasked is excluded — even when it has events (a station). This is
+// the Postgres-only contract; SQLite (local mode) applies no
+// membership filter. Runs under AdminDB, so the EXISTS reduces to the
+// org-scoped semi-join; the RLS team-scoping it inherits in production
+// is a property of tasks_select, exercised by the RLS suite.
+func TestFactoryReadStore_Postgres_ExcludesUntaskedEntity(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	orgID, userID := seedPgFactoryOrg(t, h)
+	promptID := seedPgFactoryPrompt(t, h, orgID, userID)
+	seed := newPgFactorySeeder(h.AdminDB, orgID, userID, promptID)
+
+	now := time.Now().UTC()
+	// withTask: a rule cared about it — earns membership.
+	withTask := seed.Entity(t, "memb-tasked")
+	ev := seed.Event(t, withTask, "github:pr:opened", "", now, time.Time{})
+	seed.Task(t, withTask, "github:pr:opened", "", ev, "queued", now)
+
+	// noTask: never matched a rule. Give it an event so the only thing
+	// keeping it out is membership, not a missing station.
+	noTask := seed.Entity(t, "memb-untasked")
+	seed.Event(t, noTask, "github:pr:opened", "", now, time.Time{})
+
+	stores := pgstore.New(h.AdminDB, h.AdminDB)
+	rows, err := stores.Factory.Entities(context.Background(), orgID, 100)
+	if err != nil {
+		t.Fatalf("Entities: %v", err)
+	}
+	got := map[string]bool{}
+	for _, r := range rows {
+		got[r.Entity.ID] = true
+	}
+	if !got[withTask] {
+		t.Errorf("tasked entity %s missing — membership semi-join dropped a member", withTask)
+	}
+	if got[noTask] {
+		t.Errorf("untasked entity %s leaked through — membership semi-join not applied", noTask)
+	}
+}
+
+// TestFactoryReadStore_Postgres_KeepsEntityAfterTaskTerminal pins that
+// membership spans all task statuses: an entity whose only task has
+// gone terminal (done) still rides the snapshot. "Has had a task but
+// has none active now" must stay in the factory — membership is
+// monotonic, orthogonal to task lifecycle.
+func TestFactoryReadStore_Postgres_KeepsEntityAfterTaskTerminal(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	orgID, userID := seedPgFactoryOrg(t, h)
+	promptID := seedPgFactoryPrompt(t, h, orgID, userID)
+	seed := newPgFactorySeeder(h.AdminDB, orgID, userID, promptID)
+
+	now := time.Now().UTC()
+	ent := seed.Entity(t, "terminal-task")
+	ev := seed.Event(t, ent, "github:pr:opened", "", now, time.Time{})
+	seed.Task(t, ent, "github:pr:opened", "", ev, "done", now)
+
+	stores := pgstore.New(h.AdminDB, h.AdminDB)
+	rows, err := stores.Factory.Entities(context.Background(), orgID, 100)
+	if err != nil {
+		t.Fatalf("Entities: %v", err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.Entity.ID == ent {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("entity %s with a terminal (done) task dropped — membership must span all task statuses", ent)
+	}
+}
+
+// TestFactoryReadStore_Postgres_CountersScopedToMembership pins that
+// the station-throughput aggregates (EventCountsSince,
+// LifetimeDistinctByEventType) carry the same team-membership scope as
+// the entity belt. events RLS is org-wide, so without the semi-join an
+// event on a PR no team of the viewer's ever tasked would inflate the
+// station header even though that PR never appears on the belt. Runs
+// under AdminDB, so the semi-join reduces to the org-scoped task
+// existence check; the production team-scoping it inherits is a
+// property of tasks RLS.
+func TestFactoryReadStore_Postgres_CountersScopedToMembership(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	orgID, userID := seedPgFactoryOrg(t, h)
+	promptID := seedPgFactoryPrompt(t, h, orgID, userID)
+	seed := newPgFactorySeeder(h.AdminDB, orgID, userID, promptID)
+
+	now := time.Now().UTC()
+
+	// Tasked entity: one opened event in-window — counts.
+	tasked := seed.Entity(t, "ctr-tasked")
+	evT := seed.Event(t, tasked, "github:pr:opened", "", now.Add(-10*time.Minute), time.Time{})
+	seed.Task(t, tasked, "github:pr:opened", "", evT, "queued", now)
+
+	// Untasked entity: its events must NOT contribute to either counter.
+	untasked := seed.Entity(t, "ctr-untasked")
+	seed.Event(t, untasked, "github:pr:opened", "", now.Add(-5*time.Minute), time.Time{})
+	seed.Event(t, untasked, "github:pr:merged", "", now.Add(-5*time.Minute), time.Time{})
+
+	stores := pgstore.New(h.AdminDB, h.AdminDB)
+	ctx := context.Background()
+
+	since, err := stores.Factory.EventCountsSince(ctx, orgID, now.Add(-1*time.Hour))
+	if err != nil {
+		t.Fatalf("EventCountsSince: %v", err)
+	}
+	if since["github:pr:opened"] != 1 {
+		t.Errorf("EventCountsSince[opened] = %d, want 1 (only the tasked entity counts)", since["github:pr:opened"])
+	}
+	if since["github:pr:merged"] != 0 {
+		t.Errorf("EventCountsSince[merged] = %d, want 0 (untasked entity's event must not count)", since["github:pr:merged"])
+	}
+
+	life, err := stores.Factory.LifetimeDistinctByEventType(ctx, orgID)
+	if err != nil {
+		t.Fatalf("LifetimeDistinctByEventType: %v", err)
+	}
+	if life["github:pr:opened"] != 1 {
+		t.Errorf("Lifetime[opened] = %d, want 1 (untasked entity excluded)", life["github:pr:opened"])
+	}
+	if life["github:pr:merged"] != 0 {
+		t.Errorf("Lifetime[merged] = %d, want 0 (untasked entity excluded)", life["github:pr:merged"])
+	}
+}
+
 // TestFactoryReadStore_Postgres_CrossOrgLeakage pins the defense-in-
 // depth guarantee: even with the org_id filter as the only line of
 // defense (AdminDB bypasses RLS), org A's queries can't see org B's
@@ -217,8 +347,13 @@ func TestFactoryReadStore_Postgres_CrossOrgLeakage(t *testing.T) {
 	now := time.Now().UTC()
 	entA := seedA.Entity(t, "cross-A")
 	entB := seedB.Entity(t, "cross-B")
-	seedA.Event(t, entA, "github:pr:opened", "", now, time.Time{})
-	seedB.Event(t, entB, "github:pr:merged", "", now, time.Time{})
+	evA := seedA.Event(t, entA, "github:pr:opened", "", now, time.Time{})
+	evB := seedB.Event(t, entB, "github:pr:merged", "", now, time.Time{})
+	// Task each entity so the membership-scoped event aggregates count
+	// them — this test isolates the org_id filter, not membership, so
+	// both entities must clear the semi-join in their own org.
+	seedA.Task(t, entA, "github:pr:opened", "", evA, "queued", now)
+	seedB.Task(t, entB, "github:pr:merged", "", evB, "queued", now)
 
 	stores := pgstore.New(h.AdminDB, h.AdminDB)
 	ctx := context.Background()

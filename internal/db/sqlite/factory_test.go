@@ -177,6 +177,108 @@ func TestFactoryReadStore_SQLite_AssertLocalOrg(t *testing.T) {
 	}
 }
 
+// TestFactoryReadStore_SQLite_ShowsUntaskedEntities pins the local-
+// mode contract: SQLite applies NO team-membership filter, so an
+// active entity that no rule ever tasked still rides the factory
+// snapshot. The local tracker already scopes discovery to the user's
+// own involvement (author / review-requested / reviewed-by), so every
+// entity is personally relevant — filtering by task existence would
+// hide untriaged-but-relevant PRs the user expects to see. The
+// converse (multi-mode membership exclusion) is Postgres-only.
+func TestFactoryReadStore_SQLite_ShowsUntaskedEntities(t *testing.T) {
+	conn, err := sql.Open("sqlite", ":memory:?_pragma=foreign_keys(on)")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	if err := db.BootstrapSchemaForTest(conn); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	// An active entity with an event but no task at all.
+	id := uuid.New().String()
+	if _, err := conn.Exec(`
+		INSERT INTO entities (id, source, source_id, kind, title, url, snapshot_json, created_at)
+		VALUES (?, 'github', ?, 'pr', 'Untriaged PR', 'https://example/u', '{}', ?)
+	`, id, "untasked-"+id[:8], time.Now().UTC()); err != nil {
+		t.Fatalf("seed entity: %v", err)
+	}
+	if _, err := conn.Exec(`
+		INSERT INTO events (id, entity_id, event_type, dedup_key, metadata_json, created_at)
+		VALUES (?, ?, 'github:pr:opened', '', '{}', ?)
+	`, uuid.New().String(), id, time.Now().UTC()); err != nil {
+		t.Fatalf("seed event: %v", err)
+	}
+
+	store := sqlitestore.New(conn).Factory
+	rows, err := store.Entities(t.Context(), runmode.LocalDefaultOrg, 100)
+	if err != nil {
+		t.Fatalf("Entities: %v", err)
+	}
+	found := false
+	for _, r := range rows {
+		if r.Entity.ID == id {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("untasked entity %s missing from local-mode snapshot — local mode must not apply the membership filter", id)
+	}
+}
+
+// TestFactoryReadStore_SQLite_CountersUnscoped pins the local-mode
+// counterpart to the Postgres membership-scoped aggregates: SQLite
+// applies no membership filter, so an untasked entity's events still
+// contribute to EventCountsSince and LifetimeDistinctByEventType. This
+// keeps the station header consistent with the unfiltered local belt
+// (every polled entity is the user's own).
+func TestFactoryReadStore_SQLite_CountersUnscoped(t *testing.T) {
+	conn, err := sql.Open("sqlite", ":memory:?_pragma=foreign_keys(on)")
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	conn.SetMaxOpenConns(1)
+	conn.SetMaxIdleConns(1)
+	if err := db.BootstrapSchemaForTest(conn); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	id := uuid.New().String()
+	if _, err := conn.Exec(`
+		INSERT INTO entities (id, source, source_id, kind, title, url, snapshot_json, created_at)
+		VALUES (?, 'github', ?, 'pr', 'Untriaged', 'https://example/u', '{}', ?)
+	`, id, "ctr-"+id[:8], time.Now().UTC()); err != nil {
+		t.Fatalf("seed entity: %v", err)
+	}
+	if _, err := conn.Exec(`
+		INSERT INTO events (id, entity_id, event_type, dedup_key, metadata_json, created_at)
+		VALUES (?, ?, 'github:pr:opened', '', '{}', ?)
+	`, uuid.New().String(), id, time.Now().UTC()); err != nil {
+		t.Fatalf("seed event: %v", err)
+	}
+
+	store := sqlitestore.New(conn).Factory
+	ctx := t.Context()
+
+	since, err := store.EventCountsSince(ctx, runmode.LocalDefaultOrg, time.Now().Add(-1*time.Hour))
+	if err != nil {
+		t.Fatalf("EventCountsSince: %v", err)
+	}
+	if since["github:pr:opened"] != 1 {
+		t.Errorf("EventCountsSince[opened] = %d, want 1 (local mode must not scope by membership)", since["github:pr:opened"])
+	}
+	life, err := store.LifetimeDistinctByEventType(ctx, runmode.LocalDefaultOrg)
+	if err != nil {
+		t.Fatalf("LifetimeDistinctByEventType: %v", err)
+	}
+	if life["github:pr:opened"] != 1 {
+		t.Errorf("Lifetime[opened] = %d, want 1 (local mode unscoped)", life["github:pr:opened"])
+	}
+}
+
 // TestParseDBDatetime is SQLite-specific — the COALESCE-loses-type-
 // hint quirk that motivates parseDBDatetime is unique to modernc's
 // SQLite driver. Postgres' pgx round-trips timestamps cleanly, so
