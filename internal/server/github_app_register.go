@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync"
@@ -58,6 +59,58 @@ func gitHubWebOrigin(base string) (string, bool) {
 		return "", false
 	}
 	return u.Scheme + "://" + u.Host, true
+}
+
+// nonPublicPrefixes are address ranges that are not reachable over the
+// public Internet but that IsGlobalUnicast / IsPrivate don't already
+// exclude: carrier-grade NAT, documentation/test ranges, benchmarking,
+// and the reserved-for-future block.
+var nonPublicPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("100.64.0.0/10"),   // RFC 6598 carrier-grade NAT / shared
+	netip.MustParsePrefix("192.0.2.0/24"),    // RFC 5737 TEST-NET-1
+	netip.MustParsePrefix("198.51.100.0/24"), // RFC 5737 TEST-NET-2
+	netip.MustParsePrefix("203.0.113.0/24"),  // RFC 5737 TEST-NET-3
+	netip.MustParsePrefix("198.18.0.0/15"),   // RFC 2544 benchmarking
+	netip.MustParsePrefix("240.0.0.0/4"),     // RFC 1112 reserved (future use)
+	netip.MustParsePrefix("2001:db8::/32"),   // RFC 3849 documentation
+}
+
+// isPubliclyReachable reports whether rawURL's host could be reached from
+// GitHub's servers over the public Internet. A DNS name is assumed to
+// resolve publicly; an IP literal must be globally-routable unicast and
+// outside the private, carrier-grade-NAT, documentation, benchmark, and
+// reserved ranges. GitHub validates hook_attributes.url reachability when
+// converting a manifest, so an unreachable host means the manifest must
+// omit the hook block.
+func isPubliclyReachable(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	if host == "" {
+		return false
+	}
+	if strings.EqualFold(host, "localhost") {
+		return false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		// Not an IP literal — a DNS name we assume resolves publicly.
+		return true
+	}
+	ip = ip.Unmap()
+	// Global unicast rejects loopback, unspecified, multicast, and
+	// link-local in one predicate; IsPrivate adds RFC 1918 / unique-local.
+	if !ip.IsGlobalUnicast() || ip.IsPrivate() {
+		return false
+	}
+	for _, p := range nonPublicPrefixes {
+		if p.Contains(ip) {
+			return false
+		}
+	}
+	return true
 }
 
 // buildManifestAndState assembles the GitHub App manifest JSON and the
@@ -111,12 +164,8 @@ func (s *Server) buildManifestAndState(ctx context.Context, orgID, userID, owner
 	}
 
 	manifest := map[string]any{
-		"name": appName,
-		"url":  publicURL,
-		"hook_attributes": map[string]any{
-			"url":    publicURL + "/api/webhooks/github/" + orgID,
-			"active": false,
-		},
+		"name":          appName,
+		"url":           publicURL,
 		"redirect_url":  publicURL + "/api/orgs/" + orgID + "/github-app/register/callback",
 		"callback_urls": []string{publicURL + "/api/orgs/" + orgID + "/github-app/register/callback"},
 		"public":        false,
@@ -136,9 +185,19 @@ func (s *Server) buildManifestAndState(ctx context.Context, orgID, userID, owner
 			"push",
 			"check_run",
 			"check_suite",
-			"installation",
-			"installation_repositories",
 		},
+	}
+	// hook_attributes is only valid when the deployment is reachable from
+	// GitHub's servers over the public Internet — GitHub validates the
+	// hook URL at manifest-creation time even with active:false. Local /
+	// NAT'd deployments omit it entirely and discover installations via
+	// API backfill instead. active stays false here; activation is owned
+	// by the webhook-handler work.
+	if isPubliclyReachable(publicURL) {
+		manifest["hook_attributes"] = map[string]any{
+			"url":    publicURL + "/api/webhooks/github/" + orgID,
+			"active": false,
+		}
 	}
 
 	mj, err := json.Marshal(manifest)
@@ -406,9 +465,18 @@ func (s *Server) handleGitHubAppRegisterCallback(w http.ResponseWriter, r *http.
 	appIDStr := fmt.Sprintf("%d", convResp.ID)
 	clientSecretKey := "github_app_" + appIDStr + "_client_secret"
 	pemKey := "github_app_" + appIDStr + "_pem"
-	webhookSecretKey := "github_app_" + appIDStr + "_webhook_secret"
 
-	secretKeys := []string{clientSecretKey, pemKey, webhookSecretKey}
+	secretKeys := []string{clientSecretKey, pemKey}
+
+	// A hookless App (the manifest omitted hook_attributes for a
+	// non-public deployment) comes back with no webhook secret. Leave the
+	// ref empty and store nothing rather than writing an empty Vault entry.
+	hasWebhookSecret := strings.TrimSpace(convResp.WebhookSecret) != ""
+	var webhookSecretKey string
+	if hasWebhookSecret {
+		webhookSecretKey = "github_app_" + appIDStr + "_webhook_secret"
+		secretKeys = append(secretKeys, webhookSecretKey)
+	}
 
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		if err := tx.GitHubApps.CreateForOrg(r.Context(), domain.OrgGitHubApp{
@@ -429,8 +497,10 @@ func (s *Server) handleGitHubAppRegisterCallback(w http.ResponseWriter, r *http.
 		if err := tx.Secrets.Put(r.Context(), orgID, pemKey, convResp.PEM, "GitHub App private key"); err != nil {
 			return fmt.Errorf("vault put pem: %w", err)
 		}
-		if err := tx.Secrets.Put(r.Context(), orgID, webhookSecretKey, convResp.WebhookSecret, "GitHub App webhook secret"); err != nil {
-			return fmt.Errorf("vault put webhook_secret: %w", err)
+		if hasWebhookSecret {
+			if err := tx.Secrets.Put(r.Context(), orgID, webhookSecretKey, convResp.WebhookSecret, "GitHub App webhook secret"); err != nil {
+				return fmt.Errorf("vault put webhook_secret: %w", err)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -549,11 +619,13 @@ func exchangeManifestCode(ctx context.Context, conversionURL string) (*manifestC
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
+	// webhook_secret is absent when the manifest omitted hook_attributes
+	// (hookless local/NAT'd Apps), so it's not load-bearing. client_id,
+	// client_secret, and pem always must be present.
 	if strings.TrimSpace(out.ClientID) == "" ||
 		strings.TrimSpace(out.ClientSecret) == "" ||
-		strings.TrimSpace(out.WebhookSecret) == "" ||
 		strings.TrimSpace(out.PEM) == "" {
-		return nil, fmt.Errorf("incomplete response from GitHub (missing client_id, client_secret, webhook_secret, or pem)")
+		return nil, fmt.Errorf("incomplete response from GitHub (missing client_id, client_secret, or pem)")
 	}
 	return &out, nil
 }
