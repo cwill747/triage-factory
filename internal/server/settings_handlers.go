@@ -197,11 +197,18 @@ func (s *Server) handleTeamSettingsPost(w http.ResponseWriter, r *http.Request) 
 	var (
 		prevProjects    []jiraProjectConfig
 		writtenProjects []jiraProjectConfig
+		prevModel       string
+		savedModel      string
+		orgMaxTier      string
 	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		teamSet, err := tx.Teams.GetSettings(r.Context(), teamID)
 		if err != nil {
 			return fmt.Errorf("load team settings: %w", err)
+		}
+		prevModel = teamSet.DefaultModel
+		if orgSet, err := tx.Orgs.GetSettings(r.Context(), orgID); err == nil {
+			orgMaxTier = orgSet.MaxLLMModelTier
 		}
 		rules, err := tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
 		if err != nil {
@@ -252,6 +259,7 @@ func (s *Server) handleTeamSettingsPost(w http.ResponseWriter, r *http.Request) 
 		}
 
 		writtenProjects = projects
+		savedModel = teamSet.DefaultModel
 		teamSet.JiraProjects = projectKeysFromConfigs(projects)
 		if err := tx.Teams.UpdateSettings(r.Context(), teamID, teamSet); err != nil {
 			return fmt.Errorf("save team settings: %w", err)
@@ -275,7 +283,21 @@ func (s *Server) handleTeamSettingsPost(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+	resp := map[string]string{"status": "saved"}
+	// The team default doesn't override the org cap. If a newly-picked
+	// default exceeds it, accept the save (the team owns its preference)
+	// but tell them the effective model is the org's cap. Gate on an
+	// actual model change so an unrelated save (e.g. editing projects,
+	// which re-sends the current model) doesn't re-warn every time.
+	if req.AIModel != "" && savedModel != prevModel {
+		if eff, source := domain.EffectiveModel(savedModel, orgMaxTier); source == "org-cap" {
+			resp["warning"] = fmt.Sprintf(
+				"Team default of %s exceeds the org cap of %s. Effective model is %s.",
+				savedModel, orgMaxTier, eff,
+			)
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // --------------------------------------------------------------------
@@ -362,7 +384,7 @@ type orgSettingsUpdate struct {
 	JiraBaseURL         *string `json:"jira_base_url"`
 	JiraPAT             *string `json:"jira_pat"`
 	JiraPollInterval    string  `json:"jira_poll_interval,omitempty"`
-	MaxLLMModelTier     string  `json:"max_llm_model_tier,omitempty"`
+	MaxLLMModelTier     *string `json:"max_llm_model_tier"`
 	AnthropicAPIKey     *string `json:"anthropic_api_key"`
 }
 
@@ -424,8 +446,14 @@ func (s *Server) handleOrgSettingsPost(w http.ResponseWriter, r *http.Request) {
 			orgSet.JiraPollInterval = d
 		}
 	}
-	if req.MaxLLMModelTier != "" {
-		orgSet.MaxLLMModelTier = req.MaxLLMModelTier
+	// Max model tier: nil = don't touch, "" = clear the cap, value = set.
+	if req.MaxLLMModelTier != nil {
+		tier := *req.MaxLLMModelTier
+		if tier != "" && domain.ParseTier(tier) == domain.TierUnknown {
+			badRequest(w, "max_llm_model_tier must be haiku, sonnet, or opus")
+			return
+		}
+		orgSet.MaxLLMModelTier = tier
 	}
 
 	// GitHub PAT: nil = don't touch, "" = clear, non-empty = validate + set.
@@ -605,7 +633,50 @@ func (s *Server) handleOrgSettingsPost(w http.ResponseWriter, r *http.Request) {
 		go s.onJiraChanged(orgID)
 	}
 
-	writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
+	resp := map[string]string{"status": "saved"}
+	// Lowering the cap doesn't block the save — the admin has authority —
+	// but if the default team already prefers a higher tier, surface that
+	// its effective model just dropped. Gate on an actual cap change: the
+	// frontend re-sends max_llm_model_tier on every org save, so without
+	// this an unrelated save would re-warn each time the default team
+	// sits above an unchanged cap. Single-team-per-org today, so we check
+	// the default team; broadens to a team list when multi-team lands.
+	if orgSet.MaxLLMModelTier != "" && orgSet.MaxLLMModelTier != prevOrgSet.MaxLLMModelTier {
+		if w := s.capDowngradeWarning(r.Context(), orgID, userID, orgSet.MaxLLMModelTier); w != "" {
+			resp["warning"] = w
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// capDowngradeWarning returns a non-empty message when the org's default
+// team prefers a model above the given cap — i.e. the cap clamps it. Empty
+// when no clamp applies or the lookup fails (best-effort UX, never blocks
+// the save).
+func (s *Server) capDowngradeWarning(ctx context.Context, orgID, userID, maxTier string) string {
+	var teamDefault string
+	err := s.tx.WithTx(ctx, orgID, userID, func(tx db.TxStores) error {
+		teamID, e := tx.Teams.GetDefaultForOrg(ctx, orgID)
+		if e != nil || teamID == "" {
+			return e
+		}
+		teamSet, e := tx.Teams.GetSettings(ctx, teamID)
+		if e != nil {
+			return e
+		}
+		teamDefault = teamSet.DefaultModel
+		return nil
+	})
+	if err != nil || teamDefault == "" {
+		return ""
+	}
+	if eff, source := domain.EffectiveModel(teamDefault, maxTier); source == "org-cap" {
+		return fmt.Sprintf(
+			"The default team prefers %s, which exceeds the new cap of %s. Its effective model is now %s.",
+			teamDefault, maxTier, eff,
+		)
+	}
+	return ""
 }
 
 // --------------------------------------------------------------------

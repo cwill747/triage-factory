@@ -119,13 +119,15 @@ func applyPGPoolDefaults(db *sql.DB) {
 	db.SetConnMaxLifetime(5 * time.Minute)
 }
 
-// resolveAIModelForOrg looks up the default model the org's default
-// team uses. Falls back to domain.DefaultTeamSettings().DefaultModel
-// on any error so a transient DB hiccup doesn't silently clear the
-// spawner+curator credentials. The store's GetSettingsSystem already
-// returns DefaultTeamSettings() on missing rows; the explicit fallback
-// here covers the other failure modes (team-lookup error, settings-
-// read error, no default team at all).
+// resolveAIModelForOrg looks up the model the org's default team uses for
+// delegation, clamped by the org's max-tier cap (domain.EffectiveModel).
+// Falls back to domain.DefaultTeamSettings().DefaultModel on any error so a
+// transient DB hiccup doesn't silently clear the spawner+curator
+// credentials. The store's GetSettingsSystem already returns
+// DefaultTeamSettings() on missing rows; the explicit fallback here covers
+// the other failure modes (team-lookup error, settings-read error, no
+// default team at all). A failed org-settings read just means no cap is
+// applied — the team default stands.
 func resolveAIModelForOrg(ctx context.Context, stores db.Stores, orgID string) string {
 	fallback := domain.DefaultTeamSettings().DefaultModel
 	teamID, err := stores.Teams.GetDefaultForOrgSystem(ctx, orgID)
@@ -140,10 +142,16 @@ func resolveAIModelForOrg(ctx context.Context, stores db.Stores, orgID string) s
 		log.Printf("[main] read team settings %s: %v (using default model %q)", teamID, err, fallback)
 		return fallback
 	}
-	if teamSet.DefaultModel == "" {
-		return fallback
+
+	var maxTier string
+	if orgSet, err := stores.Orgs.GetSettingsSystem(ctx, orgID); err != nil {
+		log.Printf("[main] read org settings %s: %v (applying no model cap)", orgID, err)
+	} else {
+		maxTier = orgSet.MaxLLMModelTier
 	}
-	return teamSet.DefaultModel
+
+	model, _ := domain.EffectiveModel(teamSet.DefaultModel, maxTier)
+	return model
 }
 
 // bootstrapBareClones reads the configured repos from the DB and asks
