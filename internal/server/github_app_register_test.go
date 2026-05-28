@@ -267,8 +267,9 @@ func TestGitHubAppRegister_CallbackEndpoint_MultiMode(t *testing.T) {
 			t.Fatalf("callback status=%d body=%s, want 302", rec.Code, rec.Body.String())
 		}
 		loc := rec.Header().Get("Location")
-		if loc != "/settings/workspace#github-app" {
-			t.Errorf("redirect location=%q, want /settings/workspace#github-app", loc)
+		wantLoc := "/orgs/" + orgA.String() + "/settings#github-app"
+		if loc != wantLoc {
+			t.Errorf("redirect location=%q, want %q", loc, wantLoc)
 		}
 
 		// Verify the org_github_apps row was written.
@@ -359,6 +360,24 @@ func TestGitHubAPIBase(t *testing.T) {
 			t.Errorf("githubAPIBase(%q) = %q, want %q", tt.base, got, tt.want)
 		}
 	}
+}
+
+// TestSettingsRedirectPath pins the mode-aware post-callback redirect:
+// local mode lands on the flat /settings route, multi mode on the
+// org-scoped one. The #github-app fragment is appended by the caller.
+func TestSettingsRedirectPath(t *testing.T) {
+	t.Run("local", func(t *testing.T) {
+		runmode.SetForTest(t, runmode.ModeLocal)
+		if got := settingsRedirectPath("org-x"); got != "/settings" {
+			t.Errorf("local redirect = %q, want /settings", got)
+		}
+	})
+	t.Run("multi", func(t *testing.T) {
+		runmode.SetForTest(t, runmode.ModeMulti)
+		if got := settingsRedirectPath("org-x"); got != "/orgs/org-x/settings" {
+			t.Errorf("multi redirect = %q, want /orgs/org-x/settings", got)
+		}
+	})
 }
 
 func jsonBody(b []byte) io.Reader {
