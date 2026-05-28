@@ -197,6 +197,7 @@ func (s *Server) handleTeamSettingsPost(w http.ResponseWriter, r *http.Request) 
 	var (
 		prevProjects    []jiraProjectConfig
 		writtenProjects []jiraProjectConfig
+		prevModel       string
 		savedModel      string
 		orgMaxTier      string
 	)
@@ -205,6 +206,7 @@ func (s *Server) handleTeamSettingsPost(w http.ResponseWriter, r *http.Request) 
 		if err != nil {
 			return fmt.Errorf("load team settings: %w", err)
 		}
+		prevModel = teamSet.DefaultModel
 		if orgSet, err := tx.Orgs.GetSettings(r.Context(), orgID); err == nil {
 			orgMaxTier = orgSet.MaxLLMModelTier
 		}
@@ -282,10 +284,12 @@ func (s *Server) handleTeamSettingsPost(w http.ResponseWriter, r *http.Request) 
 	}
 
 	resp := map[string]string{"status": "saved"}
-	// The team default doesn't override the org cap. If it exceeds it,
-	// accept the save (the team owns its preference) but tell them the
-	// effective model is the org's cap, not what they just picked.
-	if req.AIModel != "" {
+	// The team default doesn't override the org cap. If a newly-picked
+	// default exceeds it, accept the save (the team owns its preference)
+	// but tell them the effective model is the org's cap. Gate on an
+	// actual model change so an unrelated save (e.g. editing projects,
+	// which re-sends the current model) doesn't re-warn every time.
+	if req.AIModel != "" && savedModel != prevModel {
 		if eff, source := domain.EffectiveModel(savedModel, orgMaxTier); source == "org-cap" {
 			resp["warning"] = fmt.Sprintf(
 				"Team default of %s exceeds the org cap of %s. Effective model is %s.",
@@ -632,9 +636,12 @@ func (s *Server) handleOrgSettingsPost(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]string{"status": "saved"}
 	// Lowering the cap doesn't block the save — the admin has authority —
 	// but if the default team already prefers a higher tier, surface that
-	// its effective model just dropped. Single-team-per-org today, so we
-	// check the default team; broadens to a team list when multi-team lands.
-	if req.MaxLLMModelTier != nil && *req.MaxLLMModelTier != "" {
+	// its effective model just dropped. Gate on an actual cap change: the
+	// frontend re-sends max_llm_model_tier on every org save, so without
+	// this an unrelated save would re-warn each time the default team
+	// sits above an unchanged cap. Single-team-per-org today, so we check
+	// the default team; broadens to a team list when multi-team lands.
+	if orgSet.MaxLLMModelTier != "" && orgSet.MaxLLMModelTier != prevOrgSet.MaxLLMModelTier {
 		if w := s.capDowngradeWarning(r.Context(), orgID, userID, orgSet.MaxLLMModelTier); w != "" {
 			resp["warning"] = w
 		}

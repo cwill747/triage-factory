@@ -49,7 +49,7 @@ func (t ModelTier) String() string {
 // team's configured default and the org's max-tier cap. The team default
 // wins unless it exceeds the cap, in which case the cap applies.
 //
-//   - teamDefault empty/unknown → falls back to "sonnet".
+//   - teamDefault empty/unknown → falls back to DefaultModel.
 //   - orgMaxTier empty/unknown → no cap.
 //
 // source is "org-cap" when the cap clamped the team's choice, else "team" —
@@ -57,14 +57,14 @@ func (t ModelTier) String() string {
 func EffectiveModel(teamDefault, orgMaxTier string) (model, source string) {
 	team := ParseTier(teamDefault)
 	if team == TierUnknown {
-		team = TierSonnet
+		team = ParseTier(DefaultModel)
 	}
-	cap := ParseTier(orgMaxTier)
-	if cap == TierUnknown {
+	capTier := ParseTier(orgMaxTier)
+	if capTier == TierUnknown {
 		return team.String(), "team"
 	}
-	if team > cap {
-		return cap.String(), "org-cap"
+	if team > capTier {
+		return capTier.String(), "org-cap"
 	}
 	return team.String(), "team"
 }

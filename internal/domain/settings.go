@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+// DefaultModel is the model tier TF falls back to when a team has no
+// explicit default. Shared by DefaultTeamSettings (the stored default) and
+// EffectiveModel (the resolution fallback) so the two can't drift.
+const DefaultModel = "sonnet"
+
 // OrgSettings is the org-scope settings row (org_settings table).
 //
 // Field nullability:
@@ -87,7 +92,7 @@ func DefaultTeamSettings() TeamSettings {
 	return TeamSettings{
 		AIReprioritizeThreshold:    5,
 		AIPreferenceUpdateInterval: 20,
-		DefaultModel:               "sonnet",
+		DefaultModel:               DefaultModel,
 		AutoDelegateEnabled:        false,
 	}
 }

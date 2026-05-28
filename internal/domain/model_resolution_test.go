@@ -30,7 +30,7 @@ func TestEffectiveModel(t *testing.T) {
 }
 
 func TestParseTierOrdering(t *testing.T) {
-	if !(TierHaiku < TierSonnet && TierSonnet < TierOpus) {
+	if TierHaiku >= TierSonnet || TierSonnet >= TierOpus {
 		t.Fatal("tier ordering must be Haiku < Sonnet < Opus for the cap to clamp correctly")
 	}
 	if TierUnknown != 0 {
