@@ -72,6 +72,24 @@ So: **unclaimed task → visible to all matched/tracking teams; claimed task →
 
 **Bot identity** is the **SKY-352 resolver's** job, not new logic: App installation token → distinct bot identity; PAT → bot-is-you. The install tier decides.
 
+### Two routing axes — reviewer vs entity-owner (they never cross-contaminate)
+
+GitHub PR events split into two independent axes:
+- **`review_requested` → the requested reviewer's team** (above) — a reviewer's personal obligation.
+- **Everything else** (`ci_check_failed`, `pr:conflicts`, `review_changes_requested`, `review_commented`, `new_commits`) → the **entity's owning team** — the PR's author-centric lifecycle.
+
+**Entity owning-team derivation** (first hit wins): `entities.owning_team_id` override (set by transfer) → project (`entities.project_id → projects.team_id`) → TF-origin (the team of the run that opened the PR, if linkable) → the team of the most recent prior **author-centric** task on the entity → fallback: the PR author's teams (first author-centric claim establishes the owner; external/non-TF author → the teams already engaged with the entity, else no task).
+
+**The review-first trap (load-bearing):** the owning-team derivation **must exclude `review_requested` tasks.** If a review is the *first* event on a fresh entity, it creates a task on the *reviewer's* team — counting that would poison the derivation, so a later CI failure would route to the reviewer's team. Review activity is feedback *on* a PR by outsiders; it never establishes entity ownership. So review tasks feed **only** the reviewer axis. The payoff: a PR can carry a review task on the reviewer's team **and** a CI-failure task on the entity's owning team at the same time, with no conflict — different deliverables, different teams.
+
+---
+
+## Transferring ownership between teams
+
+Teams hand work off with a directed **FROM → TO** transfer (both user-selected; FROM defaults to the current owner), **atomic**: set `entities.owning_team_id = TO` **and** re-home the entity's active *owning-team* tasks that are FROM's (`tasks.team_id` + `task_teams` → TO) in one transaction. **Reviewer tasks are not moved** — they're reviewer-personal. After transfer the owning-team derivation returns TO (tier 1 override), so future author-centric events route to TO durably (even after the moved task closes).
+
+**Cheap by construction:** because entities are org-shared (not forked per team), transfer moves **no content** — events, prior runs, and memory are org-level, so TO inherits the full context for free; transfer just re-points attribution. (The forked-per-team model we rejected would have required copying entity + event log + memory — exactly the mess we avoided.)
+
 ---
 
 ## Augment vs consume — there is NO "augment mode"
@@ -108,19 +126,27 @@ These are inherent to event→task→claim. The general fix, if ever needed, is 
 - `github-team ↔ TF-team` mapping (string labels) as the twin of `jira_project_status_rules`.
 - Bot reviews per requested codeowner team; org/repo default for direct `@bot`.
 - Bot identity via the SKY-352 resolver.
+- **Two routing axes:** `review_requested` → reviewer's team; all other GitHub PR events → entity's owning team (derivation: override → project → TF-origin → prior *author-centric* task → author-teams fallback), with **review tasks excluded** from the owning-team derivation.
+- **Acting team on claim** is derived (claimer's teams ∩ `task_teams`; bot = firing trigger's team) — not blocked on the team-picker.
+- **Transfer** = directed FROM→TO, atomic (entity `owning_team_id` + FROM-owned tasks), reviewer tasks stay; cheap because entities are org-shared.
 
 **Open / deferred:**
 - "Bot pass + human pass both *required* on GitHub" (bot as a separate explicit reviewer with its own identity) — niche; deferred.
-- The **org / org+per-repo default-bot-config** surface — needs a config home.
-- The `task_teams` schema + multi-mode **RLS** shape (visible-to-team vs owned-by-team).
+- Hard team-RLS vs soft (query-level) team filter — currently **hard RLS** (262/366/367 + SKY-368); soft was explored and judged ~equivalent-with-less-boundary, so kept hard for the defense-in-depth backstop. Revisit only if the state-dependent claim-RLS proves painful.
 - Distribution policy when several teams auto-claim the same shared pool (CAS keeps it *safe*; "who *should* get it" is a separate knob).
+- Whole "org == team" collapse — rejected for now (loses poll consolidation + inter-team sharing + claim-dedup); may revisit.
 
 ---
 
-## How the in-flight tickets relate
+## How the tickets relate (cluster under SKY-242)
 
-- **SKY-295** — its per-team fan-out is exactly what's being reversed. This model supersedes it.
-- **SKY-366** (merged) — factory entity↔team membership. Consistent; reads as "entity has a task visible to my team."
-- **SKY-367** — Jira deck **GET** team-scoping (via `jira_project_status_rules`). Consistent. Its **POST** gap (the Codex finding: an off-team assigned ticket can be acted on) is **downstream of this model** — the POST eligibility must check the acting team's tracked projects, mirroring the GET.
-- **SKY-294** — team-selection UX. Downstream; its reads/writes scope per this model. (Note: its `entities.project_id → projects.team_id` router-derivation is invalid — projects are optional; the router already stamps team from the matched handler.)
-- **New work this implies:** the SKY-295 reversal + `task_teams`; per-reviewer GitHub review events; the `github-team ↔ TF-team` mapping table; the org/repo default-bot-config surface.
+- **SKY-368** — the reversal: one task + `task_teams` + claim-CAS; the foundation. Supersedes **SKY-295**'s fan-out (kept: `became_atomic` suppression, bus-routed backfill).
+- **SKY-369** — `github-team ↔ TF-team` mapping (the `jira_project_status_rules` twin).
+- **SKY-370** — per-reviewer review events + route to the requested identity's team.
+- **SKY-371** — org/repo default bot-review config (direct `@bot` fallback). *Low.*
+- **SKY-372** — author-centric routing → entity owning team; adds `entities.owning_team_id`; encodes the review-first exclusion.
+- **SKY-373** — transfer (directed FROM→TO).
+- **SKY-294** — team-selection UX; *read-scoping now delegated to 366/367/368*, so it narrows to the picker + write-threading. (Its old `entities.project_id → projects.team_id` derivation is invalid — projects are optional.)
+- **SKY-366** (merged) — factory entity↔team membership; consistent, reused by 372's owning-team lookup.
+- **SKY-367** (merged) — Jira deck GET+POST team-scoping; consistent.
+- **Order:** 368 + 369 (foundation, parallel) → 271 + 353 (prereqs) → 370 → 372 → 294 → 371 → 373.
