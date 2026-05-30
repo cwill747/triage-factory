@@ -1,0 +1,87 @@
+package db
+
+import (
+	"context"
+
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
+)
+
+// TeamGitHubReposStore owns the team_github_repos table — the per-team
+// GitHub repo selection (one row per (team_id, owner, repo)) and the
+// source of truth for which repos a team tracks. The GitHub
+// tracking-scope twin of jira_project_status_rules.
+//
+// # repo_profiles is derived from this table
+//
+// repo_profiles stays org-shared and stays the polled set, but it is now
+// a *derived cache*: the org-wide UNION of every team's rows here. It is
+// never user-written directly anymore — ReplaceForTeam mutates the team's
+// rows AND reconciles repo_profiles to the new union atomically, in one
+// transaction. The poller keeps reading repo_profiles via
+// RepoStore.ListConfiguredNamesSystem, unchanged.
+//
+// # Pool split (Postgres)
+//
+//   - ListForTeam, ReplaceForTeam run on the app pool. The
+//     team_github_repos_select / _insert / _update / _delete RLS
+//     policies gate reads by team membership and writes by team admin;
+//     the request-handler caller has set the JWT claims via the TxRunner.
+//     ReplaceForTeam's union read crosses team boundaries (which the
+//     team-membership SELECT policy hides), so it reads through the
+//     tf.org_tracked_repos() SECURITY DEFINER helper — scoped to the
+//     caller's org via tf.current_org_id(), never to a trusted argument,
+//     so the org boundary is preserved at the DB layer while only the
+//     non-boundary team scope is bypassed. The whole team-write +
+//     reconcile runs in the caller's tx (atomic), serialized per org by a
+//     transaction advisory lock so concurrent same-org saves can't race
+//     repo_profiles into an inconsistent state.
+//   - ListForTeamSystem, ListForOrgSystem, TracksRepoSystem run on the
+//     admin pool. The router gate + any poll caller resolve tracking
+//     without a JWT-claims context.
+//
+// SQLite collapses the pool split to one connection; the `...System`
+// variant delegates to its non-System counterpart, the union read needs
+// no SECURITY DEFINER (no RLS), and the reconcile runs in the same
+// (single-writer, lock-free) transaction as the team-row write.
+type TeamGitHubReposStore interface {
+	// ListForTeam returns the team's tracked repos ordered by
+	// (owner, repo). Empty slice with nil error when the team tracks
+	// nothing. Postgres routes through the app pool
+	// (team_github_repos_select gates by team membership).
+	ListForTeam(ctx context.Context, teamID string) ([]domain.TeamGitHubRepo, error)
+
+	// ListForTeamSystem mirrors ListForTeam but routes through the admin
+	// pool in Postgres for callers without a JWT-claims context.
+	ListForTeamSystem(ctx context.Context, teamID string) ([]domain.TeamGitHubRepo, error)
+
+	// ListForOrgSystem returns the DISTINCT (owner, repo) union across
+	// every team in the org, ordered by (owner, repo) — the polled set
+	// without going through repo_profiles. Admin pool in Postgres: the
+	// union spans teams the caller may not belong to.
+	ListForOrgSystem(ctx context.Context, orgID string) ([]domain.TeamGitHubRepo, error)
+
+	// ReplaceForTeam upserts one row per entry in repos and deletes rows
+	// whose (owner, repo) is no longer in the input — bulk-replace
+	// semantics mirroring JiraStatusRulesStore.ReplaceForTeam. Passing an
+	// empty slice clears every row for the team.
+	//
+	// In the same transaction it reconciles the org-shared repo_profiles
+	// cache to the new org-wide union: newly-tracked repos get a skeleton
+	// row, a repo no team tracks anymore is GC'd, and a repo still tracked
+	// by another team survives with its cached profile intact. Atomic — if
+	// the tx rolls back, neither team_github_repos nor repo_profiles moves.
+	// Postgres serializes concurrent same-org calls with a per-org
+	// transaction advisory lock so the union recompute can't race; the
+	// cross-team union read goes through the tf.org_tracked_repos(org)
+	// SECURITY DEFINER helper, which enforces org == the caller's claims
+	// when present (so the org boundary holds at the DB layer). Composed
+	// in the caller's WithTx so RLS gates the team-row write by team admin.
+	// orgID must be the team's org (the request's authorized org).
+	ReplaceForTeam(ctx context.Context, orgID, teamID string, repos []domain.TeamGitHubRepo) error
+
+	// TracksRepoSystem reports whether the team tracks (owner, repo),
+	// matched case-insensitively on both fields (GitHub identifiers are
+	// case-insensitive). This is the router gate lookup. Admin pool in
+	// Postgres: the router goroutine has no JWT claims.
+	TracksRepoSystem(ctx context.Context, teamID, owner, repo string) (bool, error)
+}

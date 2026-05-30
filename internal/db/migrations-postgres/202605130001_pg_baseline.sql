@@ -408,6 +408,40 @@ $$;
 
 
 --
+-- Name: org_tracked_repos(uuid); Type: FUNCTION; Schema: tf; Owner: -
+--
+
+-- The cross-team union read behind team_github_repos -> repo_profiles
+-- reconciliation (SKY-375). repo_profiles is the org-wide UNION of every
+-- team's tracked repos, but the team_github_repos SELECT policy is
+-- team-membership-scoped, so a team admin's app-pool tx can't see sibling
+-- teams' rows. This SECURITY DEFINER helper bypasses that per-team SELECT
+-- RLS — a within-org, non-security boundary — to return the full org
+-- union, while preserving the ORG boundary: with request claims it
+-- requires p_org_id to equal the caller's org; with no claims
+-- (admin-pool / system / test) the guard is skipped, mirroring the
+-- vault_*_system split. The pinned search_path blocks definer hijacking.
+-- +goose StatementBegin
+CREATE FUNCTION tf.org_tracked_repos(p_org_id uuid) RETURNS TABLE(owner text, repo text)
+    LANGUAGE plpgsql STABLE SECURITY DEFINER
+    SET search_path TO 'pg_catalog', 'public'
+    AS $$
+BEGIN
+  IF tf.current_org_id() IS NOT NULL AND p_org_id <> tf.current_org_id() THEN
+    RAISE EXCEPTION 'org_tracked_repos: requested org % does not match caller org %', p_org_id, tf.current_org_id();
+  END IF;
+  RETURN QUERY
+    SELECT DISTINCT g.owner, g.repo
+    FROM team_github_repos g
+    JOIN teams t ON t.id = g.team_id
+    WHERE t.org_id = p_org_id
+    ORDER BY g.owner, g.repo;
+END;
+$$;
+-- +goose StatementEnd
+
+
+--
 -- Name: user_in_team(uuid); Type: FUNCTION; Schema: tf; Owner: -
 --
 
@@ -777,6 +811,30 @@ CREATE TABLE public.team_github_groups (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT tgg_org_login_populated CHECK (github_org_login <> ''),
     CONSTRAINT tgg_team_slug_populated CHECK (github_team_slug <> '')
+);
+
+
+--
+-- Name: team_github_repos; Type: TABLE; Schema: public; Owner: -
+--
+
+-- One row per (team, owner, repo): a team declaring "I track this repo."
+-- The GitHub *tracking-scope* twin of jira_project_status_rules and the
+-- source of truth for which repos a team cares about. NOT the same as
+-- team_github_groups above (CODEOWNERS review-routing teams) — this is
+-- the tracking selection. repo_profiles is the org-shared UNION of every
+-- team's rows here, a derived poll/profile/ETag cache reconciled on every
+-- write and never user-written directly anymore. No org_id column: org
+-- scope rides the teams FK, mirroring jira_project_status_rules. Local
+-- mode (N=1) tracks every configured repo on the single default team, so
+-- the router's team↔repo gate never drops anything there.
+CREATE TABLE public.team_github_repos (
+    team_id uuid NOT NULL,
+    owner text NOT NULL,
+    repo text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    CONSTRAINT tgr_owner_populated CHECK (owner <> ''),
+    CONSTRAINT tgr_repo_populated CHECK (repo <> '')
 );
 
 
@@ -1601,6 +1659,14 @@ ALTER TABLE ONLY public.jira_project_status_rules
 
 ALTER TABLE ONLY public.team_github_groups
     ADD CONSTRAINT team_github_groups_pkey PRIMARY KEY (team_id, github_org_login, github_team_slug);
+
+
+--
+-- Name: team_github_repos team_github_repos_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.team_github_repos
+    ADD CONSTRAINT team_github_repos_pkey PRIMARY KEY (team_id, owner, repo);
 
 
 --
@@ -2627,6 +2693,14 @@ ALTER TABLE ONLY public.team_github_groups
 
 
 --
+-- Name: team_github_repos team_github_repos_team_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.team_github_repos
+    ADD CONSTRAINT team_github_repos_team_id_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id) ON DELETE CASCADE;
+
+
+--
 -- Name: memberships memberships_team_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -3494,6 +3568,42 @@ CREATE POLICY team_github_groups_delete ON public.team_github_groups FOR DELETE 
 
 
 --
+-- Name: team_github_repos; Type: ROW SECURITY; Schema: public; Owner: -
+--
+
+ALTER TABLE public.team_github_repos ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: team_github_repos team_github_repos_select; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY team_github_repos_select ON public.team_github_repos FOR SELECT USING ((tf.team_in_current_org(team_id) AND (EXISTS ( SELECT 1
+   FROM public.memberships m
+  WHERE ((m.team_id = team_github_repos.team_id) AND (m.user_id = tf.current_user_id()))))));
+
+
+--
+-- Name: team_github_repos team_github_repos_insert; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY team_github_repos_insert ON public.team_github_repos FOR INSERT WITH CHECK ((tf.team_in_current_org(team_id) AND tf.user_is_team_admin(team_id)));
+
+
+--
+-- Name: team_github_repos team_github_repos_update; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY team_github_repos_update ON public.team_github_repos FOR UPDATE USING ((tf.team_in_current_org(team_id) AND tf.user_is_team_admin(team_id))) WITH CHECK ((tf.team_in_current_org(team_id) AND tf.user_is_team_admin(team_id)));
+
+
+--
+-- Name: team_github_repos team_github_repos_delete; Type: POLICY; Schema: public; Owner: -
+--
+
+CREATE POLICY team_github_repos_delete ON public.team_github_repos FOR DELETE USING ((tf.team_in_current_org(team_id) AND tf.user_is_team_admin(team_id)));
+
+
+--
 -- Name: memberships; Type: ROW SECURITY; Schema: public; Owner: -
 --
 
@@ -4304,6 +4414,14 @@ GRANT ALL ON FUNCTION tf.user_has_org_access(target_org uuid) TO tf_app;
 
 
 --
+-- Name: FUNCTION org_tracked_repos(p_org_id uuid); Type: ACL; Schema: tf; Owner: -
+--
+
+REVOKE ALL ON FUNCTION tf.org_tracked_repos(p_org_id uuid) FROM PUBLIC;
+GRANT ALL ON FUNCTION tf.org_tracked_repos(p_org_id uuid) TO tf_app;
+
+
+--
 -- Name: FUNCTION user_in_team(target_team uuid); Type: ACL; Schema: tf; Owner: -
 --
 
@@ -4484,6 +4602,17 @@ GRANT ALL ON TABLE public.team_github_groups TO anon;
 GRANT ALL ON TABLE public.team_github_groups TO authenticated;
 GRANT ALL ON TABLE public.team_github_groups TO service_role;
 GRANT SELECT,INSERT,DELETE ON TABLE public.team_github_groups TO tf_app;
+
+
+--
+-- Name: TABLE team_github_repos; Type: ACL; Schema: public; Owner: -
+--
+
+GRANT ALL ON TABLE public.team_github_repos TO postgres;
+GRANT ALL ON TABLE public.team_github_repos TO anon;
+GRANT ALL ON TABLE public.team_github_repos TO authenticated;
+GRANT ALL ON TABLE public.team_github_repos TO service_role;
+GRANT SELECT,INSERT,DELETE,UPDATE ON TABLE public.team_github_repos TO tf_app;
 
 
 --

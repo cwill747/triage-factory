@@ -73,28 +73,27 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
 		return
 	}
-	var pinned []string
-	var pinnedErrMsg string
-	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-		pinned, pinnedErrMsg = validatePinnedRepos(r.Context(), tx.Repos, orgID, req.PinnedRepos)
-		return nil
-	}); err != nil {
-		internalError(w, "projects", err)
-		return
-	}
-	if pinnedErrMsg != "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": pinnedErrMsg})
-		return
-	}
 	jiraKey := strings.TrimSpace(req.JiraProjectKey)
 	linearKey := strings.TrimSpace(req.LinearProjectKey)
 
-	// Resolve team + (lazily) jira rules inside one WithTx so
-	// teams_select and jira_rules_select RLS gates fire under the
-	// user's claims. Mirrors the PATCH path's lazy-load policy:
-	// only read rules when the Jira side actually needs validation.
+	// Resolve team first, then validate pinned repos against that team's
+	// tracked set + (lazily) jira rules — all inside one WithTx so
+	// teams_select, team_github_repos_select, and jira_rules_select RLS
+	// gates fire under the user's claims. Mirrors the PATCH path's
+	// lazy-load policy: only read jira rules when the Jira side needs
+	// validation.
+	//
+	// TODO(SKY-294): new projects are created under the org's default team
+	// because there is no write-time team picker yet. This is correct while
+	// every org has a single default team; when the picker lands, take the
+	// acting team from the request body instead of GetDefaultForOrg (the
+	// frontend RepoMultiSelect hardcodes the matching default-team path).
+	// Note UPDATE already validates against the project's own
+	// existing.TeamID — only this create path assumes default.
 	var (
 		teamID        string
+		pinned        []string
+		pinnedErrMsg  string
 		teamJiraRules []domain.JiraProjectStatusRules
 	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
@@ -106,6 +105,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		if teamID == "" {
 			return fmt.Errorf("org %s has no default team", orgID)
 		}
+		pinned, pinnedErrMsg = validatePinnedRepos(r.Context(), tx.TeamGitHubRepos, teamID, req.PinnedRepos)
 		if jiraKey != "" {
 			teamJiraRules, e = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
 			if e != nil {
@@ -116,6 +116,10 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	}); err != nil {
 		log.Printf("handleProjectCreate: %v", err)
 		internalError(w, "projects", err)
+		return
+	}
+	if pinnedErrMsg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": pinnedErrMsg})
 		return
 	}
 	if jiraKey != "" || linearKey != "" {
@@ -468,10 +472,18 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		updated.Description = *req.Description
 	}
 	if req.PinnedRepos != nil {
+		// Validate against the project's OWN team, not the org default — a
+		// non-default-team project's pins must be tracked by that team.
+		// existing.TeamID is populated by Projects.Get; the store preserves
+		// team_id on update.
+		if existing.TeamID == "" {
+			internalError(w, "projects", fmt.Errorf("project %s has no team_id", existing.ID))
+			return
+		}
 		var pinned []string
 		var errMsg string
 		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-			pinned, errMsg = validatePinnedRepos(r.Context(), tx.Repos, orgID, *req.PinnedRepos)
+			pinned, errMsg = validatePinnedRepos(r.Context(), tx.TeamGitHubRepos, existing.TeamID, *req.PinnedRepos)
 			return nil
 		}); err != nil {
 			internalError(w, "projects", err)
@@ -503,20 +515,18 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		if jiraInput == "" {
 			updated.JiraProjectKey = ""
 		} else {
-			// Default-team + rule lookup inside WithTx so the rule
-			// read goes through tx.JiraStatusRules.ListForTeam (app
-			// pool, jira_rules_select RLS gates by team membership).
+			// Rule lookup against the project's OWN team (not the org
+			// default), inside WithTx so the read goes through
+			// tx.JiraStatusRules.ListForTeam (app pool, jira_rules_select
+			// RLS gates by team membership).
+			if existing.TeamID == "" {
+				internalError(w, "projects", fmt.Errorf("project %s has no team_id", existing.ID))
+				return
+			}
 			var teamRules []domain.JiraProjectStatusRules
 			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-				teamID, terr := tx.Teams.GetDefaultForOrg(r.Context(), orgID)
-				if terr != nil {
-					return fmt.Errorf("default team lookup: %w", terr)
-				}
-				if teamID == "" {
-					return fmt.Errorf("org %s has no default team", orgID)
-				}
 				var rerr error
-				teamRules, rerr = tx.JiraStatusRules.ListForTeam(r.Context(), teamID)
+				teamRules, rerr = tx.JiraStatusRules.ListForTeam(r.Context(), existing.TeamID)
 				return rerr
 			}); err != nil {
 				log.Printf("[projects] patch: jira rules load: %v", err)
@@ -767,18 +777,22 @@ func validatePinnedRepoShape(repos []string) ([]string, string) {
 	return out, ""
 }
 
-// validatePinnedRepos composes shape validation with the must-be-
-// configured existence check: every slug must correspond to a row in
-// repo_profiles. This pins the UX contract — the frontend (SKY-217)
-// presents pinned_repos as a multi-select over the configured-repos
-// list, so an unconfigured slug arriving here is either a stale
-// client (the user removed the repo from config after pinning) or
-// someone hand-crafting a curl. Rejecting it up front keeps the
-// Curator from later trying to materialize a worktree for a repo
-// the user can't authenticate against.
+// validatePinnedRepos composes shape validation with the must-be-tracked
+// existence check: every slug must be a repo the project's *team* tracks
+// (team_github_repos). Post-SKY-375 repos are per-team, so pinning is
+// gated on the team's set rather than the org-wide union — a repo another
+// team tracks (and that therefore exists in the shared repo_profiles
+// cache) is still rejected here if the project's own team doesn't track
+// it. This pins the UX contract — the frontend presents pinned_repos as a
+// multi-select over the team's tracked repos, so an untracked slug
+// arriving here is a stale client or a hand-crafted curl. Rejecting it up
+// front keeps the Curator from later trying to materialize a worktree for
+// a repo the team can't authenticate against.
 //
-// Returns (normalized, "") on success and (nil, errMsg) on failure.
-func validatePinnedRepos(ctx context.Context, repos db.RepoStore, orgID string, slugs []string) ([]string, string) {
+// Runs under the caller's claims (team_github_repos_select RLS), so it
+// must be invoked inside a WithTx for the requesting user. Returns
+// (normalized, "") on success and (nil, errMsg) on failure.
+func validatePinnedRepos(ctx context.Context, teamRepos db.TeamGitHubReposStore, teamID string, slugs []string) ([]string, string) {
 	out, errMsg := validatePinnedRepoShape(slugs)
 	if errMsg != "" {
 		return nil, errMsg
@@ -787,17 +801,22 @@ func validatePinnedRepos(ctx context.Context, repos db.RepoStore, orgID string, 
 		return out, ""
 	}
 
-	configured, err := repos.ListConfiguredNames(ctx, orgID)
+	tracked, err := teamRepos.ListForTeam(ctx, teamID)
 	if err != nil {
-		return nil, "failed to load configured repos: " + err.Error()
+		return nil, "failed to load tracked repos: " + err.Error()
 	}
-	known := make(map[string]struct{}, len(configured))
-	for _, name := range configured {
-		known[name] = struct{}{}
+	// Key both sides case-insensitively: GitHub owner/repo names are
+	// case-insensitive and the rest of SKY-375 folds case (TracksRepoSystem,
+	// newlyAddedRepos, the reconcile). A repo re-saved into team_github_repos
+	// with different capitalization than the incoming pin is the same repo,
+	// so an exact-string match would wrongly reject an otherwise-valid pin.
+	known := make(map[string]struct{}, len(tracked))
+	for _, t := range tracked {
+		known[strings.ToLower(t.Slug())] = struct{}{}
 	}
 	for _, slug := range out {
-		if _, ok := known[slug]; !ok {
-			return nil, "pinned_repos: " + slug + " is not a configured repo (add it on the GitHub config page first)"
+		if _, ok := known[strings.ToLower(slug)]; !ok {
+			return nil, "pinned_repos: " + slug + " is not a repo this team tracks (add it on the GitHub config page first)"
 		}
 	}
 	return out, ""

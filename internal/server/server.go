@@ -492,6 +492,8 @@ func (s *Server) routes() {
 	s.apiMutating("POST /api/settings/team/{team_id}", s.handleTeamSettingsPost)
 	s.api("GET /api/settings/team/{team_id}/github-groups", s.handleTeamGitHubGroupsGet)
 	s.apiMutating("PUT /api/settings/team/{team_id}/github-groups", s.handleTeamGitHubGroupsPut)
+	s.api("GET /api/settings/team/{team_id}/repos", s.handleTeamReposGet)
+	s.apiMutating("PUT /api/settings/team/{team_id}/repos", s.handleTeamReposPut)
 	s.api("GET /api/settings/org", s.handleOrgSettingsGet)
 	s.apiMutating("POST /api/settings/org", s.handleOrgSettingsPost)
 
@@ -506,7 +508,6 @@ func (s *Server) routes() {
 	s.api("GET /api/github/repos", s.handleGitHubRepos)
 	s.apiMutating("POST /api/github/preflight-ssh", s.handleGitHubPreflightSSH)
 	s.api("GET /api/repos", s.handleRepoProfiles)
-	s.apiMutating("POST /api/repos", s.handleReposSave)
 	s.apiMutating("PATCH /api/repos/{owner}/{repo}", s.handleRepoUpdate)
 	s.api("GET /api/repos/{owner}/{repo}/branches", s.handleRepoBranches)
 	s.apiMutating("POST /api/jira/connect", s.handleJiraConnect)

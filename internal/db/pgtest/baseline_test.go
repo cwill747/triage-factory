@@ -23,7 +23,7 @@ func TestBaseline_AppliesCleanly(t *testing.T) {
 	expectedTables := []string{
 		"orgs", "teams", "users", "memberships", "org_memberships", "sessions", "project_knowledge",
 		"org_settings", "team_settings", "user_settings", "jira_project_status_rules",
-		"team_github_groups",
+		"team_github_groups", "team_github_repos",
 		"prompts", "projects", "events_catalog", "entities", "entity_links", "events",
 		"event_handlers", "tasks", "task_events", "runs", "run_artifacts",
 		"run_messages", "run_memory", "pending_firings", "run_worktrees", "pending_prs",
@@ -3046,4 +3046,164 @@ func assertPgCode(t *testing.T, err error, code, what string) {
 	if pgErr.Code != code {
 		t.Errorf("%s: SQLSTATE = %s (msg %q), want %s", what, pgErr.Code, pgErr.Message, code)
 	}
+}
+
+// TestRLS_TeamGitHubRepos pins the team_github_repos RLS contract
+// (SKY-375): SELECT is gated by team membership, INSERT/DELETE by team
+// admin, and rows are isolated cross-team. The mirror of the
+// jira_project_status_rules policies.
+func TestRLS_TeamGitHubRepos(t *testing.T) {
+	h := Shared(t)
+	h.Reset(t)
+
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	bob := SeedUser(t, h, "bob")
+	AddOrgMember(t, h, bob, orgA, teamA, "member", "member")
+
+	// A second team in the same org with its own admin (carol). Bob is
+	// NOT a member of teamB, so its rows must stay invisible to him.
+	teamB := SeedTeam(t, h, orgA, "team-b")
+	carol := SeedUser(t, h, "carol")
+	AddOrgMember(t, h, carol, orgA, teamB, "member", "admin")
+
+	// carol (admin of teamB) tracks a repo for teamB.
+	if err := h.WithUser(t, carol, orgA, func(tx *sql.Tx) error {
+		_, e := tx.Exec(`INSERT INTO team_github_repos (team_id, owner, repo) VALUES ($1, 'acme', 'b-repo')`, teamB)
+		return e
+	}); err != nil {
+		t.Fatalf("carol INSERT teamB repo: %v", err)
+	}
+
+	// alice (admin of teamA — owner is implicitly team admin) tracks a
+	// repo for teamA.
+	if err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+		_, e := tx.Exec(`INSERT INTO team_github_repos (team_id, owner, repo) VALUES ($1, 'acme', 'a-repo')`, teamA)
+		return e
+	}); err != nil {
+		t.Fatalf("alice INSERT teamA repo: %v", err)
+	}
+
+	// bob (member of teamA only) sees exactly teamA's row — teamB's row
+	// is filtered out by the membership semi-join in the SELECT policy.
+	if err := h.WithUser(t, bob, orgA, func(tx *sql.Tx) error {
+		rows, e := tx.Query(`SELECT repo FROM team_github_repos ORDER BY repo`)
+		if e != nil {
+			return e
+		}
+		defer rows.Close()
+		var got []string
+		for rows.Next() {
+			var r string
+			if e := rows.Scan(&r); e != nil {
+				return e
+			}
+			got = append(got, r)
+		}
+		if len(got) != 1 || got[0] != "a-repo" {
+			t.Errorf("bob sees %v; want only [a-repo] (teamB isolated)", got)
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatalf("bob SELECT: %v", err)
+	}
+
+	// bob (non-admin) cannot INSERT into teamA — INSERT WITH CHECK is
+	// admin-gated → SQLSTATE 42501.
+	err := h.WithUser(t, bob, orgA, func(tx *sql.Tx) error {
+		_, e := tx.Exec(`INSERT INTO team_github_repos (team_id, owner, repo) VALUES ($1, 'acme', 'sneaky')`, teamA)
+		return e
+	})
+	assertPgCode(t, err, "42501", "bob INSERT teamA repo (non-admin)")
+
+	// bob cannot DELETE teamA's row either — DELETE policy admin-gated,
+	// so the row is filtered out and 0 rows are affected (no error).
+	if err := h.WithUser(t, bob, orgA, func(tx *sql.Tx) error {
+		res, e := tx.Exec(`DELETE FROM team_github_repos WHERE team_id = $1`, teamA)
+		if e != nil {
+			return e
+		}
+		if n, _ := res.RowsAffected(); n != 0 {
+			t.Errorf("bob DELETE affected %d rows; want 0 (admin-gated)", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("bob DELETE attempt: %v", err)
+	}
+
+	// carol cannot see teamA's row (she's not a member of teamA).
+	if err := h.WithUser(t, carol, orgA, func(tx *sql.Tx) error {
+		var n int
+		if e := tx.QueryRow(`SELECT count(*) FROM team_github_repos WHERE team_id = $1`, teamA).Scan(&n); e != nil {
+			return e
+		}
+		if n != 0 {
+			t.Errorf("carol sees %d teamA rows; want 0 (cross-team isolation)", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("carol cross-team SELECT: %v", err)
+	}
+}
+
+// TestOrgTrackedRepos_OrgBoundaryAndTeamBypass pins the security contract
+// of the tf.org_tracked_repos() SECURITY DEFINER helper (SKY-375): it
+// bypasses the per-team SELECT RLS (a within-org, non-security boundary)
+// so the repo_profiles reconcile can read the full org union, but it
+// holds the ORG boundary — a caller's claims org must match the requested
+// org, so it can never read another org's tracked repos.
+func TestOrgTrackedRepos_OrgBoundaryAndTeamBypass(t *testing.T) {
+	h := Shared(t)
+	h.Reset(t)
+
+	orgA, alice, teamA := SeedOrgWithUser(t, h, "alice")
+	teamA2 := SeedTeam(t, h, orgA, "team-a2") // alice is NOT a member
+	orgB, _, teamB := SeedOrgWithUser(t, h, "bob")
+
+	// Tracked repos: two teams in orgA (alice belongs to only one), one in orgB.
+	MustExec(t, h.AdminDB, `INSERT INTO team_github_repos (team_id, owner, repo) VALUES ($1, 'acme', 'a1')`, teamA)
+	MustExec(t, h.AdminDB, `INSERT INTO team_github_repos (team_id, owner, repo) VALUES ($1, 'acme', 'a2')`, teamA2)
+	MustExec(t, h.AdminDB, `INSERT INTO team_github_repos (team_id, owner, repo) VALUES ($1, 'beta', 'b1')`, teamB)
+
+	// Under alice's claims, the helper returns the WHOLE org-A union — both
+	// teamA and teamA2 — even though alice isn't a member of teamA2 (the
+	// intentional team-RLS bypass).
+	if err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+		var n int
+		if e := tx.QueryRow(`SELECT count(*) FROM tf.org_tracked_repos($1)`, orgA).Scan(&n); e != nil {
+			return e
+		}
+		if n != 2 {
+			t.Errorf("org_tracked_repos(orgA) returned %d repos; want 2 (both teams, team RLS bypassed)", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("alice org_tracked_repos(orgA): %v", err)
+	}
+
+	// But a DIRECT table read under alice still honors the per-team SELECT
+	// RLS — she sees only teamA's row, not teamA2's. The boundary is intact
+	// at the table level; only the definer helper bridges it.
+	if err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+		var n int
+		if e := tx.QueryRow(`SELECT count(*) FROM team_github_repos`).Scan(&n); e != nil {
+			return e
+		}
+		if n != 1 {
+			t.Errorf("direct team_github_repos read saw %d rows; want 1 (team RLS still enforced)", n)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("alice direct read: %v", err)
+	}
+
+	// The ORG boundary holds: alice (claims org A) asking for org B's union
+	// is rejected by the helper's guard — no cross-org read.
+	err := h.WithUser(t, alice, orgA, func(tx *sql.Tx) error {
+		var n int
+		return tx.QueryRow(`SELECT count(*) FROM tf.org_tracked_repos($1)`, orgB).Scan(&n)
+	})
+	if err == nil {
+		t.Fatal("org_tracked_repos(orgB) under org-A claims should be rejected, got nil error")
+	}
+	assertPgCode(t, err, "P0001", "cross-org org_tracked_repos (raise_exception)")
 }

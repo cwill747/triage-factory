@@ -596,6 +596,14 @@ function PinnedReposInline({
   // a "couldn't load — try again" hint in the popover instead of
   // the misleading "No repos configured" empty state, which would
   // route the user to a setup page they may have already completed.
+  //
+  // TODO(SKY-294): this offers the org-wide /api/repos union, but the
+  // PATCH validator only accepts repos the project's OWN team tracks. In
+  // N=1 the two sets are identical (repo_profiles is the single default
+  // team's tracked set), so every offered repo validates. Once multi-team
+  // exists, source this from /api/settings/team/{team_id}/repos and thread
+  // the project's team_id in (the Project type needs to expose it) — same
+  // deferred multi-team frontend gap as RepoMultiSelect.
   const loadRepos = useCallback(async (signal: AbortSignal) => {
     setLoadError(null)
     try {
