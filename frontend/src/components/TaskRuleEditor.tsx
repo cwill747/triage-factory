@@ -4,14 +4,22 @@ import * as Tooltip from '@radix-ui/react-tooltip'
 import { X } from 'lucide-react'
 import PredicateEditor from './PredicateEditor'
 import Slider from './Slider'
+import TeamPicker from './TeamPicker'
 import type { RuleHandler, EventType } from '../types'
 import { toast } from './Toast/toastStore'
+import { useTeams, pickerDefault, noteWrittenTeam } from '../hooks/useTeams'
 
 interface TaskRuleEditorProps {
   open: boolean
   rule: RuleHandler | null // null = create mode
   prefillEventType?: string
   prefillPredicate?: string // JSON string, for forgiving banner pre-fill
+  // When set (the single-team prompts page), a new rule is created under
+  // this team and the per-modal TeamPicker is replaced by a read-only
+  // label. Empty / undefined keeps the modal's own write picker — the
+  // standalone path (TaskRulesPanel on Cards) passes nothing and is
+  // unchanged.
+  lockedTeamId?: string
   onClose: () => void
   onSaved: () => void
   onDeleted?: () => void
@@ -22,6 +30,7 @@ export default function TaskRuleEditor({
   rule,
   prefillEventType,
   prefillPredicate,
+  lockedTeamId,
   onClose,
   onSaved,
   onDeleted,
@@ -41,6 +50,23 @@ export default function TaskRuleEditor({
   const [saving, setSaving] = useState(false)
   const [deleting, setDeleting] = useState(false)
   const [error, setError] = useState('')
+
+  // Acting team — create mode only; a rule's team is immutable.
+  // TeamPicker renders only at ≥2 teams; below that `team` stays '' and
+  // the server resolves the sole team. Seeded when the panel opens, once
+  // teams have loaded; teamsLoaded also gates the create submit so a
+  // multi-team user can't submit team_id:'' in the cold-load window.
+  const { teams, lastActingTeamId, loaded: teamsLoaded } = useTeams()
+  const [team, setTeam] = useState('')
+  useEffect(() => {
+    if (!open || isEdit || !teamsLoaded) return
+    setTeam(pickerDefault(teams, lastActingTeamId))
+  }, [open, isEdit, teamsLoaded, teams, lastActingTeamId])
+  // When the page locks the team (single-team prompts page), create uses it
+  // directly and the picker is hidden; otherwise the modal's own write
+  // picker applies. lockedTeamId is non-empty only for a ≥2-team user, by
+  // which point teams are loaded, so no cold-load gate is needed.
+  const effectiveTeam = lockedTeamId || team
 
   // Track original predicate JSON for PATCH diff.
   const [originalPredicateJSON, setOriginalPredicateJSON] = useState<string | null>(null)
@@ -155,6 +181,7 @@ export default function TaskRuleEditor({
           default_priority: priority,
           sort_order: sortOrder,
           enabled,
+          team_id: effectiveTeam,
         }
         if (predicateJSON) {
           body.scope_predicate_json = predicateJSON
@@ -169,6 +196,7 @@ export default function TaskRuleEditor({
           const err = await res.json()
           throw new Error(err.error || 'Failed to create rule')
         }
+        if (effectiveTeam) noteWrittenTeam(effectiveTeam)
       }
 
       onSaved()
@@ -186,6 +214,7 @@ export default function TaskRuleEditor({
     priority,
     sortOrder,
     enabled,
+    effectiveTeam,
     isEdit,
     rule,
     originalPredicateJSON,
@@ -253,6 +282,20 @@ export default function TaskRuleEditor({
 
                 {/* Body — scrollable */}
                 <div className="flex-1 overflow-y-auto px-6 py-4 space-y-5 min-h-0">
+                  {/* Team (create mode only — a rule's team is immutable).
+                      Locked to the page's active team on the single-team
+                      prompts page; otherwise the modal's own write picker. */}
+                  {!isEdit &&
+                    (lockedTeamId ? (
+                      <div className="text-[12px] text-text-tertiary">
+                        Team:{' '}
+                        <span className="font-medium text-text-secondary">
+                          {teams.find((t) => t.id === lockedTeamId)?.name ?? 'current team'}
+                        </span>
+                      </div>
+                    ) : (
+                      <TeamPicker value={team} onChange={setTeam} label="Team" />
+                    ))}
                   {/* Event type */}
                   <div>
                     <label className="block text-[12px] font-medium text-text-secondary mb-1.5">
@@ -360,7 +403,12 @@ export default function TaskRuleEditor({
                     </button>
                     <button
                       onClick={handleSave}
-                      disabled={saving || !eventType || !name.trim()}
+                      disabled={
+                        saving ||
+                        !eventType ||
+                        !name.trim() ||
+                        (!isEdit && !lockedTeamId && !teamsLoaded)
+                      }
                       className="text-[13px] font-semibold text-white bg-accent hover:bg-accent/90 disabled:opacity-50 disabled:cursor-not-allowed px-5 py-2 rounded-full transition-colors"
                     >
                       {saving ? 'Saving…' : isEdit ? 'Save' : 'Create'}

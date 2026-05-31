@@ -59,6 +59,11 @@ type taskJSON struct {
 	// omitempty keeps the wire shape clean for the unclaimed-queue case.
 	ClaimedByAgentID string `json:"claimed_by_agent_id,omitempty"`
 	ClaimedByUserID  string `json:"claimed_by_user_id,omitempty"`
+	// TeamID is the task's owning team. Exposed so the multi-team board
+	// can color-code / tag rows by team. Always set; the
+	// frontend only surfaces it when the viewer belongs to ≥2 teams.
+	// TODO(SKY-379): board row color-coding consumes this.
+	TeamID string `json:"team_id,omitempty"`
 }
 
 func taskToJSON(t domain.Task) taskJSON {
@@ -90,7 +95,60 @@ func taskToJSON(t domain.Task) taskJSON {
 		OpenSubtaskCount:    t.OpenSubtaskCount,
 		ClaimedByAgentID:    t.ClaimedByAgentID,
 		ClaimedByUserID:     t.ClaimedByUserID,
+		TeamID:              t.TeamID,
 	}
+}
+
+// teamFilterParam extracts the per-page multi-team read filter from the
+// request — the set of non-empty, deduped, *valid-UUID* ?team_id= values
+// (a repeated query param). Returns nil when none are present, which the
+// stores treat as "the union of the viewer's teams."
+//
+// Malformed values are dropped, not errored: these params are
+// user-controlled and also come from possibly-stale/corrupt localStorage
+// (the device-local read filter), so a junk id should degrade to "no
+// narrow for that value" rather than 500 the queue/board/factory when the
+// raw string hits a Postgres ::uuid cast. A team the caller isn't in is
+// already filtered out downstream by the RLS-mirroring predicate, so the
+// only validation needed here is well-formedness.
+func teamFilterParam(r *http.Request) []string {
+	raw := r.URL.Query()["team_id"]
+	if len(raw) == 0 {
+		return nil
+	}
+	seen := make(map[string]struct{}, len(raw))
+	out := make([]string, 0, len(raw))
+	for _, v := range raw {
+		if v == "" {
+			continue
+		}
+		if _, err := uuid.Parse(v); err != nil {
+			continue // drop malformed ids (stale localStorage, hand-edited URL)
+		}
+		if _, dup := seen[v]; dup {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
+}
+
+// singleTeamParam reads a single ?team_id= value for the single-team read
+// surfaces (the prompts page narrowed to one team). Like teamFilterParam
+// it drops a malformed id rather than erroring — the value is device-local
+// view state (possibly stale localStorage) and junk should degrade to
+// "unfiltered", not 500 the page. Returns "" when absent or malformed; the
+// stores treat "" as no team narrow.
+func singleTeamParam(r *http.Request) string {
+	v := r.URL.Query().Get("team_id")
+	if v == "" {
+		return ""
+	}
+	if _, err := uuid.Parse(v); err != nil {
+		return "" // drop malformed (stale localStorage, hand-edited URL)
+	}
+	return v
 }
 
 func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
@@ -105,13 +163,20 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 	// stays the canonical "pickable right now" projection for the
 	// Cards triage view.
 	includeSnoozed := r.URL.Query().Get("include_snoozed") == "true"
+	// Optional per-page team filter — a multi-team view scope, supplied as
+	// repeated ?team_id= params. Empty = the union of the viewer's teams
+	// (the RLS-scoped default); a non-empty set narrows to those teams'
+	// owned/visible tasks. Teams the caller isn't in yield nothing under
+	// RLS rather than leaking, so no extra validation is needed here — the
+	// narrow is additive on top of the visibility scope.
+	teamFilter := teamFilterParam(r)
 	var tasks []domain.Task
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
 		if includeSnoozed {
-			tasks, e = tx.Tasks.QueuedIncludingSnoozed(r.Context(), orgID)
+			tasks, e = tx.Tasks.QueuedIncludingSnoozed(r.Context(), orgID, teamFilter)
 		} else {
-			tasks, e = tx.Tasks.Queued(r.Context(), orgID)
+			tasks, e = tx.Tasks.Queued(r.Context(), orgID, teamFilter)
 		}
 		return e
 	}); err != nil {
@@ -132,13 +197,15 @@ func (s *Server) handleTasks(w http.ResponseWriter, r *http.Request) {
 	}
 	userID := ClaimsFrom(r.Context()).Subject
 	status := r.URL.Query().Get("status")
+	// Optional per-page team filter — see handleQueue.
+	teamFilter := teamFilterParam(r)
 	var tasks []domain.Task
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
 		if status != "" {
-			tasks, e = tx.Tasks.ByStatus(r.Context(), orgID, status)
+			tasks, e = tx.Tasks.ByStatus(r.Context(), orgID, status, teamFilter)
 		} else {
-			tasks, e = tx.Tasks.Queued(r.Context(), orgID)
+			tasks, e = tx.Tasks.Queued(r.Context(), orgID, teamFilter)
 		}
 		return e
 	}); err != nil {
@@ -331,25 +398,6 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 	case "delegate":
-		// SKY-261 acceptance: swipe-delegate re-checks
-		// team_agents.enabled at swipe time. A team admin can
-		// toggle the bot off; trigger-spawned tasks landed
-		// unclaimed (router's auto-fire skipped), and the user
-		// can't manually delegate to a disabled bot either.
-		// Refuse with 409 — clear error the FE can surface as
-		// "bot is off; enable it in team settings."
-		a, enabled, err := s.agentEnabledForOrg(r.Context(), orgID, userID)
-		if err != nil {
-			log.Printf("[swipe] delegate aborted on task %s: %v", id, err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "delegate failed: " + err.Error()})
-			return
-		}
-		if !enabled {
-			writeJSON(w, http.StatusConflict, map[string]string{
-				"error": "bot is disabled for this team; enable it in team settings to delegate",
-			})
-			return
-		}
 		// HandoffAgentClaim covers three legitimate user→bot
 		// transitions (unclaimed → bot; user-claimed-by-me → bot
 		// transfer; bot-already-owns idempotent no-op) and three
@@ -359,6 +407,11 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		// for the response — 404 for missing, 409 + closed-task
 		// message for terminal, 409 + theft message for different
 		// user. Matches the claim path's load-and-branch shape.
+		//
+		// Loaded BEFORE the bot-enablement check so that check gates on
+		// the task's own team (task.TeamID), not the org default — a
+		// multi-team user delegating a team-B task is governed by B's
+		// bot setting (SKY-378).
 		var task *domain.Task
 		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 			var e error
@@ -375,6 +428,41 @@ func (s *Server) handleSwipe(w http.ResponseWriter, r *http.Request) {
 		if task.Status == "done" || task.Status == "dismissed" {
 			writeJSON(w, http.StatusConflict, map[string]string{
 				"error": "task is closed; delegate transitions aren't allowed past close",
+			})
+			return
+		}
+		// SKY-261 acceptance: swipe-delegate re-checks
+		// team_agents.enabled at swipe time. A team admin can
+		// toggle the bot off; trigger-spawned tasks landed
+		// unclaimed (router's auto-fire skipped), and the user
+		// can't manually delegate to a disabled bot either.
+		// Refuse with 409 — clear error the FE can surface as
+		// "bot is off; enable it in team settings."
+		//
+		// Gate on the team HandoffAgentClaim will consolidate onto, not
+		// the pre-handoff task.TeamID: for an unclaimed task visible to
+		// several teams the latter can be a team the caller isn't in,
+		// whose team_agents row RLS hides — wrongly reporting the bot
+		// disabled and rejecting a legitimate delegate.
+		var claimTeamID string
+		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+			var e error
+			claimTeamID, e = tx.Tasks.ResolveClaimTeam(r.Context(), orgID, id, userID)
+			return e
+		}); err != nil {
+			log.Printf("[swipe] delegate aborted on task %s: %v", id, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "delegate failed: " + err.Error()})
+			return
+		}
+		a, enabled, err := s.agentEnabledForTeam(r.Context(), orgID, userID, claimTeamID)
+		if err != nil {
+			log.Printf("[swipe] delegate aborted on task %s: %v", id, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "delegate failed: " + err.Error()})
+			return
+		}
+		if !enabled {
+			writeJSON(w, http.StatusConflict, map[string]string{
+				"error": "bot is disabled for this team; enable it in team settings to delegate",
 			})
 			return
 		}

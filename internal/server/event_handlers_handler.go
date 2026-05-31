@@ -47,10 +47,13 @@ func (s *Server) handleEventHandlersList(w http.ResponseWriter, r *http.Request)
 		})
 		return
 	}
+	// ?team_id= narrows to one team's handlers (+ org-visible) on the
+	// multi-team prompts page; absent/solo returns everything visible.
+	teamID := singleTeamParam(r)
 	var handlers []domain.EventHandler
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
-		handlers, e = tx.EventHandlers.List(r.Context(), orgID, kind)
+		handlers, e = tx.EventHandlers.List(r.Context(), orgID, kind, teamID)
 		return e
 	}); err != nil {
 		internalError(w, "event_handlers", err)
@@ -91,6 +94,11 @@ type createEventHandlerRequest struct {
 	PromptID               string   `json:"prompt_id"`
 	BreakerThreshold       *int     `json:"breaker_threshold"`
 	MinAutonomySuitability *float64 `json:"min_autonomy_suitability"`
+
+	// TeamID is the acting team the write picker supplied — the team
+	// this rule/trigger is created under. Required in the UI when the
+	// caller belongs to ≥2 teams; empty (sole-team fallback) otherwise.
+	TeamID string `json:"team_id"`
 }
 
 func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request) {
@@ -179,6 +187,14 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 			notFound(w, "prompt")
 			return
 		}
+		// TODO(SKY-380): once prompts expose team_id + visibility, validate
+		// here that the resolved acting team may bind this prompt (prompt is
+		// org-visible OR prompt.team == acting team) and reject otherwise.
+		// The trigger→prompt FK is only (prompt_id, org_id), so this is the
+		// authoritative cross-team guard. The single-team prompts page keeps
+		// the UI from presenting the footgun (only the active team's prompts
+		// are on the canvas), but a hand-crafted API call still can until
+		// this server-side check lands.
 		h.PromptID = req.PromptID
 		h.TriggerType = domain.TriggerTypeEvent
 		threshold := 4
@@ -209,7 +225,7 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 
 	var fresh *domain.EventHandler
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-		teamID, e := resolveActingTeam(r.Context(), tx.Teams, orgID)
+		teamID, e := resolveActingTeam(r.Context(), tx.Teams, tx.Users, orgID, userID, req.TeamID)
 		if e != nil {
 			return e
 		}
@@ -220,6 +236,9 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 		fresh, ge = tx.EventHandlers.Get(r.Context(), orgID, h.ID)
 		return ge
 	}); err != nil {
+		if writeIfActingTeamError(w, err) {
+			return
+		}
 		// Driver-specific error strings ("UNIQUE constraint failed: ..." on
 		// SQLite, "duplicate key value violates unique constraint ..." on
 		// Postgres) leak schema names + index identifiers to clients.

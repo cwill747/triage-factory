@@ -88,3 +88,87 @@ func BootstrapTeamAgent(ctx context.Context, stores Stores, orgID, teamID string
 	}
 	return nil
 }
+
+// BootstrapNewTeam materializes the structural defaults for a *new team
+// in an existing org* (SKY-378): the team's default-enabled bot
+// membership (team_agents). It deliberately does NOT seed event handlers
+// (system rules/triggers).
+//
+// Why bot-only — two reasons converge:
+//
+//   - Correctness: the shipped-handler row id is UUIDFor(handler.ID,
+//     orgID) — team-independent — under PK (org_id, id). Seeding a 2nd+
+//     team's handlers would collide with the org's first team's rows and
+//     ON CONFLICT-skip them all, so the seed never actually materialized
+//     per-team rows anyway (Codex review on PR #263).
+//
+//   - Product direction: a newly-created team is a blank slate the org
+//     admin configures, not a place to re-stamp TF's opinionated
+//     defaults. Org-defined default templates that new teams inherit are
+//     their own ticket; until then a 2nd+ team starts with no system
+//     handlers and the admin adds rules (the org's *first* team still
+//     gets the full defaults via BootstrapNewOrg).
+//
+//     TODO(SKY-381): copy the org's default-team template into the new
+//     team here (handlers + prompts, forward-only) instead of seeding
+//     bot-only — replaces this blank-slate behavior once org templates
+//     land.
+//
+// The bot row is enabled, so manual delegation (swipe / factory drag) to
+// the new team works immediately; only auto-delegation waits on rules.
+//
+// Must run OUTSIDE any caller WithTx: TeamAgents.AddForTeam routes
+// through the Postgres admin pool and guards against being called inside
+// an app-pool tx. Idempotent — re-runs no-op via ON CONFLICT, and never
+// flip a team's bot back to enabled if the team disabled it.
+func BootstrapNewTeam(ctx context.Context, stores Stores, orgID, teamID string) error {
+	if err := BootstrapTeamAgent(ctx, stores, orgID, teamID); err != nil {
+		return err
+	}
+	return nil
+}
+
+// BootstrapNewOrg materializes the shipped defaults for a brand-new org
+// + its default team (the multi-mode founder-signup path, SKY-378 /
+// SKY-251 D7): the org's single agents row, the shipped system prompts,
+// the shipped event handlers scoped to the default team, and the team's
+// default-enabled bot membership. shippedPrompts is passed in (rather
+// than read from internal/ai) so internal/db stays free of the ai
+// dependency — main / server supply ai.ShippedPrompts().
+//
+// Order is load-bearing: agent → prompts → handlers → team_agents. The
+// trigger rows in EventHandlers.Seed FK into the prompts (composite
+// (prompt_id, org_id)), so prompts must land first; the team_agents row
+// needs the agent created in step 1.
+//
+// TODO(SKY-380): when prompts go team-scoped the prompt seed here becomes
+// team-owned copies (keyed by system_slug) and the trigger→prompt FK
+// becomes same-team; the org-wide visibility='org' prompt rows go away.
+// TODO(SKY-381): the org's first team's defaults will be sourced from the
+// org template (itself seeded from Shipped* at org-create) rather than
+// directly from the TF-shipped lists, so org admins can shape what new
+// orgs/teams start with.
+//
+// Like BootstrapNewTeam this must run OUTSIDE any WithTx (admin-pool
+// seeders) and is fully idempotent. The org-provisioning caller runs it
+// AFTER the tenant-row transaction commits, and logs-and-continues on
+// error: a provisioned org with un-seeded defaults is usable (the user
+// is signed in with an org + team) and a later bootstrap re-run repairs
+// auto-delegation, whereas failing the signup callback strands the user.
+func BootstrapNewOrg(ctx context.Context, stores Stores, orgID, teamID string, shippedPrompts []domain.Prompt) error {
+	if _, err := BootstrapAgentForOrg(ctx, stores, orgID); err != nil {
+		return err
+	}
+	for _, p := range shippedPrompts {
+		if err := stores.Prompts.SeedOrUpdate(ctx, orgID, p); err != nil {
+			return fmt.Errorf("bootstrap new org: seed prompt %s: %w", p.ID, err)
+		}
+	}
+	if err := stores.EventHandlers.Seed(ctx, orgID, teamID); err != nil {
+		return fmt.Errorf("bootstrap new org: seed event handlers: %w", err)
+	}
+	if err := BootstrapTeamAgent(ctx, stores, orgID, teamID); err != nil {
+		return err
+	}
+	return nil
+}

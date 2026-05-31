@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -72,10 +73,59 @@ func getTask(ctx context.Context, q queryer, orgID, taskID string) (*domain.Task
 	return &t, nil
 }
 
-func (s *taskStore) Queued(ctx context.Context, orgID string) ([]domain.Task, error) {
+// pgTaskTeamFilter returns the SQL fragment that narrows a tasks query
+// (alias t) to a *set* of teams, and the args extended with the team ids.
+// Empty teamIDs is a no-op (the union-of-the-viewer's-teams default).
+//
+// The predicate mirrors the tasks_select RLS policy's own team test so
+// the filter narrows to *exactly* what membership would admit, never
+// wider:
+//
+//   - The selected ids are first intersected with tf.user_in_team — a
+//     forged ?team_id= for a team the caller isn't in contributes
+//     nothing, even when RLS admits the row via a *different* team the
+//     caller does belong to. Without this the filter would leak: an
+//     unclaimed task visible to both the caller's team A and an
+//     outside team B would still match a ?team_id=B narrow. (Codex P2)
+//
+//   - task_teams (visibility) is consulted only while the task is
+//     UNCLAIMED. RLS documents — and HandoffAgentClaim enforces — that
+//     a claim consolidates the task to its owning team_id; the stale
+//     task_teams rows are not drained, so matching them post-claim would
+//     show a team-A-owned claimed task under a ?team_id=B narrow. Gating
+//     the task_teams branch on "both claim cols NULL" keeps claimed rows
+//     matchable only by their owning team_id. (Codex P2)
+//
+// Both the owning-team branch and the visibility branch are themselves
+// tf.user_in_team-gated, so the whole predicate can only ever shrink the
+// RLS-admitted set, never widen it.
+func pgTaskTeamFilter(teamIDs []string, args []any) (string, []any) {
+	if len(teamIDs) == 0 {
+		return "", args
+	}
+	ph := make([]string, len(teamIDs))
+	for i, id := range teamIDs {
+		ph[i] = fmt.Sprintf("$%d", len(args)+1+i)
+		args = append(args, id)
+	}
+	list := strings.Join(ph, ", ")
+	return fmt.Sprintf(
+		" AND ("+
+			"(t.team_id IN (%s) AND tf.user_in_team(t.team_id))"+
+			" OR (t.claimed_by_agent_id IS NULL AND t.claimed_by_user_id IS NULL"+
+			" AND EXISTS (SELECT 1 FROM task_teams tt WHERE tt.task_id = t.id"+
+			" AND tt.team_id IN (%s) AND tf.user_in_team(tt.team_id)))"+
+			")",
+		list, list,
+	), args
+}
+
+func (s *taskStore) Queued(ctx context.Context, orgID string, teamIDs []string) ([]domain.Task, error) {
 	// SKY-261 B+ derived filter mirrors SQLite. The event_handlers
 	// derived table is org-scoped so rules in another org can't
 	// influence ordering — load-bearing in multi mode.
+	args := []any{orgID}
+	teamClause, args := pgTaskTeamFilter(teamIDs, args)
 	return queryTasksCtx(ctx, s.q, `
 		SELECT `+pgTaskColumnsWithEntity+`
 		FROM tasks t
@@ -90,16 +140,18 @@ func (s *taskStore) Queued(ctx context.Context, orgID string) ([]domain.Task, er
 			AND t.status = 'queued'
 			AND t.claimed_by_agent_id IS NULL
 			AND t.claimed_by_user_id  IS NULL
-			AND (t.snooze_until IS NULL OR t.snooze_until <= NOW())
+			AND (t.snooze_until IS NULL OR t.snooze_until <= NOW())`+teamClause+`
 		ORDER BY COALESCE(tr.sort_order, 999) ASC, COALESCE(t.priority_score, 0.5) DESC
-	`, orgID)
+	`, args...)
 }
 
-func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([]domain.Task, error) {
+func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string, teamIDs []string) ([]domain.Task, error) {
 	// SKY-330: snoozed rows render at the tail regardless of
 	// priority so deferred entries don't jump above live queued
 	// work. Postgres sorts false before true on the boolean
 	// expression (matches the SQLite mirror's 0/1 ordering).
+	args := []any{orgID}
+	teamClause, args := pgTaskTeamFilter(teamIDs, args)
 	return queryTasksCtx(ctx, s.q, `
 		SELECT `+pgTaskColumnsWithEntity+`
 		FROM tasks t
@@ -113,14 +165,14 @@ func (s *taskStore) QueuedIncludingSnoozed(ctx context.Context, orgID string) ([
 		WHERE t.org_id = $1
 			AND t.status IN ('queued', 'snoozed')
 			AND t.claimed_by_agent_id IS NULL
-			AND t.claimed_by_user_id  IS NULL
+			AND t.claimed_by_user_id  IS NULL`+teamClause+`
 		ORDER BY (t.status = 'snoozed') ASC,
 		         COALESCE(tr.sort_order, 999) ASC,
 		         COALESCE(t.priority_score, 0.5) DESC
-	`, orgID)
+	`, args...)
 }
 
-func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domain.Task, error) {
+func (s *taskStore) ByStatus(ctx context.Context, orgID, status string, teamIDs []string) ([]domain.Task, error) {
 	switch status {
 	case "claimed":
 		// SKY-330: "claimed" = any claim (user or bot) at
@@ -128,30 +180,36 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 		// file's comment for the full rationale around the
 		// status='queued' filter and including bot claims to
 		// surface the delegate-spawn-failure retry case.
+		args := []any{orgID}
+		teamClause, args := pgTaskTeamFilter(teamIDs, args)
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+pgTaskColumnsWithEntity+`
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
 			WHERE t.org_id = $1
 				AND (t.claimed_by_user_id IS NOT NULL OR t.claimed_by_agent_id IS NOT NULL)
-				AND t.status = 'queued'
+				AND t.status = 'queued'`+teamClause+`
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
-		`, orgID)
+		`, args...)
 	case "delegated":
+		args := []any{orgID}
+		teamClause, args := pgTaskTeamFilter(teamIDs, args)
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+pgTaskColumnsWithEntity+`
 			FROM tasks t
 			JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
 			WHERE t.org_id = $1
 				AND t.claimed_by_agent_id IS NOT NULL
-				AND t.status NOT IN ('done', 'dismissed')
+				AND t.status NOT IN ('done', 'dismissed')`+teamClause+`
 			ORDER BY COALESCE(t.priority_score, 0.5) DESC
-		`, orgID)
+		`, args...)
 	case "done", "dismissed":
 		// SKY-330: cap the Done column at the last 7 days. Mirrors
 		// the SQLite branch — every close path now populates
 		// closed_at, so the NOT NULL guard turns missing values into
 		// surfacable bugs rather than letting them accumulate.
+		args := []any{orgID, status}
+		teamClause, args := pgTaskTeamFilter(teamIDs, args)
 		return queryTasksCtx(ctx, s.q, `
 			SELECT `+pgTaskColumnsWithEntity+`
 			FROM tasks t
@@ -159,17 +217,19 @@ func (s *taskStore) ByStatus(ctx context.Context, orgID, status string) ([]domai
 			WHERE t.org_id = $1
 				AND t.status = $2
 				AND t.closed_at IS NOT NULL
-				AND t.closed_at >= NOW() - INTERVAL '7 days'
+				AND t.closed_at >= NOW() - INTERVAL '7 days'`+teamClause+`
 			ORDER BY t.closed_at DESC, COALESCE(t.priority_score, 0.5) DESC
-		`, orgID, status)
+		`, args...)
 	}
+	args := []any{orgID, status}
+	teamClause, args := pgTaskTeamFilter(teamIDs, args)
 	return queryTasksCtx(ctx, s.q, `
 		SELECT `+pgTaskColumnsWithEntity+`
 		FROM tasks t
 		JOIN entities e ON t.entity_id = e.id AND e.org_id = t.org_id
-		WHERE t.org_id = $1 AND t.status = $2
+		WHERE t.org_id = $1 AND t.status = $2`+teamClause+`
 		ORDER BY COALESCE(t.priority_score, 0.5) DESC
-	`, orgID, status)
+	`, args...)
 }
 
 func (s *taskStore) FindActiveByEntityAndType(ctx context.Context, orgID, entityID, eventType string) ([]domain.Task, error) {
@@ -208,21 +268,27 @@ func findActiveTasksByEntity(ctx context.Context, q queryer, orgID, entityID str
 	`, orgID, entityID)
 }
 
-func (s *taskStore) ListActiveRefsForEntities(ctx context.Context, orgID string, entityIDs []string) ([]domain.PendingTaskRef, error) {
+func (s *taskStore) ListActiveRefsForEntities(ctx context.Context, orgID string, entityIDs []string, teamIDs []string) ([]domain.PendingTaskRef, error) {
 	if len(entityIDs) == 0 {
 		return nil, nil
 	}
 	// Postgres has no comparable variable-bind cap to SQLite's 999/500;
 	// the array bind via lib/pq keeps the whole list in a single
-	// placeholder regardless of size, so no chunking is needed.
+	// placeholder regardless of size, so no chunking is needed. The
+	// table is aliased t so the shared team-filter fragment (same
+	// RLS-mirroring predicate as Queued) applies — narrowing the refs to
+	// the selected teams keeps the station drawer in sync with a
+	// team-filtered entity belt.
+	args := []any{orgID, entityIDs}
+	teamClause, args := pgTaskTeamFilter(teamIDs, args)
 	rows, err := s.q.QueryContext(ctx, `
-		SELECT id, entity_id, event_type, dedup_key
-		FROM tasks
-		WHERE org_id = $1
-			AND entity_id = ANY($2)
-			AND status NOT IN ('done', 'dismissed')
-		ORDER BY entity_id, event_type, created_at DESC
-	`, orgID, entityIDs)
+		SELECT t.id, t.entity_id, t.event_type, t.dedup_key
+		FROM tasks t
+		WHERE t.org_id = $1
+			AND t.entity_id = ANY($2)
+			AND t.status NOT IN ('done', 'dismissed')`+teamClause+`
+		ORDER BY t.entity_id, t.event_type, t.created_at DESC
+	`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -704,6 +770,31 @@ func (s *taskStore) HandoffAgentClaim(ctx context.Context, orgID, taskID, agentI
 		return db.HandoffNoOp, nil
 	}
 	return db.HandoffRefused, nil
+}
+
+func (s *taskStore) ResolveClaimTeam(ctx context.Context, orgID, taskID, userID string) (string, error) {
+	// Mirrors HandoffAgentClaim's team_id COALESCE: the caller's team in
+	// the task's visibility set (preferring the current owner on a tie),
+	// else the current owner. Read-only; under the app pool tasks_select
+	// RLS scopes the row to the viewer.
+	var team string
+	err := s.q.QueryRowContext(ctx, `
+		SELECT COALESCE(
+		         (SELECT tt.team_id::text FROM task_teams tt
+		            JOIN memberships m ON m.team_id = tt.team_id
+		           WHERE tt.task_id = $2 AND m.user_id = $3
+		           ORDER BY (tt.team_id = t.team_id) DESC, tt.team_id ASC LIMIT 1),
+		         t.team_id::text)
+		  FROM tasks t
+		 WHERE t.org_id = $1 AND t.id = $2
+	`, orgID, taskID, userID).Scan(&team)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("resolve claim team: %w", err)
+	}
+	return team, nil
 }
 
 func (s *taskStore) TakeoverClaimFromAgent(ctx context.Context, orgID, taskID, userID string) (bool, error) {

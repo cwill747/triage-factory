@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { motion, AnimatePresence } from 'motion/react'
 import type { Prompt } from '../types'
+import TeamPicker from './TeamPicker'
 
 interface Props {
   open: boolean
@@ -22,6 +23,20 @@ interface Props {
    *  context — e.g. the chain step editor passes a filter that hides
    *  chain-kind prompts (no nested chains) and the chain itself. */
   filter?: (p: Prompt) => boolean
+  /** When the picker drives a *create* delegate (the factory
+   *  drag-to-station flow synthesizes a task), wiring onTeamChange renders
+   *  a required team picker in the header so the caller can stamp the
+   *  acting team, and teamValue scopes the prompt list to that team. The
+   *  swipe-delegate callers (claiming an existing task, whose team is
+   *  derived from the claim) leave both undefined → no picker, unscoped
+   *  list. */
+  teamValue?: string
+  onTeamChange?: (teamId: string) => void
+  /** When true, prompt tiles are non-interactive and dimmed. The factory
+   *  create-delegate caller sets this until /api/teams has loaded so a
+   *  selection in the cold-load window can't post a blank/unresolved
+   *  acting team. */
+  selectionDisabled?: boolean
 }
 
 export default function PromptPicker({
@@ -33,6 +48,9 @@ export default function PromptPicker({
   subtitle = 'Select a delegation strategy for this task',
   selectedId,
   filter,
+  teamValue,
+  onTeamChange,
+  selectionDisabled,
 }: Props) {
   const [prompts, setPrompts] = useState<Prompt[]>([])
   const [fetchFailed, setFetchFailed] = useState(false)
@@ -46,7 +64,22 @@ export default function PromptPicker({
   useEffect(() => {
     if (!open) return
     let cancelled = false
-    fetch('/api/prompts')
+    // Scope the prompt list to the acting team when the caller drives one
+    // (the factory create-delegate picker passes teamValue + onTeamChange).
+    // Empty/absent teamValue → unscoped: a solo user's sole team, or the
+    // swipe / chain / curator callers that don't scope by team. Refetching
+    // on teamValue keeps the tiles matched to the header's team so a user
+    // can't select another team's prompt for a task stamped to this team.
+    const q = teamValue ? `?team_id=${encodeURIComponent(teamValue)}` : ''
+    // On a team switch, drop the prior team's tiles so the skeleton shows
+    // during the refetch and a stale cross-team prompt can't be clicked.
+    // Only when team-scoped — unscoped callers keep their across-opens cache
+    // (prompts render instantly on reopen), so behavior there is unchanged.
+    if (teamValue !== undefined) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setPrompts([])
+    }
+    fetch(`/api/prompts${q}`)
       .then((res) => res.json())
       .then((data: Prompt[]) => {
         if (!cancelled) {
@@ -60,7 +93,7 @@ export default function PromptPicker({
     return () => {
       cancelled = true
     }
-  }, [open])
+  }, [open, teamValue])
 
   return (
     <AnimatePresence>
@@ -90,12 +123,22 @@ export default function PromptPicker({
                   <h2 className="text-[15px] font-semibold text-text-primary">{title}</h2>
                   <p className="text-[12px] text-text-tertiary mt-0.5">{subtitle}</p>
                 </div>
-                <button
-                  onClick={onClose}
-                  className="text-text-tertiary hover:text-text-secondary transition-colors text-lg leading-none px-1"
-                >
-                  &times;
-                </button>
+                <div className="flex items-center gap-2">
+                  {onTeamChange && (
+                    <TeamPicker
+                      value={teamValue ?? ''}
+                      onChange={onTeamChange}
+                      label="Team"
+                      className="w-40"
+                    />
+                  )}
+                  <button
+                    onClick={onClose}
+                    className="text-text-tertiary hover:text-text-secondary transition-colors text-lg leading-none px-1"
+                  >
+                    &times;
+                  </button>
+                </div>
               </div>
 
               {/* Tiles grid — scrollable */}
@@ -107,11 +150,15 @@ export default function PromptPicker({
                     ))}
                   </div>
                 ) : (
-                  <div className="grid grid-cols-2 gap-3">
+                  <div
+                    className={`grid grid-cols-2 gap-3 ${selectionDisabled ? 'opacity-50 pointer-events-none' : ''}`}
+                    aria-busy={selectionDisabled}
+                  >
                     {(filter ? prompts.filter(filter) : prompts).map((prompt) => (
                       <button
                         key={prompt.id}
                         onClick={() => onSelect(prompt.id)}
+                        disabled={selectionDisabled}
                         className={`group text-left p-4 rounded-xl border hover:shadow-sm transition-all duration-150 ${
                           selectedId === prompt.id
                             ? 'border-accent/60 bg-accent/[0.06] ring-1 ring-accent/20'

@@ -29,10 +29,13 @@ func (s *Server) handlePromptsList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := ClaimsFrom(r.Context()).Subject
+	// ?team_id= narrows to one team's prompts (+ org-visible) on the
+	// multi-team prompts page; absent/solo returns everything visible.
+	teamID := singleTeamParam(r)
 	var prompts []domain.Prompt
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
-		prompts, e = tx.Prompts.List(r.Context(), orgID)
+		prompts, e = tx.Prompts.List(r.Context(), orgID, teamID)
 		return e
 	}); err != nil {
 		internalError(w, "prompts", err)
@@ -73,6 +76,11 @@ type createPromptRequest struct {
 	Body  string `json:"body"`
 	Kind  string `json:"kind"`
 	Model string `json:"model"`
+	// TeamID is the acting team the write picker supplied. Required in
+	// the UI whenever the caller belongs to ≥2 teams; empty for a solo
+	// caller (the picker is hidden), where the resolver falls back to the
+	// sole team. See resolveActingTeam.
+	TeamID string `json:"team_id"`
 }
 
 // allowedPromptModelOverrides is the set of non-empty values accepted
@@ -136,7 +144,7 @@ func (s *Server) handlePromptCreate(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
 	var created *domain.Prompt
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-		teamID, e := resolveActingTeam(r.Context(), tx.Teams, orgID)
+		teamID, e := resolveActingTeam(r.Context(), tx.Teams, tx.Users, orgID, userID, req.TeamID)
 		if e != nil {
 			return e
 		}
@@ -147,6 +155,9 @@ func (s *Server) handlePromptCreate(w http.ResponseWriter, r *http.Request) {
 		created, ge = tx.Prompts.Get(r.Context(), orgID, id)
 		return ge
 	}); err != nil {
+		if writeIfActingTeamError(w, err) {
+			return
+		}
 		internalError(w, "prompts", err)
 		return
 	}

@@ -42,6 +42,11 @@ type createProjectRequest struct {
 	JiraProjectKey   string   `json:"jira_project_key"`
 	LinearProjectKey string   `json:"linear_project_key"`
 	CuratorSessionID string   `json:"curator_session_id"` // optional; usually set by the runtime, not the user
+	// TeamID is the acting team the write picker supplied — the team the
+	// new project (and its pinned-repo / tracker-key validation) is
+	// scoped to. Required in the UI when the caller belongs to ≥2 teams;
+	// empty (sole-team fallback) otherwise.
+	TeamID string `json:"team_id"`
 }
 
 // patchProjectRequest is the PATCH body shape. Pointers distinguish
@@ -99,7 +104,7 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
-		teamID, e = resolveActingTeam(r.Context(), tx.Teams, orgID)
+		teamID, e = resolveActingTeam(r.Context(), tx.Teams, tx.Users, orgID, userID, req.TeamID)
 		if e != nil {
 			return e
 		}
@@ -149,6 +154,9 @@ func (s *Server) handleProjectCreate(w http.ResponseWriter, r *http.Request) {
 		created, getErr = tx.Projects.Get(r.Context(), orgID, id)
 		return getErr
 	}); err != nil {
+		if writeIfActingTeamError(w, err) {
+			return
+		}
 		log.Printf("handleProjectCreate: %v", err)
 		internalError(w, "projects", err)
 		return
@@ -336,9 +344,14 @@ func (s *Server) handleProjectImport(w http.ResponseWriter, r *http.Request) {
 	var teamID string
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
-		teamID, e = resolveActingTeam(r.Context(), tx.Teams, orgID)
+		// Import is local-mode-only (gated above), so there's no picker
+		// and the sole-team fallback always applies — pass an empty pick.
+		teamID, e = resolveActingTeam(r.Context(), tx.Teams, tx.Users, orgID, userID, "")
 		return e
 	}); err != nil {
+		if writeIfActingTeamError(w, err) {
+			return
+		}
 		internalError(w, "projects", err)
 		return
 	}
@@ -559,16 +572,43 @@ func (s *Server) handleProjectUpdate(w http.ResponseWriter, r *http.Request) {
 		// up front keeps the contract crisp.
 		trimmed := strings.TrimSpace(*req.SpecAuthorshipPromptID)
 		if trimmed != "" {
-			var prompt *domain.Prompt
+			// Validate against the project's OWN team, not just the org:
+			// the curator runs this prompt under existing.TeamID, so a
+			// cross-team prompt would let a team-A project run a team-B
+			// prompt. Mirror the picker's list predicate — Prompts.List
+			// (visibility='org' OR team_id=existing.TeamID) — so a chosen
+			// prompt is accepted iff it's org-visible (system) or owned by
+			// this project's team. (Prompts.Get is org-scoped only and the
+			// domain.Prompt struct doesn't expose team_id/visibility yet —
+			// SKY-380 — so a same-team-list membership check is the
+			// available way to enforce this without the schema reshape.)
+			// SQLite ignores teamID (local is single-team), so this is a
+			// no-op there and only constrains multi-mode.
+			if existing.TeamID == "" {
+				internalError(w, "projects", fmt.Errorf("project %s has no team_id", existing.ID))
+				return
+			}
+			var visible []domain.Prompt
 			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 				var e error
-				prompt, e = tx.Prompts.Get(r.Context(), orgID, trimmed)
+				visible, e = tx.Prompts.List(r.Context(), orgID, existing.TeamID)
 				return e
 			}); err != nil {
 				writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "load prompt: " + err.Error()})
 				return
 			}
-			if prompt == nil {
+			found := false
+			for i := range visible {
+				if visible[i].ID == trimmed {
+					found = true
+					break
+				}
+			}
+			if !found {
+				// Same 400 for "unknown" and "other team's" — the client
+				// shouldn't be able to distinguish a prompt that exists but
+				// isn't theirs from one that doesn't exist (don't leak the
+				// existence of another team's prompt by id).
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "spec_authorship_prompt_id references unknown prompt"})
 				return
 			}

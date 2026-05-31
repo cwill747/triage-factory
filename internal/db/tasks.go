@@ -48,22 +48,32 @@ type TaskStore interface {
 	// event_handler rule's sort_order then priority_score DESC.
 	// Queue membership is the post-SKY-261 B+ derived filter:
 	// status='queued' AND both claim cols NULL AND not future-snoozed.
-	Queued(ctx context.Context, orgID string) ([]domain.Task, error)
+	//
+	// teamIDs is the optional per-page read filter — a *multi-team* view
+	// scope. Empty/nil = the union of the viewer's teams (the RLS-scoped
+	// default). When non-empty, the result narrows to tasks any of those
+	// teams owns (team_id) or can see (a task_teams visibility row) — the
+	// "show A and B together, hide the rest" board contract. The viewer's
+	// membership is still RLS-enforced underneath, so teams the caller
+	// isn't in contribute nothing rather than leaking.
+	Queued(ctx context.Context, orgID string, teamIDs []string) ([]domain.Task, error)
 
 	// QueuedIncludingSnoozed mirrors Queued but drops the snooze-
 	// window filter so future-snoozed rows surface too. SKY-330's
 	// Board Queued column uses this when the user toggles "show
 	// snoozed"; the default Queued() stays the canonical "what's
-	// actually pickable right now" projection.
-	QueuedIncludingSnoozed(ctx context.Context, orgID string) ([]domain.Task, error)
+	// actually pickable right now" projection. teamIDs is the same
+	// optional multi-team read filter as Queued.
+	QueuedIncludingSnoozed(ctx context.Context, orgID string, teamIDs []string) ([]domain.Task, error)
 
 	// ByStatus returns tasks with the given lifecycle status,
 	// ordered by priority. Two pseudo-values are mapped to claim-
 	// axis queries for API back-compat (SKY-261 B+):
 	//   "claimed"   → claimed_by_user_id IS NOT NULL + active
 	//   "delegated" → claimed_by_agent_id IS NOT NULL + active
-	// Other status values are passed through literally.
-	ByStatus(ctx context.Context, orgID, status string) ([]domain.Task, error)
+	// Other status values are passed through literally. teamIDs is the
+	// same optional multi-team read filter as Queued.
+	ByStatus(ctx context.Context, orgID, status string, teamIDs []string) ([]domain.Task, error)
 
 	// FindActiveByEntityAndType returns non-terminal tasks for an
 	// entity matching the given event type. Used by inline close
@@ -91,7 +101,14 @@ type TaskStore interface {
 	// tasks per entity in a single round-trip — no entity JOIN,
 	// no priority columns. Chunks internally on SQLite's
 	// variable-bind limit.
-	ListActiveRefsForEntities(ctx context.Context, orgID string, entityIDs []string) ([]domain.PendingTaskRef, error)
+	//
+	// teamIDs is the factory's per-page team filter (same shape as
+	// Queued): empty = the viewer's union, non-empty narrows the refs to
+	// those teams via the same RLS-mirroring predicate as Queued. Without
+	// it the station drawer would surface (and let you delegate) task
+	// refs outside the selected team scope even when the entity belt was
+	// filtered. Postgres-only effect; SQLite is N=1 and ignores it.
+	ListActiveRefsForEntities(ctx context.Context, orgID string, entityIDs []string, teamIDs []string) ([]domain.PendingTaskRef, error)
 
 	// EntityIDsWithActiveTasks returns the set of entity IDs with
 	// at least one non-terminal task, scoped to the given entity
@@ -222,6 +239,20 @@ type TaskStore interface {
 	// visibility set; the existing owner when that is empty or
 	// ambiguous).
 	HandoffAgentClaim(ctx context.Context, orgID, taskID, agentID, userID string) (HandoffResult, error)
+
+	// ResolveClaimTeam returns the team a user→bot handoff WOULD
+	// consolidate the task onto, without mutating anything — the same
+	// derivation HandoffAgentClaim applies: the caller's team in the
+	// task's task_teams visibility set (preferring the current owner on a
+	// tie), falling back to the task's current team_id. Returns "" when
+	// the task doesn't exist (or RLS hides it).
+	//
+	// The delegate handlers call this BEFORE the bot-enablement gate so
+	// the gate checks team_agents for the team the claim will actually
+	// land on — not the pre-handoff team_id, which for a multi-team
+	// unclaimed task can be a team the caller doesn't belong to (whose
+	// team_agents row RLS then hides, wrongly reporting the bot disabled).
+	ResolveClaimTeam(ctx context.Context, orgID, taskID, userID string) (string, error)
 
 	// TakeoverClaimFromAgent atomically flips a bot-claimed task
 	// to a user claim. Race-safe: guards on the bot still holding

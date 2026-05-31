@@ -80,6 +80,14 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		jiraRules                        []domain.JiraProjectStatusRules
 		localAccountID, localDisplayName string
 	)
+	// The optional ?team_id= read filter narrows the deck to one team's
+	// Jira projects (the per-page selector). The deck is single-team by
+	// construction; resolveReadTeam defaults to the sticky/first team
+	// when no filter is set rather than blocking a multi-team caller.
+	// singleTeamParam drops a malformed id to "" — same validation the
+	// prompts / event-handlers read paths use, so a junk value can't reach
+	// a future ::uuid cast.
+	filterTeam := singleTeamParam(r)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
 		var e error
@@ -87,7 +95,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			return fmt.Errorf("load org settings: %w", e)
 		}
-		teamID, e = resolveActingTeam(r.Context(), tx.Teams, orgID)
+		teamID, e = resolveReadTeam(r.Context(), tx.Teams, tx.Users, orgID, userID, filterTeam)
 		if e != nil {
 			return e
 		}
@@ -126,7 +134,7 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		// org-wide poller can't surface another team's untriaged backlog
 		// on this user's swipe deck. Local mode (SQLite) returns the full
 		// active set — N=1, nothing to scope away.
-		entities, e = tx.Entities.ListActiveJiraTeamScoped(r.Context(), orgID)
+		entities, e = tx.Entities.ListActiveJiraTeamScoped(r.Context(), orgID, teamID)
 		if e != nil {
 			return e
 		}
@@ -331,6 +339,12 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 	userID := ClaimsFrom(r.Context()).Subject
 	var req struct {
 		Actions []stockAction `json:"actions"`
+		// TeamID is the acting team the write picker supplied — the team
+		// claimed/queued stock tasks are stamped under. Required in the UI
+		// when the caller belongs to ≥2 teams; empty (sole-team fallback)
+		// otherwise. The same value must scope the Jira rules the actions
+		// validate against, so claim writes land on the picked team.
+		TeamID string `json:"team_id"`
 	}
 	if !decodeJSON(w, r, &req, "") {
 		return
@@ -347,7 +361,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		creds, _ = integrations.Load(r.Context(), tx.Secrets, orgID)
 		var e error
-		teamID, e = resolveActingTeam(r.Context(), tx.Teams, orgID)
+		teamID, e = resolveActingTeam(r.Context(), tx.Teams, tx.Users, orgID, userID, req.TeamID)
 		if e != nil {
 			return e
 		}
@@ -358,6 +372,9 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
 		return e
 	}); err != nil {
+		if writeIfActingTeamError(w, err) {
+			return
+		}
 		internalError(w, "stock", err)
 		return
 	}
@@ -381,7 +398,7 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			return e
 		}
-		scoped, e := tx.Entities.ListActiveJiraTeamScoped(r.Context(), orgID)
+		scoped, e := tx.Entities.ListActiveJiraTeamScoped(r.Context(), orgID, teamID)
 		if e != nil {
 			return e
 		}

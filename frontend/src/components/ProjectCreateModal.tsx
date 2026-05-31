@@ -5,6 +5,8 @@ import { readError } from '../lib/api'
 import { toast } from './Toast/toastStore'
 import RepoMultiSelect from './RepoMultiSelect'
 import TrackerProjectPickers from './TrackerProjectPickers'
+import TeamPicker from './TeamPicker'
+import { useWriteTeam, noteWrittenTeam } from '../hooks/useTeams'
 
 // ProjectCreateModal is the only way to create a project from the UI.
 // Required: name. Optional: description, pinned repos, tracker
@@ -23,6 +25,30 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
   const [jiraKey, setJiraKey] = useState('')
   const [linearKey, setLinearKey] = useState('')
   const [submitting, setSubmitting] = useState(false)
+  // Acting team. The TeamPicker renders only at ≥2 teams; below that
+  // `team` stays '' and the server resolves the sole team. `ready` is
+  // false until /api/teams resolves — the submit button gates on it so a
+  // multi-team user can't submit team_id:'' in the cold-load window.
+  const { team, setTeam, multi, ready: teamReady } = useWriteTeam()
+
+  // The pinned-repo picker offers the acting team's tracked repos, so it
+  // must wait until the team resolves: for a multi-team user the seed lands
+  // after /api/teams, and picking the *default* team's repos beforehand
+  // would 400 when the team resolves to a different one. Disabled until the
+  // team is known (solo → '' is already resolved → ready immediately).
+  const repoPickerReady = teamReady && (!multi || team !== '')
+
+  // Repos AND the Jira project are team-scoped (the create POST validates
+  // both against the acting team — pinned repos via validatePinnedRepos,
+  // jira_project_key against the team's jira_project_status_rules), so any
+  // team change — a manual pick OR the automatic seed / org-switch reseed —
+  // invalidates both selections. Clear them so a choice made under one team
+  // can't be submitted under another (the Jira picker also refetches its
+  // options for the new team from its own teamId-keyed effect).
+  useEffect(() => {
+    setPinnedRepos([])
+    setJiraKey('')
+  }, [team])
   // Holds the in-flight POST's AbortController so the close path
   // can cancel it. Without this, clicking the backdrop / hitting
   // Escape after submit would dismiss the dialog while leaving the
@@ -71,6 +97,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
             pinned_repos: pinnedRepos,
             jira_project_key: jiraKey,
             linear_project_key: linearKey,
+            team_id: team,
           }),
           signal: controller.signal,
         })
@@ -79,6 +106,9 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
           return
         }
         const created: Project = await res.json()
+        // Sync the cache to the team this write landed on (the backend
+        // resolver has already persisted it as the last-written default).
+        if (team) noteWrittenTeam(team)
         toast.success(`Created project "${created.name}"`)
         onCreated(created)
       } catch (err) {
@@ -91,7 +121,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
         setSubmitting(false)
       }
     },
-    [name, description, pinnedRepos, jiraKey, linearKey, onCreated],
+    [name, description, pinnedRepos, jiraKey, linearKey, team, onCreated],
   )
 
   // Backdrop click closes only when no submit is in flight. If a
@@ -152,6 +182,8 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
         </header>
 
         <form onSubmit={handleSubmit} className="space-y-4">
+          <TeamPicker value={team} onChange={setTeam} label="Team" />
+
           <Field label="Name" required>
             <input
               type="text"
@@ -185,7 +217,12 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
           </Field>
 
           <Field label="Pinned repos">
-            <RepoMultiSelect value={pinnedRepos} onChange={setPinnedRepos} />
+            <RepoMultiSelect
+              value={pinnedRepos}
+              onChange={setPinnedRepos}
+              teamId={team}
+              disabled={!repoPickerReady}
+            />
           </Field>
 
           <Field label="Tracker projects">
@@ -194,6 +231,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
               linearKey={linearKey}
               onJiraChange={setJiraKey}
               onLinearChange={setLinearKey}
+              teamId={team}
             />
           </Field>
 
@@ -212,7 +250,7 @@ export default function ProjectCreateModal({ onClose, onCreated }: Props) {
             </button>
             <button
               type="submit"
-              disabled={submitting || !name.trim()}
+              disabled={submitting || !name.trim() || !teamReady}
               className="
                 rounded-full px-4 py-2 text-[13px] font-medium
                 bg-accent text-white hover:opacity-90

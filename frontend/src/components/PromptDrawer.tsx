@@ -4,10 +4,17 @@ import { toast } from './Toast/toastStore'
 import { readError } from '../lib/api'
 import type { ChainStep, PromptKind } from '../types'
 import ChainStepEditor, { type ChainStepDraft } from './ChainStepEditor'
+import TeamPicker from './TeamPicker'
+import { useTeams, pickerDefault, noteWrittenTeam } from '../hooks/useTeams'
 
 interface Props {
   promptId: string | null
   isNew?: boolean
+  // When set (the single-team prompts page), a new prompt is created under
+  // this team and the per-modal TeamPicker is replaced by a read-only
+  // label — the page's active team is the single source of truth. Empty /
+  // undefined keeps the modal's own write picker (standalone / solo use).
+  lockedTeamId?: string
   onClose: () => void
   onSaved: () => void
   onDeleted?: () => void
@@ -118,11 +125,30 @@ function loadWidth(): number {
   return 520
 }
 
-export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDeleted }: Props) {
+export default function PromptDrawer({
+  promptId,
+  isNew,
+  lockedTeamId,
+  onClose,
+  onSaved,
+  onDeleted,
+}: Props) {
   const [name, setName] = useState('')
   const [body, setBody] = useState('')
   const [source, setSource] = useState('user')
   const [kind, setKind] = useState<PromptKind>('leaf')
+  // Acting team — create mode only; a prompt's team is fixed
+  // after creation. TeamPicker renders only at ≥2 teams; below that
+  // `team` stays '' and the server resolves the sole team. teamsLoaded
+  // gates the create submit so a multi-team user can't submit team_id:''
+  // in the cold-load window before /api/teams resolves.
+  const { teams, lastActingTeamId, loaded: teamsLoaded } = useTeams()
+  const [team, setTeam] = useState('')
+  // When the page locks the team (single-team prompts page), create uses it
+  // directly and the picker is hidden; otherwise the modal's own write
+  // picker applies. lockedTeamId is non-empty only for a ≥2-team user on the
+  // prompts page — by then teams are loaded, so no cold-load gate is needed.
+  const effectiveTeam = lockedTeamId || team
   const [chainDraft, setChainDraft] = useState<ChainStepDraft[]>([])
   const [model, setModel] = useState('')
   const [defaultModel, setDefaultModel] = useState('')
@@ -139,10 +165,15 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
 
   // Refreshes when the drawer (re)opens so a Settings change is
   // reflected in the "Default" option's label without a page reload.
+  // Scoped to the prompt's own team (effectiveTeam) so the "Default"
+  // label shows the model that team's setting resolves to — the prompt
+  // is created under this team, and per-team DefaultModel can differ.
+  // '' (solo/local) falls back to the "default" alias the backend accepts.
   useEffect(() => {
     if (!open) return
     let cancelled = false
-    fetch('/api/settings/team/default')
+    const settingsTeam = effectiveTeam || 'default'
+    fetch(`/api/settings/team/${encodeURIComponent(settingsTeam)}`)
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (!cancelled && data?.team_settings?.DefaultModel)
@@ -152,7 +183,7 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
     return () => {
       cancelled = true
     }
-  }, [open])
+  }, [open, effectiveTeam])
 
   useEffect(() => {
     if (isNew) {
@@ -214,6 +245,16 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
     }
   }, [promptId, isNew])
 
+  // Seed the acting team for create mode once the teams load. Kept in its
+  // own effect (not the form-reset above) so a late teams fetch reseeds
+  // without re-running the whole reset and clobbering user input. Gated
+  // on teamsLoaded so the seed reflects the real team set, not the empty
+  // pre-fetch state.
+  useEffect(() => {
+    if (!isNew || !teamsLoaded) return
+    setTeam(pickerDefault(teams, lastActingTeamId))
+  }, [isNew, open, teamsLoaded, teams, lastActingTeamId])
+
   // Resize drag handlers
   const onMouseDown = useCallback(
     (e: React.MouseEvent) => {
@@ -271,7 +312,7 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
         ? await fetch('/api/prompts', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ name, body, kind, model }),
+            body: JSON.stringify({ name, body, kind, model, team_id: effectiveTeam }),
           })
         : await fetch(`/api/prompts/${promptId}`, {
             method: 'PUT',
@@ -282,6 +323,7 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
         toast.error(await readError(res, `Failed to ${isNew ? 'create' : 'save'} prompt`))
         return
       }
+      if (isNew && effectiveTeam) noteWrittenTeam(effectiveTeam)
 
       // For chain prompts, persist the step list immediately after the
       // prompt itself. We use the id from the response so it works for
@@ -392,6 +434,20 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
 
             {/* Body — scrollable */}
             <div className="flex-1 overflow-y-auto px-6 py-5 space-y-5">
+              {/* Team (create mode only — a prompt's team is fixed after creation).
+                  Locked to the page's active team on the single-team prompts page;
+                  otherwise the modal's own write picker (≥2 teams). */}
+              {isNew &&
+                (lockedTeamId ? (
+                  <div className="text-[12px] text-text-tertiary">
+                    Team:{' '}
+                    <span className="font-medium text-text-secondary">
+                      {teams.find((t) => t.id === lockedTeamId)?.name ?? 'current team'}
+                    </span>
+                  </div>
+                ) : (
+                  <TeamPicker value={team} onChange={setTeam} label="Team" />
+                ))}
               {/* Name */}
               <div>
                 <label className="block text-[12px] font-medium text-text-secondary mb-1.5">
@@ -450,6 +506,7 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
                   steps={chainDraft}
                   onChange={setChainDraft}
                   busy={saving}
+                  lockedTeamId={effectiveTeam}
                 />
               )}
 
@@ -604,7 +661,7 @@ export default function PromptDrawer({ promptId, isNew, onClose, onSaved, onDele
                 </button>
                 <button
                   onClick={save}
-                  disabled={saving}
+                  disabled={saving || (isNew && !lockedTeamId && !teamsLoaded)}
                   className="text-[12px] font-semibold text-white bg-accent hover:bg-accent/90 px-4 py-1.5 rounded-full transition-colors disabled:opacity-50"
                 >
                   {saving ? 'Saving...' : isNew ? 'Create' : 'Save'}

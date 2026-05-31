@@ -59,7 +59,12 @@ type EventHandlerStore interface {
 	//   rules first by sort_order ASC, then name ASC,
 	//   then triggers by created_at DESC.
 	// kind="" returns all. kind="rule" or kind="trigger" filters.
-	List(ctx context.Context, orgID string, kind string) ([]domain.EventHandler, error)
+	// teamID="" returns all (solo/local, or unfiltered). A non-empty
+	// teamID — the multi-team prompts page narrowed to one team — scopes
+	// to that team's handlers plus org-visible ones (team_id IS NULL),
+	// mirroring the delegation visibility gate (handler.TeamID == "" ||
+	// == teamID). The SQLite impl ignores it (local mode is single-team).
+	List(ctx context.Context, orgID string, kind string, teamID string) ([]domain.EventHandler, error)
 
 	// Get returns one handler by id, or (nil, nil) if not found.
 	Get(ctx context.Context, orgID string, id string) (*domain.EventHandler, error)
@@ -162,6 +167,14 @@ var (
 // identical to what task_rules and prompt_triggers produced before the
 // unification — the backfill copies IDs verbatim, and re-seeding on an
 // upgraded install lands on the same row.
+//
+// TODO(SKY-381): this id is per-(handler, org) — team-independent — so it
+// cannot materialize distinct rows for a second team in the same org
+// (PK (org_id, id) → ON CONFLICT skip). That's why BootstrapNewTeam seeds
+// no handlers today. The org-template copy path needs a per-team identity
+// (fold teamID into the derived id, or a real-UUID PK + system_slug, the
+// same scheme SKY-380 adopts for prompts) before new teams can carry
+// their own copies of shipped/templated handlers.
 func (h ShippedEventHandler) UUIDFor(orgID string) string {
 	ns := shippedRuleNamespace
 	if h.Kind == domain.EventHandlerKindTrigger {
