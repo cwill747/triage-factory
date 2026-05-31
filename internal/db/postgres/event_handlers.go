@@ -8,6 +8,8 @@ import (
 	"log"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
@@ -63,12 +65,12 @@ const pgEventHandlerColumns = `id, kind, event_type, scope_predicate_json::text,
        prompt_id, breaker_threshold, min_autonomy_suitability,
        created_at, updated_at`
 
-func (s *eventHandlerStore) Seed(ctx context.Context, orgID, teamID string) error {
+func (s *eventHandlerStore) Seed(ctx context.Context, orgID, teamID string, promptIDsBySlug map[string]string) error {
 	if s.inTx {
 		return errors.New("postgres event_handlers: Seed must not be called inside WithTx; call stores.EventHandlers.Seed directly")
 	}
 	if teamID == "" {
-		return errors.New("postgres event_handlers Seed: teamID required (SKY-295: shipped rules are team-scoped; caller must thread the target team — local mode passes runmode.LocalDefaultTeamID, multi mode passes the new team's UUID on team creation)")
+		return errors.New("postgres event_handlers Seed: teamID required (shipped handlers are team-scoped; caller threads the target team — local mode passes runmode.LocalDefaultTeamID, multi mode passes the new team's UUID on team creation)")
 	}
 	now := time.Now().UTC()
 	var inserted int64
@@ -78,28 +80,28 @@ func (s *eventHandlerStore) Seed(ctx context.Context, orgID, teamID string) erro
 			pred = h.Predicate
 		}
 
-		// SKY-295: system rows materialize as visibility='team' with
-		// team_id=teamID. event_handlers_system_has_no_creator allows
-		// creator_user_id NULL on source='system' regardless of
-		// visibility; team_visibility_requires_team is satisfied
-		// because team_id is non-NULL.
+		// System rows materialize as visibility='team' with team_id=teamID.
+		// event_handlers_system_has_no_creator allows creator_user_id NULL
+		// on source='system'. The id is a random UUID per team copy and h.ID
+		// is the system_slug; re-seed dedupes on (org_id, team_id,
+		// system_slug) via ON CONFLICT (SKY-380).
 		switch h.Kind {
 		case domain.EventHandlerKindRule:
 			res, err := s.admin.ExecContext(ctx, `
 				INSERT INTO event_handlers
 					(id, org_id, team_id, creator_user_id, kind, event_type,
-					 scope_predicate_json, enabled, source, visibility,
+					 system_slug, scope_predicate_json, enabled, source,
 					 name, default_priority, sort_order,
 					 created_at, updated_at)
 				VALUES (
 					$1, $2, $3::uuid, NULL, 'rule', $4,
-					$5::jsonb, TRUE, 'system', 'team',
-					$6, $7, $8,
-					$9, $9
+					$5, $6::jsonb, TRUE, 'system',
+					$7, $8, $9,
+					$10, $10
 				)
-				ON CONFLICT (org_id, id) DO NOTHING
-			`, h.UUIDFor(orgID), orgID, teamID, h.EventType,
-				pred, h.Name, h.DefaultPriority, h.SortOrder, now)
+				ON CONFLICT (org_id, team_id, system_slug) DO NOTHING
+			`, uuid.New().String(), orgID, teamID, h.EventType,
+				h.ID, pred, h.Name, h.DefaultPriority, h.SortOrder, now)
 			if err != nil {
 				return fmt.Errorf("seed event_handler rule %s: %w", h.ID, err)
 			}
@@ -110,6 +112,15 @@ func (s *eventHandlerStore) Seed(ctx context.Context, orgID, teamID string) erro
 			inserted += n
 
 		case domain.EventHandlerKindTrigger:
+			// Resolve the trigger's prompt slug to this team's prompt-copy
+			// UUID (phase-2 of the two-phase seed). A missing entry means
+			// the caller didn't seed the prompts first — fail loudly rather
+			// than write a dangling reference (the same-team FK would reject
+			// it anyway).
+			promptID, ok := promptIDsBySlug[h.PromptID]
+			if !ok || promptID == "" {
+				return fmt.Errorf("seed event_handler trigger %s: prompt slug %q not found in promptIDsBySlug (seed prompts before handlers)", h.ID, h.PromptID)
+			}
 			// Trigger: prompt_id + breaker_threshold +
 			// min_autonomy_suitability populated; rule-only columns NULL.
 			// Shipped triggers ship disabled (project convention —
@@ -117,18 +128,18 @@ func (s *eventHandlerStore) Seed(ctx context.Context, orgID, teamID string) erro
 			res, err := s.admin.ExecContext(ctx, `
 				INSERT INTO event_handlers
 					(id, org_id, team_id, creator_user_id, kind, event_type,
-					 scope_predicate_json, enabled, source, visibility,
+					 system_slug, scope_predicate_json, enabled, source,
 					 prompt_id, breaker_threshold, min_autonomy_suitability,
 					 created_at, updated_at)
 				VALUES (
 					$1, $2, $3::uuid, NULL, 'trigger', $4,
-					$5::jsonb, FALSE, 'system', 'team',
-					$6, $7, $8,
-					$9, $9
+					$5, $6::jsonb, FALSE, 'system',
+					$7, $8, $9,
+					$10, $10
 				)
-				ON CONFLICT (org_id, id) DO NOTHING
-			`, h.UUIDFor(orgID), orgID, teamID, h.EventType,
-				pred, h.PromptID, h.BreakerThreshold, h.MinAutonomySuitability, now)
+				ON CONFLICT (org_id, team_id, system_slug) DO NOTHING
+			`, uuid.New().String(), orgID, teamID, h.EventType,
+				h.ID, pred, promptID, h.BreakerThreshold, h.MinAutonomySuitability, now)
 			if err != nil {
 				return fmt.Errorf("seed event_handler trigger %s: %w", h.ID, err)
 			}
@@ -231,13 +242,10 @@ func (s *eventHandlerStore) Create(ctx context.Context, orgID, teamID string, h 
 	}
 
 	// team_id is the acting team the handler resolved for this request —
-	// no "first/any team in org" fallback. user-source rows default to
-	// visibility='team', and the team_visibility_requires_team CHECK
-	// forces team_id non-NULL whenever visibility='team'; a real team
-	// here keeps both the CHECK and the event_handlers_insert RLS
-	// (tf.user_in_team) satisfied. (The column itself stays nullable so
-	// shipped system rows — creator NULL + visibility='org' + team_id
-	// NULL, written by Seed — remain valid.) Empty is a handler bug, so
+	// no "first/any team in org" fallback. team_id is NOT NULL (the sole
+	// scoping signal post-SKY-380; no visibility column) and the
+	// event_handlers_insert RLS gates on tf.user_in_team(team_id), so a
+	// real team here keeps the write valid. Empty is a handler bug, so
 	// reject it rather than write an invalid row.
 	if teamID == "" {
 		return fmt.Errorf("postgres event_handlers Create: team_id required (handler must thread the resolved acting team from request context)")
@@ -246,7 +254,7 @@ func (s *eventHandlerStore) Create(ctx context.Context, orgID, teamID string, h 
 	case domain.EventHandlerKindRule:
 		_, err := s.app.ExecContext(ctx, `
 			INSERT INTO event_handlers
-				(id, org_id, creator_user_id, team_id, visibility, kind, event_type,
+				(id, org_id, creator_user_id, team_id, kind, event_type,
 				 scope_predicate_json, enabled, source,
 				 name, default_priority, sort_order,
 				 created_at, updated_at)
@@ -254,7 +262,6 @@ func (s *eventHandlerStore) Create(ctx context.Context, orgID, teamID string, h 
 				$1, $2,
 				COALESCE(tf.current_user_id(), (SELECT owner_user_id FROM orgs WHERE id = $2)),
 				$3::uuid,
-				'team',
 				'rule', $4,
 				$5::jsonb, $6, 'user',
 				$7, $8, $9,
@@ -267,7 +274,7 @@ func (s *eventHandlerStore) Create(ctx context.Context, orgID, teamID string, h 
 	case domain.EventHandlerKindTrigger:
 		_, err := s.app.ExecContext(ctx, `
 			INSERT INTO event_handlers
-				(id, org_id, creator_user_id, team_id, visibility, kind, event_type,
+				(id, org_id, creator_user_id, team_id, kind, event_type,
 				 scope_predicate_json, enabled, source,
 				 prompt_id, breaker_threshold, min_autonomy_suitability,
 				 created_at, updated_at)
@@ -275,7 +282,6 @@ func (s *eventHandlerStore) Create(ctx context.Context, orgID, teamID string, h 
 				$1, $2,
 				COALESCE(tf.current_user_id(), (SELECT owner_user_id FROM orgs WHERE id = $2)),
 				$3::uuid,
-				'team',
 				'trigger', $4,
 				$5::jsonb, $6, 'user',
 				$7, $8, $9,
@@ -420,12 +426,12 @@ func (s *eventHandlerStore) buildListQuery(orgID, kind, teamID string) (string, 
 		q += fmt.Sprintf(" AND kind = $%d", len(args))
 	}
 	if teamID != "" {
-		// Prompts page narrowed to one team: that team's handlers plus
-		// org-visible ones (team_id NULL). Mirrors the delegation
-		// visibility gate (handler.TeamID == "" || == teamID). RLS still
-		// gates the row set; this narrows within it.
+		// Prompts page narrowed to one team: that team's handlers. Every
+		// handler is team-owned (team_id NOT NULL, no org-visible tier), so
+		// this is a plain team filter. RLS still gates the row set; this
+		// narrows within it.
 		args = append(args, teamID)
-		q += fmt.Sprintf(" AND (team_id IS NULL OR team_id = $%d)", len(args))
+		q += fmt.Sprintf(" AND team_id = $%d", len(args))
 	}
 	// Order: rules first (sort_order ASC, name ASC), then triggers
 	// (created_at DESC). Same shape as the predecessor stores' List

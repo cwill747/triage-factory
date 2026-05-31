@@ -37,7 +37,7 @@ import (
 //
 // org_id is threaded through every WHERE for defense in depth; RLS
 // enforces the creator predicate on chain_runs and prompt_chain_steps
-// RLS gates on the parent prompt's visibility.
+// RLS gates on the parent prompt's team membership.
 //
 // Reads against UUID-typed columns (chain_runs.id, runs.id, …) guard
 // inputs with isValidUUID and treat non-UUID strings as not-found —
@@ -111,9 +111,14 @@ func (s *chainStore) ReplaceSteps(ctx context.Context, orgID, chainPromptID stri
 			if i < len(briefs) {
 				brief = briefs[i]
 			}
+			// team_id is derived from the chain prompt in-SQL so the
+			// same-team composite FKs ((chain_prompt_id|step_prompt_id,
+			// team_id) → prompts(id, team_id)) enforce that every step
+			// belongs to the chain's own team — a cross-team step is
+			// refused at the DB layer (SKY-380).
 			if _, err := tx.ExecContext(ctx, `
-				INSERT INTO prompt_chain_steps (org_id, chain_prompt_id, step_index, step_prompt_id, brief, created_at)
-				VALUES ($1, $2, $3, $4, $5, $6)
+				INSERT INTO prompt_chain_steps (org_id, team_id, chain_prompt_id, step_index, step_prompt_id, brief, created_at)
+				VALUES ($1, (SELECT team_id FROM prompts WHERE id = $2 AND org_id = $1), $2, $3, $4, $5, $6)
 			`, orgID, chainPromptID, i, stepID, brief, now); err != nil {
 				return fmt.Errorf("insert step %d: %w", i, err)
 			}

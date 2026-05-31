@@ -64,6 +64,7 @@ func TestPromptStore_Postgres(t *testing.T) {
 			t.Helper()
 			return seedPgRunsForStats(t, h.AdminDB, orgID, userID, promptID, statusByOffset)
 		}
+		_ = userID
 		return stores.Prompts, orgID, teamID, seeder
 	})
 }
@@ -87,9 +88,11 @@ func TestPromptStore_Postgres_SeedOrUpdate_AdminOnly(t *testing.T) {
 
 	// Admin-pool store — must succeed.
 	adminStores := pgstore.New(h.AdminDB, h.AdminDB)
-	if err := adminStores.Prompts.SeedOrUpdate(ctx, orgID, domain.Prompt{
-		ID: "sys-admin-ok", Name: "OK", Body: "x", Source: "system",
-	}); err != nil {
+	teamID := firstTeamForOrg(t, h, orgID)
+	seededID, err := adminStores.Prompts.SeedOrUpdate(ctx, orgID, teamID, domain.Prompt{
+		SystemSlug: "sys-admin-ok", Name: "OK", Body: "x", Source: "system",
+	})
+	if err != nil {
 		t.Fatalf("admin-pool SeedOrUpdate should succeed, got: %v", err)
 	}
 
@@ -104,7 +107,7 @@ func TestPromptStore_Postgres_SeedOrUpdate_AdminOnly(t *testing.T) {
 		_, err := tx.ExecContext(ctx, `
 			INSERT INTO system_prompt_versions (org_id, prompt_id, content_hash, applied_at)
 			VALUES ($1, $2, $3, now())
-		`, orgID, "sys-admin-ok", "deadbeef")
+		`, orgID, seededID, "deadbeef")
 		if err == nil {
 			t.Fatalf("tf_app INSERT on system_prompt_versions should fail with privilege error")
 		}
@@ -124,11 +127,10 @@ func TestPromptStore_Postgres_SeedOrUpdate_AdminOnly(t *testing.T) {
 // silently filtered (USING); cross-org Create raises 42501 from
 // prompts_insert WITH CHECK.
 //
-// Prompts carry a visibility column ('org'|'team'|'private'); the
-// store's Create path always lands 'team' via the SQL default in the
-// INSERT. The test seeds an admin-pool 'team'-visibility prompt in
-// orgA so the same-org user (an org member) can see it through the
-// team_visibility branch of prompts_select.
+// Every prompt is team-owned (no visibility column post-SKY-380); the
+// store's Create path stamps the acting team. The test seeds an
+// admin-pool prompt on teamA in orgA so the same-org user (a teamA
+// member) can see it through the team-membership branch of prompts_select.
 func TestPromptStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
 	h := pgtest.Shared(t)
 	h.Reset(t)
@@ -138,14 +140,14 @@ func TestPromptStore_Postgres_CrossOrgRLSDenied(t *testing.T) {
 	_ = bob
 
 	// Seed a prompt in orgA directly via the admin connection so the row
-	// exists independent of user-scoped RLS. The insert sets
-	// visibility='team' and attaches teamA so the same-org read path
-	// exercises the team_visibility branch of prompts_select.
+	// exists independent of user-scoped RLS. It's owned by teamA so the
+	// same-org read path exercises the team-membership branch of
+	// prompts_select.
 	promptA := "prompt-rls-" + orgA[:8]
 	teamA := firstTeamForOrg(t, h, orgA)
 	if _, err := h.AdminDB.Exec(`
-		INSERT INTO prompts (id, org_id, creator_user_id, team_id, name, body, source, kind, allowed_tools, visibility, created_at, updated_at)
-		VALUES ($1, $2, $3, $4, 'RLS Prompt', 'body', 'user', 'leaf', '', 'team', now(), now())
+		INSERT INTO prompts (id, org_id, creator_user_id, team_id, name, body, source, kind, allowed_tools, created_at, updated_at)
+		VALUES ($1, $2, $3, $4::uuid, 'RLS Prompt', 'body', 'user', 'leaf', '', now(), now())
 	`, promptA, orgA, alice, teamA); err != nil {
 		t.Fatalf("seed prompt: %v", err)
 	}

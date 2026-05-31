@@ -39,12 +39,22 @@ CREATE TABLE prompts (
     allowed_tools   TEXT NOT NULL DEFAULT '',
     model           TEXT NOT NULL DEFAULT '',
     org_id          TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
-    team_id         TEXT,
+    -- team_id is NOT NULL: every prompt is team-owned (SKY-380). The
+    -- LocalDefaultTeamID sentinel is the default so local-mode inserts and
+    -- the single-team N=1 case never thread it explicitly.
+    team_id         TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000010',
     -- creator_user_id is nullable: source='system' rows have NULL (no human author),
     -- source='user' rows must have a value. Enforced by prompts_system_has_no_creator.
     creator_user_id TEXT,
-    visibility      TEXT NOT NULL DEFAULT 'team'
-        CHECK (visibility IN ('private','team','org')),
+    -- system_slug is the stable shipped identifier ("system-ci-fix", …) for
+    -- source='system' rows; NULL for user/imported prompts. The id is a
+    -- random UUID per team copy, so re-seed idempotency and slug→id lookups
+    -- key on (org_id, team_id, system_slug) instead of the id (SKY-380).
+    system_slug     TEXT,
+    -- There is no visibility column: every prompt is team-owned (team_id NOT
+    -- NULL) and visible to its team. A per-user 'private' tier was never
+    -- reachable and org-wide sharing is the marketplace's copy-on-publish
+    -- concern, so a discriminator column would only ever hold one value.
     -- Uses source<>'system' (not source='user') because prompts.source
     -- has three valid values (system|user|imported) — both non-system
     -- variants require a creator. event_handlers, whose enum is just
@@ -53,9 +63,11 @@ CREATE TABLE prompts (
         (source = 'system' AND creator_user_id IS NULL)
         OR (source <> 'system' AND creator_user_id IS NOT NULL)
     ),
-    CONSTRAINT prompts_team_visibility_requires_team CHECK (
-        visibility <> 'team' OR team_id IS NOT NULL
-    )
+    -- Per-team re-seed idempotency key: each team gets exactly one copy of
+    -- each shipped prompt (same system_slug, distinct team_id). NULLs are
+    -- distinct in both dialects, so user prompts (system_slug NULL) never
+    -- collide with each other (SKY-380).
+    CONSTRAINT prompts_org_team_slug_unique UNIQUE (org_id, team_id, system_slug)
 );
 
 CREATE TABLE system_prompt_versions (
@@ -448,15 +460,12 @@ CREATE TABLE event_handlers (
     id              TEXT PRIMARY KEY,
     org_id          TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000001',
     creator_user_id TEXT,
-    -- team_id ships with the LocalDefaultTeamID sentinel as DEFAULT to
-    -- match tasks/runs. With visibility='team' as the default, any
-    -- direct INSERT that omitted team_id would otherwise trip
-    -- event_handlers_team_visibility_requires_team. System-source
-    -- shipped rows (visibility='org') tolerate any team_id value;
-    -- the sentinel is consistent across them.
+    -- team_id is NOT NULL: every handler is team-owned (SKY-380 made shipped
+    -- rows per-team copies, so the old org-visible / team_id-NULL tier is
+    -- gone). The LocalDefaultTeamID sentinel is the DEFAULT so local-mode
+    -- inserts and direct INSERTs that omit it land on the sole team. There
+    -- is no visibility column — team_id is the sole scoping signal.
     team_id         TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000010',
-    visibility      TEXT NOT NULL DEFAULT 'team'
-                       CHECK (visibility IN ('private','team','org')),
 
     kind            TEXT NOT NULL CHECK (kind IN ('rule','trigger')),
 
@@ -465,6 +474,11 @@ CREATE TABLE event_handlers (
     enabled              BOOLEAN NOT NULL DEFAULT 1,
     source               TEXT NOT NULL DEFAULT 'user'
                             CHECK (source IN ('system', 'user')),
+    -- system_slug is the stable shipped identifier ("system-rule-ci-check-failed",
+    -- "system-trigger-ci-fix", …) for source='system' rows; NULL for user
+    -- handlers. The id is a random UUID per team copy, so re-seed idempotency
+    -- keys on (org_id, team_id, system_slug) instead of the id (SKY-380).
+    system_slug          TEXT,
 
     -- Rule-only fields. NULL for triggers.
     name             TEXT,
@@ -480,6 +494,12 @@ CREATE TABLE event_handlers (
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (prompt_id, org_id) REFERENCES prompts (id, org_id) ON DELETE CASCADE,
+    -- Same-team guard (SKY-380): a trigger may only bind a prompt its own
+    -- team owns. (prompt_id, team_id) → prompts(id, team_id) refuses a
+    -- handler whose team_id doesn't match the referenced prompt's team.
+    -- NULL prompt_id (rules) skips the FK. CASCADE mirrors the org FK so a
+    -- prompt delete still removes its triggers.
+    FOREIGN KEY (prompt_id, team_id) REFERENCES prompts (id, team_id) ON DELETE CASCADE,
 
     CHECK (kind <> 'rule' OR (
         prompt_id IS NULL
@@ -501,9 +521,10 @@ CREATE TABLE event_handlers (
         (source = 'system' AND creator_user_id IS NULL)
         OR (source = 'user' AND creator_user_id IS NOT NULL)
     ),
-    CONSTRAINT event_handlers_team_visibility_requires_team CHECK (
-        visibility <> 'team' OR team_id IS NOT NULL
-    )
+    -- Per-team re-seed idempotency key: each team gets one copy of each
+    -- shipped handler (same system_slug, distinct team_id). NULLs distinct,
+    -- so user handlers (system_slug NULL) never collide (SKY-380).
+    CONSTRAINT event_handlers_org_team_slug_unique UNIQUE (org_id, team_id, system_slug)
 );
 CREATE UNIQUE INDEX event_handlers_id_org_unique          ON event_handlers (id, org_id);
 CREATE INDEX        idx_event_handlers_event_type_enabled ON event_handlers(org_id, event_type) WHERE enabled = 1;
@@ -631,14 +652,25 @@ CREATE INDEX        idx_runs_chain          ON runs(chain_run_id, chain_step_ind
 -- lives on chain_runs.
 
 CREATE TABLE prompt_chain_steps (
-    chain_prompt_id TEXT NOT NULL REFERENCES prompts(id) ON DELETE CASCADE,
+    chain_prompt_id TEXT NOT NULL,
     step_index      INTEGER NOT NULL,           -- 0-based; densely packed by ReplaceChainSteps
-    step_prompt_id  TEXT NOT NULL REFERENCES prompts(id) ON DELETE RESTRICT,
+    step_prompt_id  TEXT NOT NULL,
+    -- team_id is the chain prompt's owning team (SKY-380). The composite FKs
+    -- below pin both the chain prompt AND each step to this team, so a chain
+    -- can only step through prompts its own team owns. Sentinel default keeps
+    -- local-mode (N=1) inserts implicit.
+    team_id         TEXT NOT NULL DEFAULT '00000000-0000-0000-0000-000000000010',
     -- Author-supplied one-liner shown in the wrapper user prompt and
     -- in the run-detail UI. Falls back to step_prompt.name when empty.
     brief           TEXT NOT NULL DEFAULT '',
     created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (chain_prompt_id, step_index)
+    PRIMARY KEY (chain_prompt_id, step_index),
+    -- Same-team guards (SKY-380): both the chain and every step resolve
+    -- against prompts(id, team_id), so a cross-team step is refused. CASCADE
+    -- on the chain (deleting the chain prompt drops its steps); RESTRICT on
+    -- the step (a prompt used as a step can't be deleted out from under it).
+    FOREIGN KEY (chain_prompt_id, team_id) REFERENCES prompts (id, team_id) ON DELETE CASCADE,
+    FOREIGN KEY (step_prompt_id, team_id)  REFERENCES prompts (id, team_id) ON DELETE RESTRICT
 );
 CREATE INDEX idx_prompt_chain_steps_step_prompt ON prompt_chain_steps(step_prompt_id);
 
@@ -915,6 +947,11 @@ CREATE INDEX        idx_curator_pending_context_consumer
 -- Required by the (prompt_id, org_id) composite FK on event_handlers and
 -- mirrored across every tenant-scoped table for symmetry with Postgres.
 CREATE UNIQUE INDEX prompts_id_org_unique          ON prompts          (id, org_id);
+-- Parent key for the same-team composite FKs (event_handlers.prompt_id,
+-- prompt_chain_steps.chain_prompt_id / step_prompt_id reference
+-- prompts(id, team_id) so a trigger / chain step can only bind a prompt its
+-- own team owns) (SKY-380).
+CREATE UNIQUE INDEX prompts_id_team_unique         ON prompts          (id, team_id);
 CREATE UNIQUE INDEX projects_id_org_unique         ON projects         (id, org_id);
 CREATE UNIQUE INDEX entities_id_org_unique         ON entities         (id, org_id);
 CREATE UNIQUE INDEX events_id_org_unique           ON events           (id, org_id);

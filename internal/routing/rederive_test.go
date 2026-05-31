@@ -344,14 +344,16 @@ func TestReDeriveAfterScoring_CrossTeamTrigger_Skips(t *testing.T) {
 	); err != nil {
 		t.Fatalf("seed team B: %v", err)
 	}
-	createTestPrompt(t, database, domain.Prompt{ID: "p-teamB", Name: "Team B Prompt", Body: "x", Source: "user"})
+	// The prompt must be owned by team B so the same-team trigger→prompt FK
+	// holds (SKY-380); createTestPrompt would pin it to team A.
+	insertPromptForTeam(t, database, "p-teamB", teamB)
 	if _, err := database.Exec(`
 		INSERT INTO event_handlers
-			(id, org_id, team_id, creator_user_id, visibility, kind, event_type,
+			(id, org_id, team_id, creator_user_id, kind, event_type,
 			 scope_predicate_json, enabled, source,
 			 prompt_id, breaker_threshold, min_autonomy_suitability,
 			 created_at, updated_at)
-		VALUES (?, ?, ?, ?, 'team', 'trigger', ?,
+		VALUES (?, ?, ?, ?, 'trigger', ?,
 		        NULL, 1, 'user',
 		        ?, 4, 0.6,
 		        datetime('now'), datetime('now'))
@@ -435,14 +437,15 @@ func TestReDeriveAfterScoring_TeamNotInVisibilitySet_Skips(t *testing.T) {
 	if err := stores.TeamAgents.AddForTeam(t.Context(), runmode.LocalDefaultOrg, teamB, runmode.LocalDefaultAgentID); err != nil {
 		t.Fatalf("add agent to team B: %v", err)
 	}
-	createTestPrompt(t, database, domain.Prompt{ID: "p-novis", Name: "No-vis", Body: "x", Source: "user"})
+	// Team-B-owned prompt so the same-team trigger→prompt FK holds (SKY-380).
+	insertPromptForTeam(t, database, "p-novis", teamB)
 	if _, err := database.Exec(`
 		INSERT INTO event_handlers
-			(id, org_id, team_id, creator_user_id, visibility, kind, event_type,
+			(id, org_id, team_id, creator_user_id, kind, event_type,
 			 scope_predicate_json, enabled, source,
 			 prompt_id, breaker_threshold, min_autonomy_suitability,
 			 created_at, updated_at)
-		VALUES (?, ?, ?, ?, 'team', 'trigger', ?,
+		VALUES (?, ?, ?, ?, 'trigger', ?,
 		        NULL, 1, 'user',
 		        ?, 4, 0.6,
 		        datetime('now'), datetime('now'))

@@ -700,13 +700,13 @@ CREATE TABLE public.event_handlers (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     org_id uuid NOT NULL,
     creator_user_id uuid,
-    team_id uuid,
-    visibility text DEFAULT 'team'::text NOT NULL,
+    team_id uuid NOT NULL,
     kind text NOT NULL,
     event_type text NOT NULL,
     scope_predicate_json jsonb,
     enabled boolean DEFAULT true NOT NULL,
     source text DEFAULT 'user'::text NOT NULL,
+    system_slug text,
     name text,
     default_priority real,
     sort_order integer,
@@ -719,9 +719,7 @@ CREATE TABLE public.event_handlers (
     CONSTRAINT event_handlers_rule_shape CHECK (((kind <> 'rule'::text) OR ((prompt_id IS NULL) AND (breaker_threshold IS NULL) AND (min_autonomy_suitability IS NULL) AND (name IS NOT NULL) AND (default_priority IS NOT NULL) AND (sort_order IS NOT NULL)))),
     CONSTRAINT event_handlers_source_check CHECK ((source = ANY (ARRAY['system'::text, 'user'::text]))),
     CONSTRAINT event_handlers_system_has_no_creator CHECK ((((source = 'system'::text) AND (creator_user_id IS NULL)) OR ((source = 'user'::text) AND (creator_user_id IS NOT NULL)))),
-    CONSTRAINT event_handlers_team_visibility_requires_team CHECK (((visibility <> 'team'::text) OR (team_id IS NOT NULL))),
-    CONSTRAINT event_handlers_trigger_shape CHECK (((kind <> 'trigger'::text) OR ((prompt_id IS NOT NULL) AND (breaker_threshold IS NOT NULL) AND (min_autonomy_suitability IS NOT NULL) AND (default_priority IS NULL) AND (sort_order IS NULL) AND (name IS NULL)))),
-    CONSTRAINT event_handlers_visibility_check CHECK ((visibility = ANY (ARRAY['private'::text, 'team'::text, 'org'::text])))
+    CONSTRAINT event_handlers_trigger_shape CHECK (((kind <> 'trigger'::text) OR ((prompt_id IS NOT NULL) AND (breaker_threshold IS NOT NULL) AND (min_autonomy_suitability IS NOT NULL) AND (default_priority IS NULL) AND (sort_order IS NULL) AND (name IS NULL))))
 );
 
 
@@ -1096,8 +1094,7 @@ CREATE TABLE public.prompts (
     id text DEFAULT (gen_random_uuid())::text NOT NULL,
     org_id uuid NOT NULL,
     creator_user_id uuid,
-    team_id uuid,
-    visibility text DEFAULT 'team'::text NOT NULL,
+    team_id uuid NOT NULL,
     name text NOT NULL,
     body text NOT NULL,
     source text DEFAULT 'user'::text NOT NULL,
@@ -1109,10 +1106,9 @@ CREATE TABLE public.prompts (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     model text DEFAULT ''::text NOT NULL,
+    system_slug text,
     CONSTRAINT prompts_source_check CHECK ((source = ANY (ARRAY['system'::text, 'user'::text, 'imported'::text]))),
-    CONSTRAINT prompts_system_has_no_creator CHECK ((((source = 'system'::text) AND (creator_user_id IS NULL)) OR ((source <> 'system'::text) AND (creator_user_id IS NOT NULL)))),
-    CONSTRAINT prompts_team_visibility_requires_team CHECK (((visibility <> 'team'::text) OR (team_id IS NOT NULL))),
-    CONSTRAINT prompts_visibility_check CHECK ((visibility = ANY (ARRAY['private'::text, 'team'::text, 'org'::text])))
+    CONSTRAINT prompts_system_has_no_creator CHECK ((((source = 'system'::text) AND (creator_user_id IS NULL)) OR ((source <> 'system'::text) AND (creator_user_id IS NOT NULL))))
 );
 
 
@@ -1623,6 +1619,17 @@ ALTER TABLE ONLY public.event_handlers
 
 
 --
+-- Name: event_handlers event_handlers_org_team_slug_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+-- Per-team re-seed idempotency key: one copy of each shipped handler per team
+-- (same system_slug, distinct team_id); NULLs distinct so user handlers never
+-- collide (SKY-380).
+ALTER TABLE ONLY public.event_handlers
+    ADD CONSTRAINT event_handlers_org_team_slug_key UNIQUE (org_id, team_id, system_slug);
+
+
+--
 -- Name: events_catalog events_catalog_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -1812,6 +1819,28 @@ ALTER TABLE ONLY public.projects
 
 ALTER TABLE ONLY public.prompts
     ADD CONSTRAINT prompts_id_org_id_key UNIQUE (id, org_id);
+
+
+--
+-- Name: prompts prompts_id_team_id_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+-- Parent key for the same-team composite FKs (event_handlers.prompt_id,
+-- prompt_chain_steps.chain_prompt_id / step_prompt_id) so a trigger / chain
+-- step can only bind a prompt its own team owns (SKY-380).
+ALTER TABLE ONLY public.prompts
+    ADD CONSTRAINT prompts_id_team_id_key UNIQUE (id, team_id);
+
+
+--
+-- Name: prompts prompts_org_team_slug_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+-- Per-team re-seed idempotency key: one copy of each shipped prompt per team
+-- (same system_slug, distinct team_id); NULLs distinct so user prompts never
+-- collide (SKY-380).
+ALTER TABLE ONLY public.prompts
+    ADD CONSTRAINT prompts_org_team_slug_key UNIQUE (org_id, team_id, system_slug);
 
 
 --
@@ -2646,11 +2675,24 @@ ALTER TABLE ONLY public.event_handlers
 
 
 --
+-- Name: event_handlers event_handlers_prompt_id_team_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+-- Same-team guard (SKY-380): a trigger may only bind a prompt its own team
+-- owns. (prompt_id, team_id) -> prompts(id, team_id) refuses a handler whose
+-- team_id doesn't match the referenced prompt's team. NULL prompt_id (rules)
+-- skips the FK. CASCADE mirrors the org FK so a prompt delete still removes
+-- its triggers.
+ALTER TABLE ONLY public.event_handlers
+    ADD CONSTRAINT event_handlers_prompt_id_team_id_fkey FOREIGN KEY (prompt_id, team_id) REFERENCES public.prompts(id, team_id) ON DELETE CASCADE;
+
+
+--
 -- Name: event_handlers event_handlers_team_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
 --
 
 ALTER TABLE ONLY public.event_handlers
-    ADD CONSTRAINT event_handlers_team_id_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id) ON DELETE SET NULL;
+    ADD CONSTRAINT event_handlers_team_id_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id) ON DELETE CASCADE;
 
 
 --
@@ -2954,7 +2996,7 @@ ALTER TABLE ONLY public.prompts
 --
 
 ALTER TABLE ONLY public.prompts
-    ADD CONSTRAINT prompts_team_id_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id) ON DELETE SET NULL;
+    ADD CONSTRAINT prompts_team_id_fkey FOREIGN KEY (team_id) REFERENCES public.teams(id) ON DELETE CASCADE;
 
 
 --
@@ -3464,30 +3506,30 @@ ALTER TABLE public.event_handlers ENABLE ROW LEVEL SECURITY;
 -- Name: event_handlers event_handlers_delete; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY event_handlers_delete ON public.event_handlers FOR DELETE USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND (((visibility = 'private'::text) AND (creator_user_id = tf.current_user_id())) OR ((visibility = 'team'::text) AND tf.user_in_team(team_id)))));
+CREATE POLICY event_handlers_delete ON public.event_handlers FOR DELETE USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND tf.user_in_team(team_id)));
 
 
 --
 -- Name: event_handlers event_handlers_insert; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY event_handlers_insert ON public.event_handlers FOR INSERT WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND (creator_user_id = tf.current_user_id()) AND ((visibility <> 'team'::text) OR ((team_id IS NOT NULL) AND tf.user_in_team(team_id))) AND ((visibility <> 'org'::text) OR tf.user_is_org_admin(org_id))));
+CREATE POLICY event_handlers_insert ON public.event_handlers FOR INSERT WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND (creator_user_id = tf.current_user_id()) AND tf.user_in_team(team_id)));
 
 
 --
 -- Name: event_handlers event_handlers_select; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY event_handlers_select ON public.event_handlers FOR SELECT USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND ((creator_user_id = tf.current_user_id()) OR ((visibility = 'team'::text) AND (team_id IS NOT NULL) AND (EXISTS ( SELECT 1
+CREATE POLICY event_handlers_select ON public.event_handlers FOR SELECT USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND ((creator_user_id = tf.current_user_id()) OR (EXISTS ( SELECT 1
    FROM public.memberships m
-  WHERE ((m.user_id = tf.current_user_id()) AND (m.team_id = event_handlers.team_id))))) OR (visibility = 'org'::text))));
+  WHERE ((m.user_id = tf.current_user_id()) AND (m.team_id = event_handlers.team_id)))))));
 
 
 --
 -- Name: event_handlers event_handlers_update; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY event_handlers_update ON public.event_handlers FOR UPDATE USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND ((creator_user_id = tf.current_user_id()) OR ((visibility = 'team'::text) AND tf.user_in_team(team_id)) OR ((visibility = 'org'::text) AND tf.user_is_org_admin(org_id))))) WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND ((creator_user_id = tf.current_user_id()) OR ((visibility = 'team'::text) AND tf.user_in_team(team_id)) OR ((visibility = 'org'::text) AND tf.user_is_org_admin(org_id)))));
+CREATE POLICY event_handlers_update ON public.event_handlers FOR UPDATE USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND tf.user_in_team(team_id))) WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND tf.user_in_team(team_id)));
 
 
 --
@@ -3895,30 +3937,30 @@ ALTER TABLE public.prompts ENABLE ROW LEVEL SECURITY;
 -- Name: prompts prompts_delete; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY prompts_delete ON public.prompts FOR DELETE USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND (((visibility = 'private'::text) AND (creator_user_id = tf.current_user_id())) OR ((visibility = 'team'::text) AND (team_id IS NOT NULL) AND tf.user_in_team(team_id)))));
+CREATE POLICY prompts_delete ON public.prompts FOR DELETE USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND tf.user_in_team(team_id)));
 
 
 --
 -- Name: prompts prompts_insert; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY prompts_insert ON public.prompts FOR INSERT WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND (creator_user_id = tf.current_user_id()) AND ((visibility <> 'team'::text) OR ((team_id IS NOT NULL) AND tf.user_in_team(team_id))) AND ((visibility <> 'org'::text) OR tf.user_is_org_admin(org_id))));
+CREATE POLICY prompts_insert ON public.prompts FOR INSERT WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND (creator_user_id = tf.current_user_id()) AND tf.user_in_team(team_id)));
 
 
 --
 -- Name: prompts prompts_select; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY prompts_select ON public.prompts FOR SELECT USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND ((creator_user_id = tf.current_user_id()) OR ((visibility = 'team'::text) AND (team_id IS NOT NULL) AND (EXISTS ( SELECT 1
+CREATE POLICY prompts_select ON public.prompts FOR SELECT USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND ((creator_user_id = tf.current_user_id()) OR (EXISTS ( SELECT 1
    FROM public.memberships m
-  WHERE ((m.user_id = tf.current_user_id()) AND (m.team_id = prompts.team_id))))) OR (visibility = 'org'::text))));
+  WHERE ((m.user_id = tf.current_user_id()) AND (m.team_id = prompts.team_id)))))));
 
 
 --
 -- Name: prompts prompts_update; Type: POLICY; Schema: public; Owner: -
 --
 
-CREATE POLICY prompts_update ON public.prompts FOR UPDATE USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND (((visibility = 'private'::text) AND (creator_user_id = tf.current_user_id())) OR ((visibility = 'team'::text) AND (team_id IS NOT NULL) AND tf.user_in_team(team_id)) OR ((visibility = 'org'::text) AND tf.user_is_org_admin(org_id))))) WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND (((visibility = 'private'::text) AND (creator_user_id = tf.current_user_id())) OR ((visibility = 'team'::text) AND (team_id IS NOT NULL) AND tf.user_in_team(team_id)) OR ((visibility = 'org'::text) AND tf.user_is_org_admin(org_id)))));
+CREATE POLICY prompts_update ON public.prompts FOR UPDATE USING (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND tf.user_in_team(team_id))) WITH CHECK (((org_id = tf.current_org_id()) AND tf.user_has_org_access(org_id) AND tf.user_in_team(team_id)));
 
 
 --
@@ -5098,6 +5140,7 @@ INSERT INTO events_catalog (id, source, category, label, description) VALUES
 
 CREATE TABLE public.prompt_chain_steps (
     org_id uuid NOT NULL,
+    team_id uuid NOT NULL,
     chain_prompt_id text NOT NULL,
     step_index integer NOT NULL,
     step_prompt_id text NOT NULL,
@@ -5149,6 +5192,14 @@ ALTER TABLE ONLY public.prompt_chain_steps
     ADD CONSTRAINT prompt_chain_steps_chain_prompt_fkey FOREIGN KEY (chain_prompt_id, org_id) REFERENCES public.prompts(id, org_id) ON DELETE CASCADE;
 ALTER TABLE ONLY public.prompt_chain_steps
     ADD CONSTRAINT prompt_chain_steps_step_prompt_fkey  FOREIGN KEY (step_prompt_id,  org_id) REFERENCES public.prompts(id, org_id) ON DELETE RESTRICT;
+-- Same-team guards (SKY-380): both the chain prompt and every step resolve
+-- against prompts(id, team_id), so a chain can only step through prompts its
+-- own team owns. The writer derives team_id from the chain prompt, making the
+-- chain FK a tautology and the step FK the real cross-team refusal.
+ALTER TABLE ONLY public.prompt_chain_steps
+    ADD CONSTRAINT prompt_chain_steps_chain_prompt_team_fkey FOREIGN KEY (chain_prompt_id, team_id) REFERENCES public.prompts(id, team_id) ON DELETE CASCADE;
+ALTER TABLE ONLY public.prompt_chain_steps
+    ADD CONSTRAINT prompt_chain_steps_step_prompt_team_fkey  FOREIGN KEY (step_prompt_id,  team_id) REFERENCES public.prompts(id, team_id) ON DELETE RESTRICT;
 
 ALTER TABLE ONLY public.chain_runs
     ADD CONSTRAINT chain_runs_org_id_fkey          FOREIGN KEY (org_id)          REFERENCES public.orgs(id) ON DELETE CASCADE;
@@ -5167,9 +5218,9 @@ ALTER TABLE ONLY public.runs
 ALTER TABLE public.prompt_chain_steps ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.chain_runs         ENABLE ROW LEVEL SECURITY;
 
--- prompt_chain_steps inherits the chain prompt's visibility — if the
+-- prompt_chain_steps inherits the chain prompt's access — if the
 -- caller can't see the parent prompt, they can't see its step list.
--- prompts RLS already applies creator + team/org visibility rules.
+-- prompts RLS already applies creator + team-membership rules.
 -- The EXISTS subquery joins on p.org_id = prompt_chain_steps.org_id
 -- because prompts.id is text and can collide across orgs.
 CREATE POLICY prompt_chain_steps_all ON public.prompt_chain_steps FOR ALL
