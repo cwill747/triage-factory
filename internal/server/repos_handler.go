@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
@@ -48,6 +49,30 @@ func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "failed to fetch repos: " + err.Error()})
 		return
 	}
+
+	// Warm the reachable-repo enumeration cache (SKY-409) so the
+	// immediate-next team-repos PUT validates the selection against this
+	// in-memory set in ~µs instead of re-enumerating the org. We just paid
+	// for the enumeration; the gate shouldn't pay for it again. Only the
+	// lowercased slug set is needed for the membership check, so we keep
+	// that rather than the full UserRepo slice. TTL-bounded and evicted on
+	// SetOnGitHubChanged.
+	//
+	// NB: this is warmed from ListUserRepos (PAT only), so the cached set is
+	// PAT-derived. That matches what the picker shows today (also PAT only),
+	// so the hot-path gate can't reject a repo the user could actually have
+	// selected. The cold-path fan-out additionally probes App-installation
+	// clients, so a repo reachable *only* via an App install would pass a
+	// cache-miss PUT but be rejected by a cache-hit one. Harmless until the
+	// picker itself sources App repos — at which point this warm must union
+	// the same App sources. Tracked in SKY-410.
+	slugs := make(map[string]struct{}, len(repos))
+	for _, repo := range repos {
+		if repo.FullName != "" {
+			slugs[strings.ToLower(repo.FullName)] = struct{}{}
+		}
+	}
+	s.reachableRepoCachePut(orgID, userID, slugs)
 
 	writeJSON(w, http.StatusOK, repos)
 }

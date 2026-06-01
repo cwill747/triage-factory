@@ -160,6 +160,98 @@ type Server struct {
 	// both call GitHub's conversion endpoint, and leave an orphan
 	// App. Same sync.Map pattern as projectMutexes.
 	githubAppRegMu sync.Map // map[orgID]*sync.Mutex
+
+	// reachableRepoMu guards reachableRepoCache — the in-process
+	// enumeration cache the team-repos write gate consults before
+	// re-enumerating the org (SKY-409). The picker
+	// (handleGitHubRepos) warms it on the way out; the immediate-next
+	// PUT /api/settings/team/{id}/repos validates against this set in
+	// ~µs instead of paying the full ListUserRepos cost a second time.
+	// Entries are TTL-bounded (reachableCacheTTL) and evicted per-org
+	// when GitHub creds/installations rotate (SetOnGitHubChanged).
+	reachableRepoMu    sync.RWMutex
+	reachableRepoCache map[string]reachableRepoEntry // key: orgID\x00userID
+}
+
+// reachableRepoEntry is one cached picker enumeration: the lowercased
+// "owner/repo" slug set the user's GitHub credential can reach, plus the
+// wall-clock instant the entry stops being trusted.
+type reachableRepoEntry struct {
+	set       map[string]struct{}
+	expiresAt time.Time
+}
+
+// reachableCacheTTL bounds how long a picker enumeration is trusted to satisfy
+// a write. Long enough to cover the realistic "open picker → think → click
+// Continue" window; short enough that a stale enumeration can't mask a
+// credential revocation for more than a few minutes (eviction on
+// SetOnGitHubChanged handles the explicit-rotation case immediately).
+const reachableCacheTTL = 3 * time.Minute
+
+// reachableCacheKey namespaces the cache per (orgID, userID). A NUL separator
+// keeps two orgs/users whose IDs would otherwise concatenate ambiguously from
+// colliding.
+func reachableCacheKey(orgID, userID string) string {
+	return orgID + "\x00" + userID
+}
+
+// reachableRepoCacheGet returns the cached reachable slug set for (orgID,
+// userID) when present and unexpired. A miss (absent or stale) returns
+// (nil, false); a stale entry is reclaimed by the next put's sweep or an
+// org evict (the read path holds only an RLock and so can't delete).
+func (s *Server) reachableRepoCacheGet(orgID, userID string) (map[string]struct{}, bool) {
+	s.reachableRepoMu.RLock()
+	defer s.reachableRepoMu.RUnlock()
+	e, ok := s.reachableRepoCache[reachableCacheKey(orgID, userID)]
+	if !ok || time.Now().After(e.expiresAt) {
+		return nil, false
+	}
+	return e.set, true
+}
+
+// reachableRepoCachePut stores the picker enumeration for (orgID, userID) with
+// a fresh TTL. The set is stored by reference — callers must not mutate it
+// after handing it over.
+//
+// It also opportunistically sweeps already-expired entries while it holds the
+// write lock. Reads return a miss on expiry but can't delete (RLock only), so
+// without this the map would retain every distinct (orgID, userID) ever seen.
+// A put happens once per picker fetch, so the very workload that would grow
+// the map unboundedly — many distinct pairs churning through — is also what
+// drives the sweep, keeping it to roughly the live set.
+func (s *Server) reachableRepoCachePut(orgID, userID string, set map[string]struct{}) {
+	now := time.Now()
+	s.reachableRepoMu.Lock()
+	defer s.reachableRepoMu.Unlock()
+	if s.reachableRepoCache == nil {
+		s.reachableRepoCache = make(map[string]reachableRepoEntry)
+	}
+	for k, e := range s.reachableRepoCache {
+		if now.After(e.expiresAt) {
+			delete(s.reachableRepoCache, k)
+		}
+	}
+	s.reachableRepoCache[reachableCacheKey(orgID, userID)] = reachableRepoEntry{
+		set:       set,
+		expiresAt: now.Add(reachableCacheTTL),
+	}
+}
+
+// evictReachableRepoCache drops every cached enumeration for the org. Called
+// when the org's GitHub credentials or App installations rotate
+// (SetOnGitHubChanged): a stale enumeration built under the old credential
+// must not satisfy a write under the new one. Entries are keyed
+// orgID\x00userID, so we evict by orgID prefix to clear all of the org's
+// users at once.
+func (s *Server) evictReachableRepoCache(orgID string) {
+	prefix := orgID + "\x00"
+	s.reachableRepoMu.Lock()
+	defer s.reachableRepoMu.Unlock()
+	for k := range s.reachableRepoCache {
+		if strings.HasPrefix(k, prefix) {
+			delete(s.reachableRepoCache, k)
+		}
+	}
 }
 
 // projectMutex returns the per-project mutex for serializing
@@ -697,8 +789,25 @@ func (s *Server) SetCurator(c *curator.Curator) {
 // SetOnGitHubChanged registers a callback for GitHub config changes (creds, URL, repos).
 // This triggers a full restart: invalidate profiles → stop all pollers → re-profile → restart.
 // The orgID is the tenant whose creds changed — closure re-resolves via SecretStore.
+//
+// The registered callback is wrapped so the reachable-repo enumeration cache
+// (SKY-409) is evicted for the org *before* the restart logic runs: a creds
+// rotation, App install, or repo-set change can move which repos the org can
+// reach, and a stale cached enumeration must never satisfy the next write.
+//
+// Handlers fire this callback in a goroutine (the restart is slow), so the
+// eviction is asynchronous: a second write landing in the same instant as a
+// first could still read the pre-eviction cache. That race is benign — the
+// cache was just validated as correct, and the near-simultaneous second write
+// is still checked against it. Eviction exists to retire a *stale* enumeration
+// over the TTL window, not to serialize against a concurrent write.
 func (s *Server) SetOnGitHubChanged(fn func(orgID string)) {
-	s.onGitHubChanged = fn
+	s.onGitHubChanged = func(orgID string) {
+		s.evictReachableRepoCache(orgID)
+		if fn != nil {
+			fn(orgID)
+		}
+	}
 }
 
 // SetOnJiraChanged registers a callback for Jira config changes.
