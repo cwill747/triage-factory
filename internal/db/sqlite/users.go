@@ -20,39 +20,47 @@ func newUsersStore(q, _ queryer) db.UsersStore { return &usersStore{q: q} }
 
 var _ db.UsersStore = (*usersStore)(nil)
 
-func (s *usersStore) GetGitHubUsername(ctx context.Context, userID string) (string, error) {
-	var login sql.NullString
+func (s *usersStore) GetGitHubLogin(ctx context.Context, userID, githubBaseURL string) (string, error) {
+	var login string
 	err := s.q.QueryRowContext(ctx,
-		`SELECT github_username FROM users WHERE id = ?`,
-		userID,
+		`SELECT login FROM user_github_identities WHERE user_id = ? AND github_base_url = ?`,
+		userID, db.NormalizeGitHubHost(githubBaseURL),
 	).Scan(&login)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read users.github_username: %w", err)
+		return "", fmt.Errorf("read user_github_identities.login: %w", err)
 	}
-	return login.String, nil
+	return login, nil
 }
 
-func (s *usersStore) SetGitHubUsername(ctx context.Context, userID, login string) error {
-	var val any
-	if login != "" {
-		val = login
-	} // else val stays nil → NULL
-	result, err := s.q.ExecContext(ctx,
-		`UPDATE users SET github_username = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
-		val, userID,
-	)
+func (s *usersStore) UpsertGitHubIdentity(ctx context.Context, userID, githubBaseURL, login, source string) error {
+	// FK on user_id enforces the row-exists contract: a missing user
+	// surfaces as a FOREIGN KEY constraint error, matching the old
+	// SetGitHubUsername "user not found" guard.
+	_, err := s.q.ExecContext(ctx, `
+		INSERT INTO user_github_identities
+			(user_id, github_base_url, login, source, verified_at, created_at, updated_at)
+		VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+		ON CONFLICT(user_id, github_base_url) DO UPDATE SET
+			login       = excluded.login,
+			source      = excluded.source,
+			verified_at = excluded.verified_at,
+			updated_at  = CURRENT_TIMESTAMP
+	`, userID, db.NormalizeGitHubHost(githubBaseURL), login, source)
 	if err != nil {
-		return fmt.Errorf("update users.github_username: %w", err)
+		return fmt.Errorf("upsert user_github_identities: %w", err)
 	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("read users.github_username update result: %w", err)
-	}
-	if rows == 0 {
-		return fmt.Errorf("update users.github_username: user %q not found", userID)
+	return nil
+}
+
+func (s *usersStore) ClearGitHubIdentity(ctx context.Context, userID, githubBaseURL string) error {
+	if _, err := s.q.ExecContext(ctx,
+		`DELETE FROM user_github_identities WHERE user_id = ? AND github_base_url = ?`,
+		userID, db.NormalizeGitHubHost(githubBaseURL),
+	); err != nil {
+		return fmt.Errorf("delete user_github_identities: %w", err)
 	}
 	return nil
 }
@@ -91,8 +99,8 @@ func (s *usersStore) GetJiraIdentitySystem(ctx context.Context, userID string) (
 	return s.GetJiraIdentity(ctx, userID)
 }
 
-func (s *usersStore) GetGitHubUsernameSystem(ctx context.Context, userID string) (string, error) {
-	return s.GetGitHubUsername(ctx, userID)
+func (s *usersStore) GetGitHubLoginSystem(ctx context.Context, userID, githubBaseURL string) (string, error) {
+	return s.GetGitHubLogin(ctx, userID, githubBaseURL)
 }
 
 func (s *usersStore) SetJiraIdentity(ctx context.Context, userID, accountID, displayName string) error {
