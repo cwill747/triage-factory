@@ -16,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/sky-ai-eng/triage-factory/internal/paths"
 )
 
 // alpineCommunityRepo is the community repository URL for the alpine
@@ -58,10 +60,6 @@ func ensureRootfs(ctx context.Context) (string, error) {
 }
 
 func doEnsureRootfs(ctx context.Context) (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("rootfs: resolve home: %w", err)
-	}
 	// Cache key hashes (alpine sha, package set). Adding a package to
 	// apkPackages changes the key and forces a fresh extraction so we
 	// never serve a cached rootfs whose toolchain doesn't match the
@@ -71,7 +69,15 @@ func doEnsureRootfs(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("rootfs: %w", err)
 	}
-	cacheDir := filepath.Join(home, ".triagefactory", "sandbox", "rootfs-"+cacheKey)
+	// Surface a missing $HOME as an error (the pre-paths behavior) rather
+	// than letting the error-free SandboxRootfsDir panic underneath.
+	if _, err := paths.StateRootErr(); err != nil {
+		return "", fmt.Errorf("rootfs: %w", err)
+	}
+	// Host-global cache: shared read-only across all tenants, so it hangs
+	// off the state root with no org segment (org-scoping it would
+	// re-extract an identical toolchain per org).
+	cacheDir := paths.SandboxRootfsDir(cacheKey)
 
 	// Sentinel file marking a successful extraction + toolchain
 	// install. Distinguishes "fully populated cache" from "crashed

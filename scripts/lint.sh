@@ -65,6 +65,39 @@ else
   fail=1
 fi
 
+# forbidigo (in .golangci.yml) bans os.UserHomeDir outside internal/paths,
+# but its AST matcher can't see string literals — so the ".triagefactory"
+# path literal needs this companion grep. It must catch both the
+# double-quoted and the backtick raw-string forms (".triagefactory",
+# `.triagefactory`, "~/.triagefactory/...") while NOT tripping on:
+#   - the same path quoted inside a doc comment (a backtick-quoted path in
+#     a comment is textually identical to a raw-string literal), and
+#   - the triagefactory.com marketing domain in URLs.
+# So: strip // line comments first, then match .triagefactory only as a
+# path *segment* — flanked by a quote/backtick/slash/tilde and ending the
+# segment with / or a closing quote/backtick (the domain is followed by
+# ".com", so it's excluded). internal/paths owns the literal;
+# internal/curator/knowledge.go is a temporary exception until SKY-402
+# routes the curator runtime through paths; test files may reference it.
+blue "paths state-literal guard"
+go_src=$(git ls-files '*.go' \
+  | grep -v '_test\.go$' \
+  | grep -v '^internal/paths/' \
+  | grep -v '^internal/curator/knowledge\.go$' || true)
+literal_offenders=""
+for f in $go_src; do
+  if sed 's://.*::' "$f" | grep -qE '[`"/~]\.triagefactory[/"`]'; then
+    literal_offenders+="$f"$'\n'
+  fi
+done
+if [[ -n "$literal_offenders" ]]; then
+  red '".triagefactory" path literal found outside internal/paths — use a paths.* resolver:'
+  echo "$literal_offenders"
+  fail=1
+else
+  green "paths state-literal guard OK"
+fi
+
 # --- Frontend ---------------------------------------------------------------
 blue "prettier"
 cd frontend
