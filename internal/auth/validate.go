@@ -1,7 +1,9 @@
 package auth
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -10,6 +12,14 @@ import (
 )
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
+
+// ErrGitHubHostUnreachable wraps the network-level failure of a call to a
+// GitHub host (DNS, dial, TLS, timeout) — the case where TF's backend
+// couldn't reach the host at all, as distinct from the host answering with
+// an auth/permission error. The Connect OAuth handler keys on this via
+// errors.Is to render the "we tried to reach the host and couldn't"
+// onboarding state separately from "you haven't connected yet."
+var ErrGitHubHostUnreachable = errors.New("github host unreachable")
 
 // GitHubUser is the subset of fields we extract from the GitHub user endpoint.
 type GitHubUser struct {
@@ -44,7 +54,7 @@ func (u JiraUser) StableID() string {
 }
 
 // ValidateGitHub checks the PAT against the GitHub API and returns the user info.
-func ValidateGitHub(baseURL, pat string) (*GitHubUser, error) {
+func ValidateGitHub(ctx context.Context, baseURL, pat string) (*GitHubUser, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
 
 	// github.com API lives at api.github.com; GHE uses {host}/api/v3
@@ -55,7 +65,7 @@ func ValidateGitHub(baseURL, pat string) (*GitHubUser, error) {
 		apiURL = baseURL + "/api/v3/user"
 	}
 
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
@@ -65,7 +75,7 @@ func ValidateGitHub(baseURL, pat string) (*GitHubUser, error) {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("unreachable: %w", err)
+		return nil, fmt.Errorf("%w: %v", ErrGitHubHostUnreachable, err)
 	}
 	defer resp.Body.Close()
 
@@ -93,11 +103,11 @@ func ValidateGitHub(baseURL, pat string) (*GitHubUser, error) {
 }
 
 // ValidateJira checks the PAT against the Jira API and returns the user info.
-func ValidateJira(baseURL, pat string) (*JiraUser, error) {
+func ValidateJira(ctx context.Context, baseURL, pat string) (*JiraUser, error) {
 	baseURL = strings.TrimRight(baseURL, "/")
 	apiURL := baseURL + "/rest/api/2/myself"
 
-	req, err := http.NewRequest("GET", apiURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, apiURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
 	}
