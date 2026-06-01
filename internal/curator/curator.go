@@ -10,6 +10,8 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -34,9 +36,16 @@ type Curator struct {
 	// SetRunCredentialResolvers. modelFor supersedes the process-global
 	// model above; secrets feeds RunOptions.Secrets. Tests leave both nil
 	// and fall back to model / the ambient-subscription path.
-	secrets  agentproc.SecretsReader
-	modelFor func(context.Context, string, string) string
-	sessions map[string]*projectSession // projectID → goroutine handle
+	//
+	// ghResolver is the per-(org, owner) GitHub credential source used to
+	// authenticate the host-side pinned-repo worktree refresh
+	// (materializePinnedRepos → EnsureCuratorWorktree) for private repos in
+	// multi mode. Nil in tests / when unset — the refresh then runs with no
+	// injected credential (the unauthenticated path).
+	secrets    agentproc.SecretsReader
+	modelFor   func(context.Context, string, string) string
+	ghResolver ghclient.Resolver
+	sessions   map[string]*projectSession // projectID → goroutine handle
 
 	// closed is set during Shutdown; SendMessage rejects after this.
 	closed bool
@@ -64,18 +73,48 @@ func New(database *sql.DB, stores db.Stores, wsHub *websocket.Hub, model string)
 	}
 }
 
-// SetRunCredentialResolvers wires the per-org run-credential seam
-// (SKY-389): the per-org LLM-credential reader (nil in local → ambient
-// subscription; system-door reader in multi) and the per-(org, team)
-// default-model resolver. Both modes resolve through these so credential
-// resolution stops branching on mode. Set once at startup, post-New. Either
-// may be nil; resolveModel falls back to the constructor-supplied model and
-// a nil secrets reader yields the local ambient-subscription fallback.
-func (c *Curator) SetRunCredentialResolvers(secrets agentproc.SecretsReader, modelFor func(context.Context, string, string) string) {
+// SetRunCredentialResolvers wires the per-org run-credential seam: the GitHub
+// credential resolver (used to authenticate private pinned-repo refreshes
+// host-side), the per-org LLM-credential reader (SKY-389 — nil in
+// local → ambient subscription; system-door reader in multi), and the
+// per-(org, team) default-model resolver. Both modes resolve through these so
+// credential resolution stops branching on mode. Set once at startup,
+// post-New. Any may be nil; resolveModel falls back to the constructor model,
+// a nil secrets reader yields the ambient-subscription fallback, and a nil
+// resolver makes the pinned-repo refresh credential-free (the prior
+// path). Signature mirrors Spawner.SetRunCredentialResolvers for symmetry.
+func (c *Curator) SetRunCredentialResolvers(resolver ghclient.Resolver, secrets agentproc.SecretsReader, modelFor func(context.Context, string, string) string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.ghResolver = resolver
 	c.secrets = secrets
 	c.modelFor = modelFor
+}
+
+// cloneTokenFor resolves the App installation token for a host-side fetch of
+// a pinned repo owned by owner, via the GitHub resolver. Multi-mode only, to
+// match the spawner (Spawner.resolveCloneToken) and keep local pinned-repo
+// refreshes on their existing path (operator SSH key / anonymous HTTPS) —
+// local behavior is unchanged by this ticket. Returns "" when local, when no
+// resolver is wired, or when resolution fails; the refresh then runs with no
+// injected credential. Logged-not-fatal: the refresh is already best-effort
+// per repo.
+func (c *Curator) cloneTokenFor(ctx context.Context, orgID, owner string) string {
+	if runmode.Current() == runmode.ModeLocal {
+		return ""
+	}
+	c.mu.Lock()
+	resolver := c.ghResolver
+	c.mu.Unlock()
+	if resolver == nil {
+		return ""
+	}
+	tok, err := resolver.TokenFor(ctx, orgID, owner)
+	if err != nil {
+		log.Printf("[curator] resolve clone token for org %s owner %q: %v (refresh proceeds unauthenticated)", orgID, owner, err)
+		return ""
+	}
+	return tok.Value
 }
 
 // resolveModel resolves the project-owning team's default model via the
@@ -162,8 +201,9 @@ func (c *Curator) SendMessage(ctx context.Context, projectID, orgID, creatorUser
 	if session == nil {
 		// Best-effort cancel on the package-level helper — the
 		// "curator is shut down" path runs from the handler goroutine
-		// (not the per-project goroutine) and is covered by the D9
-		// handler sweep. SKY-253.
+		// (not the per-project goroutine).
+		// TODO(SKY-401): raw c.database write with no claims — rejected under
+		// multi-mode RLS; route via the admin pool (…System variant).
 		_, _ = db.MarkCuratorRequestCancelledIfActive(c.database, requestID, "curator is shut down")
 		return "", errors.New("curator is shut down")
 	}
@@ -177,6 +217,8 @@ func (c *Curator) SendMessage(ctx context.Context, projectID, orgID, creatorUser
 		// Queue is full — should not happen at the per-project depth
 		// we configure, but if it ever does, fail the row up-front
 		// rather than blocking the HTTP handler.
+		// TODO(SKY-401): same raw c.database / no-claims RLS gap as the
+		// shutdown path above — route via the admin pool.
 		_, _ = db.CompleteCuratorRequest(c.database, requestID, "failed", "curator queue full", 0, 0, 0)
 		c.broadcastRequestUpdate(orgID, projectID, requestID, "failed")
 		return "", errors.New("curator queue is full")
@@ -256,7 +298,7 @@ func (c *Curator) Shutdown() {
 // project to cancelled. Called from CancelProject (handler-side) and
 // from the fallback path in SendMessage when the curator is shut down.
 //
-// TODO(SKY-253/D9): both QueuedCuratorRequestsForProject and
+// TODO(SKY-401) (curator slice of the SKY-253/D9 claims sweep): both QueuedCuratorRequestsForProject and
 // MarkCuratorRequestCancelledIfActive run against *sql.DB without JWT
 // claims set. In multi-mode Postgres tf_app + RLS will hide the rows
 // from the SELECT and reject the UPDATE, leaving queued rows dangling
