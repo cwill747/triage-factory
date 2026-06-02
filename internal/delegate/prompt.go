@@ -184,12 +184,20 @@ func (s *Spawner) collectExtraTools(promptAllowedTools string) string {
 }
 
 type agentResult struct {
-	Status  string         `json:"status"`
-	Link    string         `json:"link"` // legacy — single URL
-	Summary string         `json:"summary"`
-	Links   map[string]any `json:"links"` // new — keyed URLs (pr_review, pr, jira_issues)
+	// Outcome is the single terminal vocabulary (continue|finish|abort|
+	// yield) — renamed from the legacy `status` field for clarity. See
+	// domain.RunOutcome and internal/ai/prompts/envelope.txt.
+	Outcome string `json:"outcome"`
+	// Summary is the always-present natural-language "what I did". Maps
+	// to runs.result_summary.
+	Summary string `json:"summary"`
+	// Reason is the natural-language "why I stopped / what a human needs
+	// to do" — populated only on an abort outcome. Maps to
+	// runs.outcome_reason, kept distinct from Summary.
+	Reason string         `json:"reason"`
+	Links  map[string]any `json:"links"` // keyed URLs (pr_review, pr, jira_issues)
 
-	// Yield is populated when Status == "yield". The agent is asking
+	// Yield is populated when Outcome == "yield". The agent is asking
 	// the user a question and the run should park in awaiting_input
 	// rather than completing. See domain.YieldRequest and SKY-139 /
 	// internal/ai/prompts/envelope.txt for the agent-facing contract.
@@ -198,11 +206,9 @@ type agentResult struct {
 
 // isValid reports whether the parsed envelope contains enough to act on.
 // Two terminal shapes are accepted:
-//   - completion / task_unsolvable: Summary is non-empty (the legacy
-//     contract — every successful or unsolvable envelope has a summary)
-//   - yield: Status == "yield" and the yield payload passes
-//     YieldRequest.Validate (known type, non-empty message, well-formed
-//     options for choice yields, no duplicate option ids)
+//   - continue / finish / abort: Summary is non-empty (every successful
+//     or stopped envelope carries a natural-language summary)
+//   - yield: a well-formed yield envelope (see isYield)
 //
 // Anything else is treated as "didn't parse cleanly" — the parser
 // falls through to its markdown-fence and brace-extraction paths
@@ -214,17 +220,47 @@ func (r *agentResult) isValid() bool {
 	if r.Summary != "" {
 		return true
 	}
-	if r.Status == "yield" && r.Yield != nil {
-		return r.Yield.Validate() == nil
+	return r.isYield()
+}
+
+// isYield reports whether this is a well-formed yield envelope: outcome
+// "yield" AND a yield payload that passes YieldRequest.Validate (known type,
+// non-empty message, well-formed options for choice yields, no duplicate
+// option ids). Both the run-completion yield routing and hasValidOutcome
+// gate on it so a "yield" carrying a missing/malformed payload is never
+// (a) parked in awaiting_input with a modal the user can't act on, nor
+// (b) waved through the outcome gate and then treated as a normal completion
+// that closes the task. A non-empty summary does NOT make a payload-less
+// yield valid — the payload is what the UI needs.
+func (r *agentResult) isYield() bool {
+	return r.Outcome == string(domain.RunOutcomeYield) && r.Yield != nil && r.Yield.Validate() == nil
+}
+
+// hasValidOutcome reports whether the envelope carries a usable outcome.
+// continue/finish need only the outcome token. abort additionally requires a
+// non-empty reason: abort is the agent's *voluntary* "I'm functioning but
+// choosing to stop" decision (involuntary death is the separate `failed`
+// status), so the why is exactly the thing worth collecting — a reasonless
+// abort is re-prompted by the outcome gate. yield requires a well-formed
+// payload (isYield) — otherwise a payload-less "yield" would satisfy the gate
+// and then fall through to the normal completion path. Looser than isValid
+// only in that a summary alone never substitutes for a missing/incomplete
+// outcome: a summary-only envelope parses but trips the gate.
+func (r *agentResult) hasValidOutcome() bool {
+	switch domain.RunOutcome(r.Outcome) {
+	case domain.RunOutcomeContinue, domain.RunOutcomeFinish:
+		return true
+	case domain.RunOutcomeAbort:
+		return r.Reason != ""
+	case domain.RunOutcomeYield:
+		return r.isYield()
+	default:
+		return false
 	}
-	return false
 }
 
 // PrimaryLink returns the most relevant URL from the result.
 func (r *agentResult) PrimaryLink() string {
-	if r.Link != "" {
-		return r.Link
-	}
 	for _, key := range []string{"pr_review", "pr"} {
 		if v, ok := r.Links[key]; ok {
 			if s, ok := v.(string); ok && s != "" {
@@ -242,11 +278,12 @@ func (r *agentResult) PrimaryLink() string {
 	return ""
 }
 
-// parseAgentResult extracts the structured {status, link, summary} JSON from
-// the agent's final message. Handles markdown fences, leading/trailing text.
-// Recognizes both completion envelopes (status: completed | task_unsolvable
-// with a non-empty summary) and yield envelopes (status: yield with a typed
-// yield payload — SKY-139). See agentResult.isValid for the acceptance rule.
+// parseAgentResult extracts the structured {outcome, summary, reason, links}
+// JSON from the agent's final message. Handles markdown fences, leading/
+// trailing text. Recognizes both completion envelopes (outcome: continue |
+// finish | abort with a non-empty summary) and yield envelopes (outcome:
+// yield with a typed yield payload — SKY-139). See agentResult.isValid for
+// the acceptance rule.
 func parseAgentResult(text string) *agentResult {
 	text = strings.TrimSpace(text)
 	if text == "" {
