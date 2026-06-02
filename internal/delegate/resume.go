@@ -113,6 +113,13 @@ func (s *Spawner) ResumeAfterYield(orgID, runID, agentMessage, userID string) er
 	cwd := run.WorktreePath
 	model := run.Model
 	taskCopy := *task
+	// The run's blueprint_run_id drives both the resumed env's memory namespace
+	// and processCompletion's namespacing + task disposition. Capture the raw
+	// value and derive the namespace (blueprint_run_id, else the run's own id)
+	// so the resumed agent reads/writes the same _scratch/entity-memory/
+	// <namespace>/ folder as the initial invocation.
+	blueprintRunID := run.BlueprintRunID
+	namespace := memoryNamespace(blueprintRunID, runID)
 	// trigger_type is non-null in the schema (the CHECK pairs it
 	// with creator_user_id nullability), so this fallback only
 	// defends against legacy / test fixture rows that left the
@@ -236,6 +243,7 @@ func (s *Spawner) ResumeAfterYield(orgID, runID, agentMessage, userID string) er
 			Model:             model,
 			RepoEnv:           repoEnv,
 			ExtraAllowedTools: extraTools,
+			Namespace:         namespace,
 		}, "manual", userID)
 		if ctx.Err() != nil {
 			// User cancelled mid-resume. ResumeWithMessage SIGKILLed
@@ -253,7 +261,7 @@ func (s *Spawner) ResumeAfterYield(orgID, runID, agentMessage, userID string) er
 			return
 		}
 
-		s.processCompletion(ctx, orgID, runID, taskCopy, outcome.Completion, cwd, sessionID, model, owner, repo, "manual", userID, extraTools)
+		s.processCompletion(ctx, orgID, runID, blueprintRunID, taskCopy, outcome.Completion, cwd, sessionID, model, owner, repo, "manual", userID, extraTools)
 	}()
 	return nil
 }
@@ -288,6 +296,15 @@ type ResumeOptions struct {
 	// invocation. Without this, MCP tools allowed on the first run
 	// would be rejected on resume.
 	ExtraAllowedTools string
+
+	// Namespace is the run's memory namespace — its blueprint_run_id, else the
+	// run's own id (see memoryNamespace). Exported to the resumed subprocess as
+	// TRIAGE_FACTORY_BLUEPRINT_RUN_ID so the agent's <entity_memory> contract
+	// names the same folder it read and wrote on the initial invocation.
+	// Required for the resume to stay consistent with the initial env; callers
+	// capture it from the run (ResumeAfterYield → run.BlueprintRunID, the
+	// completion gate → the namespace it computed).
+	Namespace string
 }
 
 // ResumeOutcome bundles what ResumeWithMessage returns: the raw
@@ -336,8 +353,8 @@ func (s *Spawner) ResumeWithMessage(ctx context.Context, orgID, runID, sessionID
 	// team) resolve — is what closes the mid-run model-drift gap: a config
 	// change between the initial invocation and this resume must never
 	// switch models underneath a single logical run. Both real callers
-	// capture and pass it (ResumeAfterYield → run.Model, runMemoryGate →
-	// the captured model); an empty value is a wiring bug, surfaced loudly.
+	// capture and pass it (ResumeAfterYield → run.Model, the completion
+	// gate → the captured model); an empty value is a wiring bug, surfaced loudly.
 	if opts.Model == "" {
 		return nil, fmt.Errorf("resume: missing model (caller must pass the model captured at run start)")
 	}
@@ -365,6 +382,14 @@ func (s *Spawner) ResumeWithMessage(ctx context.Context, orgID, runID, sessionID
 		// every prompt of the conversation.
 		"TRIAGE_FACTORY_RUN_ROOT=" + cwd,
 	}
+	// Mirror runAgent's memory-namespace export so the resumed agent writes
+	// into the same _scratch/entity-memory/<namespace>/ folder it used on the
+	// initial invocation (the completion-gate retry path depends on this, and a
+	// yield-resume continuing the work must land its memory in the same place).
+	if opts.Namespace == "" {
+		return nil, fmt.Errorf("resume: missing namespace (caller must pass the memory namespace captured at run start)")
+	}
+	extraEnv = append(extraEnv, "TRIAGE_FACTORY_BLUEPRINT_RUN_ID="+opts.Namespace)
 	// Preserve the initial run's GitHub repo context so gh subcommands
 	// in the resumed session keep their implicit --repo default. Without
 	// this, a resumed run on a GitHub task could suddenly fail any gh
