@@ -163,6 +163,117 @@ func RunBlueprintStoreConformance(t *testing.T, factory BlueprintStoreFactory) {
 		}
 	})
 
+	t.Run("CopyOnly_PromptInOneBlueprintOnly", func(t *testing.T) {
+		// The durable copy-only invariant: a prompt is a step in at most one
+		// blueprint. Adding it to a second blueprint must fail at the DB layer.
+		store, orgID, teamID, seedPrompt := factory(t)
+		ctx := context.Background()
+		bp1, err := store.SeedOrUpdate(ctx, orgID, teamID, domain.Blueprint{SystemSlug: "copyonly-bp1", Name: "BP1", Source: "system"})
+		if err != nil {
+			t.Fatalf("seed bp1: %v", err)
+		}
+		bp2, err := store.SeedOrUpdate(ctx, orgID, teamID, domain.Blueprint{SystemSlug: "copyonly-bp2", Name: "BP2", Source: "system"})
+		if err != nil {
+			t.Fatalf("seed bp2: %v", err)
+		}
+		p := seedPrompt(t, "shared")
+		if err := store.ReplaceSteps(ctx, orgID, bp1, []string{p}, nil); err != nil {
+			t.Fatalf("ReplaceSteps bp1: %v", err)
+		}
+		if err := store.ReplaceSteps(ctx, orgID, bp2, []string{p}, nil); err == nil {
+			t.Fatalf("ReplaceSteps bp2 with an already-owned prompt succeeded; want unique-constraint error")
+		}
+	})
+
+	t.Run("StepPromptOwner_ResolvesOwningBlueprint", func(t *testing.T) {
+		store, orgID, teamID, seedPrompt := factory(t)
+		ctx := context.Background()
+		bp, err := store.SeedOrUpdate(ctx, orgID, teamID, domain.Blueprint{SystemSlug: "owner-bp", Name: "Owner", Source: "system"})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		p := seedPrompt(t, "owned")
+		if err := store.ReplaceSteps(ctx, orgID, bp, []string{p}, nil); err != nil {
+			t.Fatalf("ReplaceSteps: %v", err)
+		}
+		owner, ok, err := store.StepPromptOwner(ctx, orgID, p)
+		if err != nil {
+			t.Fatalf("StepPromptOwner: %v", err)
+		}
+		if !ok || owner != bp {
+			t.Fatalf("StepPromptOwner = (%q, %v), want (%q, true)", owner, ok, bp)
+		}
+		// A prompt that isn't a step in any blueprint resolves to ok=false.
+		orphan := seedPrompt(t, "orphan")
+		if _, ok, err := store.StepPromptOwner(ctx, orgID, orphan); err != nil || ok {
+			t.Fatalf("StepPromptOwner(orphan) = (_, %v, %v), want (_, false, nil)", ok, err)
+		}
+	})
+
+	t.Run("SoftDelete_HidesFromRequestReadsButSystemResolves", func(t *testing.T) {
+		store, orgID, teamID, _ := factory(t)
+		ctx := context.Background()
+		bp, err := store.SeedOrUpdate(ctx, orgID, teamID, domain.Blueprint{SystemSlug: "softdel-bp", Name: "Soft", Source: "system"})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if err := store.Delete(ctx, orgID, bp); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		// Request-facing Get + List hide it.
+		if got, err := store.Get(ctx, orgID, bp); err != nil || got != nil {
+			t.Fatalf("Get after soft-delete = (%v, %v); want (nil, nil)", got, err)
+		}
+		list, err := store.List(ctx, orgID, teamID)
+		if err != nil {
+			t.Fatalf("list: %v", err)
+		}
+		for _, b := range list {
+			if b.ID == bp {
+				t.Fatalf("soft-deleted blueprint leaked into List")
+			}
+		}
+		// ...System still resolves it (in-flight runs / past-run timelines).
+		if got, err := store.GetSystem(ctx, orgID, bp); err != nil || got == nil {
+			t.Fatalf("GetSystem after soft-delete = (%v, %v); want a row", got, err)
+		}
+	})
+
+	t.Run("StepPromptOwner_FalseAfterBlueprintSoftDelete", func(t *testing.T) {
+		// Regression: StepPromptOwner must return ok=false once the owning
+		// blueprint is soft-deleted. The step row persists as an audit trail
+		// (RESTRICT FK), so without the deleted_at IS NULL join, StepPromptOwner
+		// incorrectly returns ok=true — blocking the prompt from being claimed by
+		// a new blueprint with a phantom 422.
+		store, orgID, teamID, seedPrompt := factory(t)
+		ctx := context.Background()
+		bp, err := store.SeedOrUpdate(ctx, orgID, teamID, domain.Blueprint{
+			SystemSlug: "softdel-owner-bp", Name: "SoftDelOwner", Source: "system",
+		})
+		if err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		p := seedPrompt(t, "paired-prompt")
+		if err := store.ReplaceSteps(ctx, orgID, bp, []string{p}, nil); err != nil {
+			t.Fatalf("ReplaceSteps: %v", err)
+		}
+		// Confirm the prompt is owned before deletion.
+		owner, ok, err := store.StepPromptOwner(ctx, orgID, p)
+		if err != nil || !ok || owner != bp {
+			t.Fatalf("pre-delete: StepPromptOwner = (%q, %v, %v); want (%q, true, nil)", owner, ok, err, bp)
+		}
+		// Soft-delete the owning blueprint (simulates the delete-pairing path).
+		if err := store.Delete(ctx, orgID, bp); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		// After soft-delete, StepPromptOwner must return ok=false so the prompt
+		// can be claimed by a new blueprint without a spurious 422.
+		_, ok, err = store.StepPromptOwner(ctx, orgID, p)
+		if err != nil || ok {
+			t.Fatalf("post-delete: StepPromptOwner = (_, %v, %v); want (_, false, nil)", ok, err)
+		}
+	})
+
 	t.Run("SeedOrUpdate_CtxCancellation_FailsFast", func(t *testing.T) {
 		store, orgID, teamID, _ := factory(t)
 		ctx, cancel := context.WithCancel(context.Background())
