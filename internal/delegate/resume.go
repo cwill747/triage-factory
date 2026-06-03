@@ -216,6 +216,11 @@ func (s *Spawner) ResumeAfterYield(orgID, runID, agentMessage, userID string) er
 			})
 			if ok {
 				s.broadcastRunUpdate(orgID, runID, "cancelled")
+				// Cancelled mid-resume: the run won't continue, so drop the
+				// snapshot taken when it parked. Same key/no-op semantics as
+				// failRun's discard (runID-keyed; harmless for a blueprint step,
+				// which terminateBlueprint cleans by blueprint_run_id).
+				s.discardWorkspaceSnapshot(cancelCtx, orgID, runID)
 			}
 		}
 
@@ -231,6 +236,21 @@ func (s *Spawner) ResumeAfterYield(orgID, runID, agentMessage, userID string) er
 		if owner != "" && repo != "" {
 			repoEnv = owner + "/" + repo
 		}
+
+		// Ensure the worktree is on disk before re-invoking the agent. Warm
+		// path: the parked worktree survived (the dormancy guards kept it) →
+		// ensureWorkspace returns it and rehydrate is a no-op. Cold path: it was
+		// swept / the host was lost / `/tmp` was wiped → rebuild it from the
+		// durable snapshot. The returned cwd may differ from run.WorktreePath
+		// after a cold rebuild, so use it for both the resume and the
+		// completion. cloneURL is empty: the local reboot case reuses the
+		// persistent bare, which needs no seeding.
+		resumeCwd, werr := s.ensureWorkspace(ctx, orgID, run, owner, repo, "")
+		if werr != nil {
+			s.failRun(orgID, runID, taskCopy.ID, "manual", userID, "ensure workspace before resume failed: "+werr.Error())
+			return
+		}
+		cwd = resumeCwd
 
 		// Resume routes every downstream write under the responding
 		// user's synthetic claims regardless of the run's original
