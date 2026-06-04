@@ -1,6 +1,7 @@
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { apiJSON, HttpError } from '../lib/apiClient'
 
 /**
  * Onboarding is the unified entry for an authenticated user with zero
@@ -10,10 +11,11 @@ import { useAuth } from '../contexts/AuthContext'
  * One page, two affordances, gated by a single instance flag
  * (`me.org_creation_enabled`, the inverse of TF_PREVENT_ORG_CREATION):
  *
- *   - creation allowed (default) → "Create your organization" with the
- *     "Start your Factory" CTA, plus a passive "or wait for an invite"
- *     note. The create-org flow itself is a follow-up ticket, so the CTA
- *     is present-but-disabled for now (clearly noted).
+ *   - creation allowed (default) → "Create your organization": a single
+ *     org-name field + the "Start your Factory" CTA, plus a passive "or
+ *     wait for an invite" note. Submitting POSTs /api/orgs (create with
+ *     default settings; the configure step is a follow-up ticket), then
+ *     refreshes /me — the membership-appears effect below routes in.
  *   - creation prevented → the invite-only state: "ask your admin",
  *     no create affordance.
  *
@@ -22,6 +24,44 @@ import { useAuth } from '../contexts/AuthContext'
 export default function Onboarding() {
   const auth = useAuth()
   const navigate = useNavigate()
+
+  const [orgName, setOrgName] = useState('')
+  const [creating, setCreating] = useState(false)
+  const [createError, setCreateError] = useState<string | null>(null)
+
+  async function handleCreate(e: React.FormEvent) {
+    e.preventDefault()
+    const name = orgName.trim()
+    if (name === '' || creating) {
+      return
+    }
+    setCreating(true)
+    setCreateError(null)
+    try {
+      await apiJSON('/api/orgs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+    } catch (err) {
+      // Only the create call is guarded here: nothing was persisted, so
+      // re-enable the form for a retry. (refresh() below folds its own
+      // failures into auth status and never throws, so it can't be
+      // misreported as a create failure.)
+      setCreateError(
+        err instanceof HttpError && err.status === 403
+          ? 'Organization creation is disabled on this instance.'
+          : 'Failed to create organization. Please try again.',
+      )
+      setCreating(false)
+      return
+    }
+    // The org now exists with the caller as owner and its active org set
+    // server-side. Re-fetch /me so the membership lands; the effect below
+    // sees orgs.length > 0 and routes into the app. Keep `creating` true
+    // through the redirect so the button stays disabled.
+    await auth.refresh()
+  }
 
   // Redirect to /login once logout flips auth to unauth. Onboarding is
   // outside AuthGate so nothing else observes this transition.
@@ -93,19 +133,30 @@ export default function Onboarding() {
               </p>
             </div>
 
-            <div className="space-y-2">
+            <form onSubmit={handleCreate} className="space-y-2">
+              <label htmlFor="org-name" className="sr-only">
+                Organization name
+              </label>
+              <input
+                id="org-name"
+                type="text"
+                value={orgName}
+                onChange={(e) => setOrgName(e.target.value)}
+                disabled={creating}
+                maxLength={200}
+                placeholder="Organization name"
+                autoFocus
+                className="w-full bg-white/50 border border-border-subtle focus:border-accent focus:outline-none text-text-primary placeholder:text-text-tertiary rounded-xl px-4 py-2.5 text-[13px] transition-colors disabled:opacity-50"
+              />
               <button
-                type="button"
-                disabled
-                title="Organization setup is coming soon"
-                className="w-full bg-accent disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium rounded-xl px-4 py-2.5 text-[13px] transition-colors"
+                type="submit"
+                disabled={creating || orgName.trim() === ''}
+                className="w-full bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium rounded-xl px-4 py-2.5 text-[13px] transition-colors"
               >
-                Start your Factory
+                {creating ? 'Creating…' : 'Start your Factory'}
               </button>
-              <p className="text-[11px] text-text-tertiary text-center">
-                Organization setup is coming soon.
-              </p>
-            </div>
+              {createError && <p className="text-[11px] text-red-500 text-center">{createError}</p>}
+            </form>
 
             <div className="flex items-center gap-3">
               <div className="h-px flex-1 bg-border-subtle" />
