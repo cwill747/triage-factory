@@ -143,6 +143,7 @@ export default function Onboarding() {
                 value={orgName}
                 onChange={(e) => setOrgName(e.target.value)}
                 disabled={creating}
+                maxLength={200}
                 placeholder="Organization name"
                 autoFocus
                 className="w-full bg-white/50 border border-border-subtle focus:border-accent focus:outline-none text-text-primary placeholder:text-text-tertiary rounded-xl px-4 py-2.5 text-[13px] transition-colors disabled:opacity-50"

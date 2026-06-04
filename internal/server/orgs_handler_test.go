@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -141,6 +142,42 @@ func TestOrgCreate_HappyPath(t *testing.T) {
 	}
 	if !active.Valid || active.UUID != orgID {
 		t.Errorf("session active_org_id=%+v, want %s", active, orgID)
+	}
+}
+
+// TestOrgCreate_InvalidName_400 pins the input-validation gates: a name
+// with no slug-able characters (all symbols) and an over-long name both
+// 400 before any provisioning, and neither persists an org.
+func TestOrgCreate_InvalidName_400(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	runmode.SetOrgCreationEnabledForTest(t, true)
+
+	r := newAuthRig(t)
+	founder := r.seedUser()
+	resp, _ := r.driveCallback(founder)
+	sid := r.sidFromResp(resp)
+
+	cases := map[string]string{
+		"no alphanumerics": "---",
+		"over 200 chars":   strings.Repeat("a", 201),
+	}
+	for name, value := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := r.postJSONWithSid("POST", "/api/orgs", sid, map[string]string{"name": value})
+			if got.StatusCode != http.StatusBadRequest {
+				t.Errorf("status=%d, want 400", got.StatusCode)
+			}
+		})
+	}
+
+	var cnt int
+	if err := r.h.AdminDB.QueryRow(
+		`SELECT count(*) FROM public.orgs WHERE owner_user_id = $1`, founder,
+	).Scan(&cnt); err != nil {
+		t.Fatalf("count orgs: %v", err)
+	}
+	if cnt != 0 {
+		t.Errorf("orgs created=%d on invalid input, want 0", cnt)
 	}
 }
 
