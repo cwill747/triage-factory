@@ -94,9 +94,14 @@ func (s *Server) provisionOrg(ctx context.Context, userID uuid.UUID, name, slugB
 	// Race-safe slug allocation. `ON CONFLICT (slug) DO NOTHING
 	// RETURNING id` lets the loser of a cross-user race cleanly observe
 	// zero rows and advance to the next candidate (slugBase-2, -3, …)
-	// rather than blocking on a unique violation. owner_user_id is set
-	// explicitly — the admin pool is BYPASSRLS, so the orgs INSERT's
-	// RLS WITH CHECK isn't what guards ownership here.
+	// instead of erroring out on the unique violation a plain INSERT would
+	// raise. Note this avoids the *error*, not the *wait*: if a concurrent
+	// tx holds an uncommitted row on the same slug, Postgres still blocks
+	// this INSERT until that tx commits or rolls back before deciding
+	// whether the conflict stands — a tail-latency cost under contention,
+	// not a failure. owner_user_id is set explicitly — the admin pool is
+	// BYPASSRLS, so the orgs INSERT's RLS WITH CHECK isn't what guards
+	// ownership here.
 	for i := 0; i < 64; i++ {
 		candidate := slugBase
 		if i > 0 {
