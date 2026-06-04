@@ -43,18 +43,24 @@ export default function Onboarding() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name }),
       })
-      // The org now exists with the caller as owner and its active org
-      // set server-side. Re-fetch /me so the membership lands; the
-      // effect below sees orgs.length > 0 and routes into the app.
-      await auth.refresh()
     } catch (err) {
+      // Only the create call is guarded here: nothing was persisted, so
+      // re-enable the form for a retry. (refresh() below folds its own
+      // failures into auth status and never throws, so it can't be
+      // misreported as a create failure.)
       setCreateError(
         err instanceof HttpError && err.status === 403
           ? 'Organization creation is disabled on this instance.'
           : 'Failed to create organization. Please try again.',
       )
       setCreating(false)
+      return
     }
+    // The org now exists with the caller as owner and its active org set
+    // server-side. Re-fetch /me so the membership lands; the effect below
+    // sees orgs.length > 0 and routes into the app. Keep `creating` true
+    // through the redirect so the button stays disabled.
+    await auth.refresh()
   }
 
   // Redirect to /login once logout flips auth to unauth. Onboarding is

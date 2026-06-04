@@ -144,6 +144,19 @@ func TestOrgCreate_HappyPath(t *testing.T) {
 	}
 }
 
+// TestOrgCreate_LocalModeIsNotFound pins the multi-only gate: in local
+// mode (N=1, provisions via POST /api/setup/start) POST /api/orgs is
+// 404. Uses the SQLite test server so it runs without Docker.
+func TestOrgCreate_LocalModeIsNotFound(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeLocal)
+	s := newTestServer(t)
+
+	rec := doJSON(t, s, http.MethodPost, "/api/orgs", map[string]string{"name": "Acme"})
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status=%d, want 404 (multi-only); body=%s", rec.Code, rec.Body.String())
+	}
+}
+
 // TestOrgCreate_Unauthenticated_401 pins the auth gate: no sid cookie →
 // withSession 401s before the handler runs.
 func TestOrgCreate_Unauthenticated_401(t *testing.T) {

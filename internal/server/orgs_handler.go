@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -84,6 +85,13 @@ func (s *Server) handleOrgCreate(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimSpace(body.Name)
 	if name == "" {
 		badRequest(w, "name is required")
+		return
+	}
+	// Cap the stored display name. The column is unbounded TEXT and the
+	// slug derived below is length-capped separately, so without this a
+	// pathologically long name would persist verbatim.
+	if utf8.RuneCountInString(name) > 200 {
+		badRequest(w, "name must be 200 characters or fewer")
 		return
 	}
 	slugBase := slugify(name)
