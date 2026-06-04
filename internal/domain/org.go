@@ -7,6 +7,5 @@ type Org struct {
 	Name        string
 	Slug        string
 	OwnerUserID string
-	IsPersonal  bool
 	CreatedAt   time.Time
 }

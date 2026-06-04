@@ -4,6 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"hash/fnv"
+	"log"
 
 	"github.com/google/uuid"
 )
@@ -58,4 +61,134 @@ func (s *Server) lookupEarliestMembership(ctx context.Context, q membershipQuery
 		return uuid.NullUUID{}, err
 	}
 	return existing, nil
+}
+
+// provisionOrg creates a net-new org for the founder with default
+// settings: the org row, its Default team, the founder's owner/admin
+// memberships, and the org_settings + team_settings rows — all in one
+// transaction. Returns the new org id, its Default team id, and the
+// slug actually allocated.
+//
+// LOAD-BEARING: this runs on the ADMIN pool (s.db, BYPASSRLS), NOT on
+// the app pool (tf_app + RLS). The founder has no membership at the
+// moment of creation, so RLS would reject every insert here; the admin
+// pool bypasses it and the owner_user_id FK is set explicitly to keep
+// the ownership invariant intact. The caller owns nothing inside the
+// tx — it's fully self-contained — but the shipped-defaults bootstrap
+// (BootstrapNewOrg) MUST run after this commits, outside the tx: its
+// seeders route through the admin pool and refuse to run inside a
+// WithTx.
+func (s *Server) provisionOrg(ctx context.Context, userID uuid.UUID, name, slugBase string) (orgID, teamID uuid.UUID, slug string, err error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return uuid.Nil, uuid.Nil, "", fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Per-user advisory lock serializes concurrent create calls for the
+	// same founder (double-submit safety). Released on commit/rollback.
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1)`, userLockKey(userID)); err != nil {
+		return uuid.Nil, uuid.Nil, "", fmt.Errorf("acquire advisory lock: %w", err)
+	}
+
+	// Race-safe slug allocation. `ON CONFLICT (slug) DO NOTHING
+	// RETURNING id` lets the loser of a cross-user race cleanly observe
+	// zero rows and advance to the next candidate (slugBase-2, -3, …)
+	// rather than blocking on a unique violation. owner_user_id is set
+	// explicitly — the admin pool is BYPASSRLS, so the orgs INSERT's
+	// RLS WITH CHECK isn't what guards ownership here.
+	for i := 0; i < 64; i++ {
+		candidate := slugBase
+		if i > 0 {
+			candidate = fmt.Sprintf("%s-%d", slugBase, i+1)
+		}
+		var got uuid.NullUUID
+		serr := tx.QueryRowContext(ctx, `
+			INSERT INTO public.orgs (slug, name, owner_user_id)
+			VALUES ($1, $2, $3)
+			ON CONFLICT (slug) DO NOTHING
+			RETURNING id
+		`, candidate, name, userID).Scan(&got)
+		if errors.Is(serr, sql.ErrNoRows) {
+			continue
+		}
+		if serr != nil {
+			return uuid.Nil, uuid.Nil, "", fmt.Errorf("insert orgs: %w", serr)
+		}
+		if !got.Valid {
+			continue
+		}
+		orgID = got.UUID
+		slug = candidate
+		break
+	}
+	if orgID == uuid.Nil {
+		return uuid.Nil, uuid.Nil, "", fmt.Errorf("could not allocate slug starting from %q after 64 tries", slugBase)
+	}
+
+	if err := tx.QueryRowContext(ctx, `
+		INSERT INTO public.teams (org_id, slug, name, created_by_user_id)
+		VALUES ($1, 'default', 'Default', $2)
+		RETURNING id
+	`, orgID, userID).Scan(&teamID); err != nil {
+		return uuid.Nil, uuid.Nil, "", fmt.Errorf("insert teams: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO public.org_memberships (user_id, org_id, role)
+		VALUES ($1, $2, 'owner')
+	`, userID, orgID); err != nil {
+		return uuid.Nil, uuid.Nil, "", fmt.Errorf("insert org_memberships: %w", err)
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO public.memberships (user_id, team_id, role)
+		VALUES ($1, $2, 'admin')
+	`, userID, teamID); err != nil {
+		return uuid.Nil, uuid.Nil, "", fmt.Errorf("insert memberships: %w", err)
+	}
+
+	if err := seedSettingsRows(ctx, tx, orgID, teamID); err != nil {
+		return uuid.Nil, uuid.Nil, "", err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return uuid.Nil, uuid.Nil, "", fmt.Errorf("commit: %w", err)
+	}
+
+	log.Printf("[orgs] provisioned org=%s team=%s owner=%s slug=%s", orgID, teamID, userID, slug)
+	return orgID, teamID, slug, nil
+}
+
+// seedSettingsRows inserts the org_settings + team_settings rows every
+// org+team needs at provisioning time. Both rows take their values
+// entirely from the schema DEFAULT clauses — listing only the
+// foreign-key column lets the NOT NULL DEFAULTs (poll intervals, clone
+// protocol, model tier, auto_delegate_enabled=false) populate the rest.
+// ON CONFLICT DO NOTHING so a backfill/re-run can't clobber an admin's
+// edits.
+func seedSettingsRows(ctx context.Context, tx *sql.Tx, orgID, teamID uuid.UUID) error {
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO public.org_settings (org_id) VALUES ($1)
+		ON CONFLICT (org_id) DO NOTHING
+	`, orgID); err != nil {
+		return fmt.Errorf("insert org_settings: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO public.team_settings (team_id) VALUES ($1)
+		ON CONFLICT (team_id) DO NOTHING
+	`, teamID); err != nil {
+		return fmt.Errorf("insert team_settings: %w", err)
+	}
+	return nil
+}
+
+// userLockKey hashes a user UUID into a 64-bit signed key for
+// pg_advisory_xact_lock. FNV-1a over the raw 16-byte UUID is stable
+// per-input, so two concurrent create calls for the same user serialize
+// on the same key while distinct users get distinct keys.
+func userLockKey(userID uuid.UUID) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write(userID[:])
+	return int64(h.Sum64())
 }

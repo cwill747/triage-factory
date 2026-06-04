@@ -50,14 +50,13 @@ func (s *orgsStore) CreateLocalTenant(ctx context.Context) error {
 
 func getOrg(ctx context.Context, q queryer, orgID string) (*domain.Org, error) {
 	var (
-		o          domain.Org
-		owner      sql.NullString
-		isPersonal sql.NullBool
+		o     domain.Org
+		owner sql.NullString
 	)
 	err := q.QueryRowContext(ctx, `
-		SELECT id::text, name, slug, owner_user_id::text, is_personal, created_at
+		SELECT id::text, name, slug, owner_user_id::text, created_at
 		  FROM orgs WHERE id = $1
-	`, orgID).Scan(&o.ID, &o.Name, &o.Slug, &owner, &isPersonal, &o.CreatedAt)
+	`, orgID).Scan(&o.ID, &o.Name, &o.Slug, &owner, &o.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -65,7 +64,6 @@ func getOrg(ctx context.Context, q queryer, orgID string) (*domain.Org, error) {
 		return nil, fmt.Errorf("read org: %w", err)
 	}
 	o.OwnerUserID = owner.String
-	o.IsPersonal = isPersonal.Valid && isPersonal.Bool
 	return &o, nil
 }
 

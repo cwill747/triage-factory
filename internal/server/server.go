@@ -542,6 +542,10 @@ func (s *Server) routes() {
 	s.api("GET /api/me", s.handleMe)
 	// Switch the session's active org.
 	s.apiMutating("POST /api/me/active-org", s.handleActiveOrgUpdate)
+	// Create a net-new org with default settings — the multi-mode
+	// "Start your Factory" onboarding CTA. Multi-mode only (404 in
+	// local); 403 when org creation is disabled on the instance.
+	s.apiMutating("POST /api/orgs", s.handleOrgCreate)
 	// multi-team selectors. GET /api/teams is the data source
 	// for the per-page read filter + write-time picker (count-gated to
 	// ≥2 teams in the frontend); it carries the last-acting-team the write
