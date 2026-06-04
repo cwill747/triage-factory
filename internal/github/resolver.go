@@ -44,6 +44,19 @@ var ErrNoGitHubCredentials = errors.New("github: no credentials resolved for org
 type Resolver interface {
 	ClientFor(ctx context.Context, orgID, githubTarget string) (*Client, error)
 
+	// ClientForRepo resolves a client for a repo-scoped operation on
+	// owner/repo. It differs from ClientFor in that tier 1 (the org's App
+	// installation for owner) is chosen only when that installation's grant
+	// actually covers owner/repo. A "Selected repositories" install mints a
+	// token for any repo under the account — minting is per-installation, not
+	// per-repo — so an owner-grain ClientFor would hand back a token that 403s
+	// on a repo outside the grant, silently skipping the PAT that would have
+	// worked. Deciding coverage up front (a single repo-access probe on the
+	// installation token) lets the resolver fall through to tier 3 instead.
+	// Genuinely account-grain callers (no single repo in view) keep using
+	// ClientFor.
+	ClientForRepo(ctx context.Context, orgID, owner, repo string) (*Client, error)
+
 	// TokenFor returns the raw credential ClientFor would authenticate
 	// with — the App installation token (tier 1) or the org PAT (tier 3) —
 	// for callers that need to hand it to a subprocess rather than make API
@@ -61,11 +74,12 @@ type Resolver interface {
 }
 
 type resolver struct {
-	secrets db.SecretStore
-	apps    db.GitHubAppsStore
-	orgs    db.OrgsStore
-	agents  db.AgentStore
-	cache   TokenCache
+	secrets  db.SecretStore
+	apps     db.GitHubAppsStore
+	orgs     db.OrgsStore
+	agents   db.AgentStore
+	cache    TokenCache
+	coverage *repoCoverageCache
 }
 
 // NewResolver builds a Resolver. A nil cache gets a fresh in-memory one.
@@ -73,7 +87,7 @@ func NewResolver(secrets db.SecretStore, apps db.GitHubAppsStore, orgs db.OrgsSt
 	if cache == nil {
 		cache = NewMemoryTokenCache()
 	}
-	return &resolver{secrets: secrets, apps: apps, orgs: orgs, agents: agents, cache: cache}
+	return &resolver{secrets: secrets, apps: apps, orgs: orgs, agents: agents, cache: cache, coverage: newRepoCoverageCache()}
 }
 
 func (r *resolver) ClientFor(ctx context.Context, orgID, target string) (*Client, error) {
@@ -105,6 +119,57 @@ func (r *resolver) ClientFor(ctx context.Context, orgID, target string) (*Client
 	}
 
 	return nil, fmt.Errorf("%w: org=%s target=%s", ErrNoGitHubCredentials, orgID, target)
+}
+
+func (r *resolver) ClientForRepo(ctx context.Context, orgID, owner, repo string) (*Client, error) {
+	base, err := r.githubBaseFor(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Tier 1, repo-aware: the org's App installation for owner, but only when
+	// its grant covers owner/repo (see the ClientForRepo interface doc).
+	// Coverage is probed up front rather than via a 403-retry — 403 is
+	// ambiguous and the grant is knowable ahead of time. A single
+	// GET /repos/{owner}/{repo} on the installation token answers it (200 →
+	// covered, 404/403 → not in grant), far cheaper than paginating the whole
+	// installation repo set; a positive answer is memoized (repoCoverageTTL) so
+	// the per-card dashboard path doesn't re-probe every request. Negatives are
+	// deliberately not cached — see repoCoverageCache.
+	if client, ok := r.tier1AppClient(ctx, orgID, owner, base); ok {
+		if r.coverage.covered(orgID, owner, repo) {
+			return client, nil // memoized: in the grant
+		}
+		reachable, conclusive := client.CheckRepoAccess(ctx, owner, repo)
+		if !conclusive {
+			// Indeterminate (5xx / transport error) — fail open with the minted
+			// App client (the same one owner-grain ClientFor would return) and
+			// don't cache, so a transient outage can't pin a wrong answer.
+			return client, nil
+		}
+		if reachable {
+			r.coverage.markCovered(orgID, owner, repo)
+			return client, nil
+		}
+		// Conclusively not covered: installed on this account but this repo
+		// isn't in the grant. Fall through to the PAT, which may still reach it.
+		log.Printf("[gh-resolver] org=%s repo=%s/%s: App installed on account but repo not in grant → falling back to PAT", orgID, owner, repo)
+	}
+
+	// Tier 2 (deployment-default shared App) slots in here when it lands,
+	// same as in ClientFor.
+
+	// Tier 3: PAT-borrow. A backend read error propagates — same discipline
+	// as ClientFor.
+	client, err := r.tier3PATClient(ctx, orgID, base)
+	if err != nil {
+		return nil, err
+	}
+	if client != nil {
+		return client, nil
+	}
+
+	return nil, fmt.Errorf("%w: org=%s repo=%s/%s", ErrNoGitHubCredentials, orgID, owner, repo)
 }
 
 // githubBaseFor resolves the org's user-facing GitHub base URL (github.com

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -81,9 +82,12 @@ func testPEM(t *testing.T) string {
 // tokens and records what the returned client subsequently sends, so a test
 // can assert which credential (App token vs PAT) the resolver handed back.
 type ghTestServer struct {
-	srv       *httptest.Server
-	mintCalls int32
-	lastProbe string // Authorization header seen on the /probe call
+	srv          *httptest.Server
+	mintCalls    int32
+	lastProbe    string   // Authorization header seen on the /probe call
+	installRepos []string // full names the repo-access probe treats as granted
+	repoProbes   int32    // count of GET /repos/{owner}/{repo} coverage probes
+	repoProbe5xx bool     // when true, the coverage probe returns 500 (indeterminate)
 }
 
 func newGHTestServer(t *testing.T) *ghTestServer {
@@ -102,6 +106,26 @@ func newGHTestServer(t *testing.T) *ghTestServer {
 		g.lastProbe = r.Header.Get("Authorization")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("[]"))
+	})
+	// Repo-access probe (ClientForRepo's coverage check via CheckRepoAccess):
+	// GET /repos/{owner}/{repo} → 200 if the repo is in the installation's
+	// grant (installRepos), else 404 like an installation token sees for a
+	// repo outside its "Selected repositories" scope.
+	mux.HandleFunc("/api/v3/repos/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&g.repoProbes, 1)
+		if g.repoProbe5xx {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		name := strings.TrimPrefix(r.URL.Path, "/api/v3/repos/")
+		for _, granted := range g.installRepos {
+			if granted == name {
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"full_name":"` + name + `"}`))
+				return
+			}
+		}
+		w.WriteHeader(http.StatusNotFound)
 	})
 	g.srv = httptest.NewServer(mux)
 	t.Cleanup(g.srv.Close)
@@ -171,6 +195,207 @@ func TestResolver_Tier1_AppInstallationToken(t *testing.T) {
 	}
 	if gh.mintCalls != 1 {
 		t.Errorf("mint called %d times after a cached resolution, want 1", gh.mintCalls)
+	}
+}
+
+// ClientForRepo: the org's App is installed on the account AND the repo is in
+// the installation's grant → the minted App token is used.
+func TestResolver_ClientForRepo_AppCoversRepo(t *testing.T) {
+	gh := newGHTestServer(t)
+	gh.installRepos = []string{"acme/widget", "acme/gadget"}
+	r := NewResolver(
+		&fakeSecrets{vals: map[string]string{"pem": testPEM(t), integrations.KeyGitHubPAT: "ghp_test"}},
+		&fakeApps{app: activeApp(), insts: []domain.OrgGitHubAppInstallation{installOn("acme")}},
+		&fakeOrgs{base: gh.srv.URL},
+		&fakeAgents{},
+		nil,
+	)
+
+	client, err := r.ClientForRepo(context.Background(), "org-1", "acme", "widget")
+	if err != nil {
+		t.Fatalf("ClientForRepo: %v", err)
+	}
+	if _, err := client.Get("/probe"); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if gh.lastProbe != "Bearer ghs_minted" {
+		t.Errorf("client carried %q, want the minted App token", gh.lastProbe)
+	}
+}
+
+// ClientForRepo: the App is installed on the account but the repo is NOT in the
+// grant (a "Selected repositories" install). Resolving on the owner alone would
+// hand back an App token that 403s on this repo; ClientForRepo detects the gap
+// up front and falls through to the PAT.
+func TestResolver_ClientForRepo_AppDoesNotCoverRepo_FallsBackToPAT(t *testing.T) {
+	gh := newGHTestServer(t)
+	gh.installRepos = []string{"acme/widget"} // "acme/other" is not granted
+	r := NewResolver(
+		&fakeSecrets{vals: map[string]string{"pem": testPEM(t), integrations.KeyGitHubPAT: "ghp_test"}},
+		&fakeApps{app: activeApp(), insts: []domain.OrgGitHubAppInstallation{installOn("acme")}},
+		&fakeOrgs{base: gh.srv.URL},
+		&fakeAgents{},
+		nil,
+	)
+
+	client, err := r.ClientForRepo(context.Background(), "org-1", "acme", "other")
+	if err != nil {
+		t.Fatalf("ClientForRepo: %v", err)
+	}
+	if _, err := client.Get("/probe"); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if gh.lastProbe != "Bearer ghp_test" {
+		t.Errorf("client carried %q, want the PAT fallback for an uncovered repo", gh.lastProbe)
+	}
+}
+
+// ClientForRepo: the App is installed but the coverage probe is indeterminate
+// (GitHub 5xx). The contract is fail-open — return the minted App client rather
+// than discarding it for the PAT — and the indeterminate result must NOT be
+// cached, so a transient outage can't pin a wrong coverage answer.
+func TestResolver_ClientForRepo_CoverageProbeIndeterminate_FailsOpen(t *testing.T) {
+	gh := newGHTestServer(t)
+	gh.repoProbe5xx = true // GET /repos/{owner}/{repo} → 500
+	r := NewResolver(
+		&fakeSecrets{vals: map[string]string{"pem": testPEM(t), integrations.KeyGitHubPAT: "ghp_test"}},
+		&fakeApps{app: activeApp(), insts: []domain.OrgGitHubAppInstallation{installOn("acme")}},
+		&fakeOrgs{base: gh.srv.URL},
+		&fakeAgents{},
+		nil,
+	)
+
+	client, err := r.ClientForRepo(context.Background(), "org-1", "acme", "widget")
+	if err != nil {
+		t.Fatalf("ClientForRepo: %v", err)
+	}
+	if _, err := client.Get("/probe"); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if gh.lastProbe != "Bearer ghs_minted" {
+		t.Errorf("client carried %q, want the minted App token (fail-open on indeterminate)", gh.lastProbe)
+	}
+
+	// A second resolution must re-probe (the indeterminate result wasn't
+	// cached), not serve a stale decision.
+	if _, err := r.ClientForRepo(context.Background(), "org-1", "acme", "widget"); err != nil {
+		t.Fatalf("second ClientForRepo: %v", err)
+	}
+	if got := atomic.LoadInt32(&gh.repoProbes); got != 2 {
+		t.Errorf("coverage probes = %d, want 2 (indeterminate must not be cached)", got)
+	}
+}
+
+// ClientForRepo memoizes a conclusive coverage answer: two resolutions for the
+// same repo probe GitHub only once.
+func TestResolver_ClientForRepo_CachesCoverage(t *testing.T) {
+	gh := newGHTestServer(t)
+	gh.installRepos = []string{"acme/widget"}
+	r := NewResolver(
+		&fakeSecrets{vals: map[string]string{"pem": testPEM(t), integrations.KeyGitHubPAT: "ghp_test"}},
+		&fakeApps{app: activeApp(), insts: []domain.OrgGitHubAppInstallation{installOn("acme")}},
+		&fakeOrgs{base: gh.srv.URL},
+		&fakeAgents{},
+		nil,
+	)
+
+	for i := 0; i < 3; i++ {
+		if _, err := r.ClientForRepo(context.Background(), "org-1", "acme", "widget"); err != nil {
+			t.Fatalf("ClientForRepo #%d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&gh.repoProbes); got != 1 {
+		t.Errorf("coverage probes = %d, want 1 (positive decision should be memoized)", got)
+	}
+}
+
+// ClientForRepo must NOT cache a non-coverage answer: a repo newly added to a
+// selective grant has to be picked up on the next call, not pinned to the PAT
+// (or to ErrNoGitHubCredentials for an App-only org) for a whole TTL. So each
+// not-covered resolution re-probes.
+func TestResolver_ClientForRepo_DoesNotCacheNonCoverage(t *testing.T) {
+	gh := newGHTestServer(t)
+	gh.installRepos = []string{"acme/widget"} // "acme/other" not granted
+	r := NewResolver(
+		&fakeSecrets{vals: map[string]string{"pem": testPEM(t), integrations.KeyGitHubPAT: "ghp_test"}},
+		&fakeApps{app: activeApp(), insts: []domain.OrgGitHubAppInstallation{installOn("acme")}},
+		&fakeOrgs{base: gh.srv.URL},
+		&fakeAgents{},
+		nil,
+	)
+
+	for i := 0; i < 2; i++ {
+		if _, err := r.ClientForRepo(context.Background(), "org-1", "acme", "other"); err != nil {
+			t.Fatalf("ClientForRepo #%d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(&gh.repoProbes); got != 2 {
+		t.Errorf("coverage probes = %d, want 2 (non-coverage must not be cached)", got)
+	}
+}
+
+// A cached positive coverage decision expires after repoCoverageTTL: once the
+// clock advances past it, the next resolution re-probes rather than serving a
+// stale "covered" answer (which would 403 if the grant had since dropped it).
+func TestResolver_ClientForRepo_CoverageExpires(t *testing.T) {
+	gh := newGHTestServer(t)
+	gh.installRepos = []string{"acme/widget"}
+	r := NewResolver(
+		&fakeSecrets{vals: map[string]string{"pem": testPEM(t), integrations.KeyGitHubPAT: "ghp_test"}},
+		&fakeApps{app: activeApp(), insts: []domain.OrgGitHubAppInstallation{installOn("acme")}},
+		&fakeOrgs{base: gh.srv.URL},
+		&fakeAgents{},
+		nil,
+	)
+	// Drive the cache's clock so the TTL boundary is exercised deterministically.
+	clock := time.Now()
+	r.(*resolver).coverage.now = func() time.Time { return clock }
+
+	if _, err := r.ClientForRepo(context.Background(), "org-1", "acme", "widget"); err != nil {
+		t.Fatalf("ClientForRepo (populate): %v", err)
+	}
+	// Still inside the TTL → cache hit, no re-probe.
+	clock = clock.Add(repoCoverageTTL - time.Second)
+	if _, err := r.ClientForRepo(context.Background(), "org-1", "acme", "widget"); err != nil {
+		t.Fatalf("ClientForRepo (fresh): %v", err)
+	}
+	if got := atomic.LoadInt32(&gh.repoProbes); got != 1 {
+		t.Fatalf("coverage probes = %d before expiry, want 1", got)
+	}
+	// Past the TTL → entry expired, re-probe.
+	clock = clock.Add(2 * time.Second)
+	if _, err := r.ClientForRepo(context.Background(), "org-1", "acme", "widget"); err != nil {
+		t.Fatalf("ClientForRepo (expired): %v", err)
+	}
+	if got := atomic.LoadInt32(&gh.repoProbes); got != 2 {
+		t.Errorf("coverage probes = %d after expiry, want 2 (expired entry must re-probe)", got)
+	}
+}
+
+// ClientForRepo with no App falls straight through to the PAT, exactly like
+// ClientFor — the repo-grain check only adds work when an App is installed.
+func TestResolver_ClientForRepo_NoApp_PAT(t *testing.T) {
+	gh := newGHTestServer(t)
+	r := NewResolver(
+		&fakeSecrets{vals: map[string]string{integrations.KeyGitHubPAT: "ghp_test"}},
+		&fakeApps{app: nil},
+		&fakeOrgs{base: gh.srv.URL},
+		&fakeAgents{},
+		nil,
+	)
+
+	client, err := r.ClientForRepo(context.Background(), "org-1", "acme", "widget")
+	if err != nil {
+		t.Fatalf("ClientForRepo: %v", err)
+	}
+	if _, err := client.Get("/probe"); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if gh.lastProbe != "Bearer ghp_test" {
+		t.Errorf("client carried %q, want the PAT", gh.lastProbe)
+	}
+	if gh.mintCalls != 0 {
+		t.Errorf("mint was called %d times for a PAT-only org", gh.mintCalls)
 	}
 }
 
