@@ -181,6 +181,7 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 		// and the resolved acting team are read under the same claims.
 		var blueprint *domain.Blueprint
 		var crossTeamBlueprint bool
+		var blueprintHasTrigger bool
 		if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 			var e error
 			blueprint, e = tx.Blueprints.Get(r.Context(), orgID, req.BlueprintID)
@@ -193,6 +194,15 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 			}
 			if blueprint.TeamID != "" && blueprint.TeamID != teamID {
 				crossTeamBlueprint = true
+			}
+			// A blueprint is fired by exactly one event: pre-check for a clean
+			// 409 instead of letting the partial-unique index surface a raw 500.
+			existing, e := tx.EventHandlers.ListForBlueprint(r.Context(), orgID, req.BlueprintID)
+			if e != nil {
+				return e
+			}
+			if len(existing) > 0 {
+				blueprintHasTrigger = true
 			}
 			return nil
 		}); err != nil {
@@ -208,6 +218,10 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 		}
 		if crossTeamBlueprint {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "blueprint_id references a blueprint owned by another team"})
+			return
+		}
+		if blueprintHasTrigger {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "this blueprint already has a trigger — a blueprint is fired by exactly one event"})
 			return
 		}
 		h.BlueprintID = req.BlueprintID
@@ -254,12 +268,9 @@ func (s *Server) handleEventHandlerCreate(w http.ResponseWriter, r *http.Request
 		if writeIfActingTeamError(w, err) {
 			return
 		}
-		// Driver-specific error strings ("UNIQUE constraint failed: ..." on
-		// SQLite, "duplicate key value violates unique constraint ..." on
-		// Postgres) leak schema names + index identifiers to clients.
-		// Sniff the substrings to classify but return a generic message;
-		// log the raw error for operators.
-		if strings.Contains(err.Error(), "UNIQUE constraint") || strings.Contains(err.Error(), "duplicate key") {
+		// A unique-constraint failure leaks schema/index names; translate to a
+		// generic 409 and log the raw error for operators.
+		if isUniqueViolation(err) {
 			log.Printf("[event_handlers] create conflict (kind=%s, event_type=%s): %v", h.Kind, h.EventType, err)
 			writeJSON(w, http.StatusConflict, map[string]string{
 				"error": "An event handler with this configuration already exists.",
@@ -542,6 +553,7 @@ func (s *Server) handleEventHandlerPromote(w http.ResponseWriter, r *http.Reques
 
 	var existing *domain.EventHandler
 	var blueprint *domain.Blueprint
+	var blueprintHasTrigger bool
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var e error
 		existing, e = tx.EventHandlers.Get(r.Context(), orgID, id)
@@ -555,7 +567,17 @@ func (s *Server) handleEventHandlerPromote(w http.ResponseWriter, r *http.Reques
 			return nil
 		}
 		blueprint, e = tx.Blueprints.Get(r.Context(), orgID, req.BlueprintID)
-		return e
+		if e != nil {
+			return e
+		}
+		triggers, e := tx.EventHandlers.ListForBlueprint(r.Context(), orgID, req.BlueprintID)
+		if e != nil {
+			return e
+		}
+		if len(triggers) > 0 {
+			blueprintHasTrigger = true
+		}
+		return nil
 	}); err != nil {
 		internalError(w, "event_handlers", err)
 		return
@@ -577,6 +599,12 @@ func (s *Server) handleEventHandlerPromote(w http.ResponseWriter, r *http.Reques
 	// composite FK on the Promote UPDATE; pre-check for a clean 400.
 	if existing.TeamID != "" && blueprint.TeamID != "" && blueprint.TeamID != existing.TeamID {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "blueprint_id references a blueprint owned by another team"})
+		return
+	}
+	// A blueprint is fired by exactly one event: refuse promoting a second
+	// trigger onto an already-triggered blueprint with a clean 409.
+	if blueprintHasTrigger {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "this blueprint already has a trigger — a blueprint is fired by exactly one event"})
 		return
 	}
 
@@ -610,6 +638,15 @@ func (s *Server) handleEventHandlerPromote(w http.ResponseWriter, r *http.Reques
 		fresh, ge = tx.EventHandlers.Get(r.Context(), orgID, id)
 		return ge
 	}); err != nil {
+		// The blueprintHasTrigger pre-check and this Promote run in separate
+		// transactions, so a concurrent promote onto the same blueprint can pass
+		// the check window and hit the partial-unique index here — surface a
+		// clean 409, not a raw 500.
+		if isUniqueViolation(err) {
+			log.Printf("[event_handlers] promote conflict (blueprint already triggered): %v", err)
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "this blueprint already has a trigger — a blueprint is fired by exactly one event"})
+			return
+		}
 		internalError(w, "event_handlers", err)
 		return
 	}
