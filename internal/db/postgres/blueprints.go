@@ -184,6 +184,14 @@ func (s *blueprintStore) Create(ctx context.Context, orgID, teamID string, b dom
 	return err
 }
 
+func (s *blueprintStore) Rename(ctx context.Context, orgID, id, name string) error {
+	_, err := s.app.ExecContext(ctx, `
+		UPDATE blueprints SET name = $1, updated_at = now()
+		WHERE org_id = $2 AND id = $3 AND deleted_at IS NULL
+	`, name, orgID, id)
+	return err
+}
+
 // Delete soft-deletes a blueprint (stamps deleted_at). Its blueprint_steps stay
 // so the copy-only unique index keeps the wrapped prompt pinned; the prompt is
 // soft-deleted alongside by the delete-pairing.
@@ -257,6 +265,38 @@ func listBlueprintSteps(ctx context.Context, q queryer, orgID, blueprintID strin
 	}
 	defer rows.Close()
 
+	var out []domain.BlueprintStep
+	for rows.Next() {
+		var st domain.BlueprintStep
+		if err := rows.Scan(&st.BlueprintID, &st.StepIndex, &st.StepPromptID, &st.Brief, &st.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
+// ListAllSteps returns every step of teamID's request-facing blueprints in one
+// read. The blueprints join mirrors List's gate (hidden = FALSE, deleted_at IS
+// NULL, optional team_id) so the canvas's bulk steps fetch lines up exactly with
+// the blueprint list it renders from.
+func (s *blueprintStore) ListAllSteps(ctx context.Context, orgID, teamID string) ([]domain.BlueprintStep, error) {
+	args := []any{orgID}
+	q := `
+		SELECT bs.blueprint_id, bs.step_index, bs.step_prompt_id, bs.brief, bs.created_at
+		FROM blueprint_steps bs
+		JOIN blueprints b ON b.id = bs.blueprint_id AND b.org_id = bs.org_id
+		WHERE bs.org_id = $1 AND b.hidden = FALSE AND b.deleted_at IS NULL`
+	if teamID != "" {
+		args = append(args, teamID)
+		q += fmt.Sprintf(" AND b.team_id = $%d", len(args))
+	}
+	q += ` ORDER BY bs.blueprint_id, bs.step_index`
+	rows, err := s.app.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query all blueprint steps: %w", err)
+	}
+	defer rows.Close()
 	var out []domain.BlueprintStep
 	for rows.Next() {
 		var st domain.BlueprintStep

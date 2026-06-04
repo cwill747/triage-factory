@@ -617,6 +617,28 @@ func (s *orgTemplateStore) ListBlueprintSteps(ctx context.Context, orgID, bluepr
 	return out, rows.Err()
 }
 
+func (s *orgTemplateStore) ListAllBlueprintSteps(ctx context.Context, orgID string) ([]domain.BlueprintStep, error) {
+	rows, err := s.app.QueryContext(ctx, `
+		SELECT blueprint_id, step_index, step_prompt_id, brief, created_at
+		FROM org_template_blueprint_steps
+		WHERE org_id = $1
+		ORDER BY blueprint_id, step_index ASC
+	`, orgID)
+	if err != nil {
+		return nil, fmt.Errorf("query all org_template blueprint steps: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.BlueprintStep
+	for rows.Next() {
+		var st domain.BlueprintStep
+		if err := rows.Scan(&st.BlueprintID, &st.StepIndex, &st.StepPromptID, &st.Brief, &st.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
 func (s *orgTemplateStore) ReplaceBlueprintSteps(ctx context.Context, orgID, blueprintID string, stepPromptIDs, briefs []string) error {
 	if len(briefs) != 0 && len(briefs) != len(stepPromptIDs) {
 		return fmt.Errorf("briefs length %d must match stepPromptIDs length %d", len(briefs), len(stepPromptIDs))
@@ -648,6 +670,107 @@ func (s *orgTemplateStore) runInTx(ctx context.Context, fn func(*sql.Tx) error) 
 	default:
 		return errors.New("postgres org_template: unexpected queryer type")
 	}
+}
+
+// withTemplateTx runs fn in a transaction over the app pool. The dispatch turns
+// on what s.app concretely is. Inside a handler's s.tx.WithTx(...) closure the
+// WithTx machinery hands the closure a TxStores whose stores are bound to the
+// open *sql.Tx — so the orgTemplateStore reached via tx.OrgTemplate has s.app ==
+// that transaction, and running fn inline makes merge/split share the handler's
+// tx (atomic with its GetBlueprint reads and the post-write re-read). Called
+// directly with no enclosing WithTx (a conformance test), s.app is the *sql.DB
+// pool, so we open a short-lived tx for atomicity. Mirrors the dispatch
+// ReplaceBlueprintSteps does inline.
+func (s *orgTemplateStore) withTemplateTx(ctx context.Context, fn func(*sql.Tx) error) error {
+	switch v := s.app.(type) {
+	case *sql.Tx:
+		return fn(v)
+	case *sql.DB:
+		tx, err := v.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		if err := fn(tx); err != nil {
+			return err
+		}
+		return tx.Commit()
+	default:
+		return errors.New("postgres org_template: unexpected queryer type")
+	}
+}
+
+func (s *orgTemplateStore) MergeBlueprints(ctx context.Context, orgID, hostID, sourceID string) error {
+	return s.withTemplateTx(ctx, func(tx *sql.Tx) error {
+		var hostLen int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM org_template_blueprint_steps WHERE org_id = $1 AND blueprint_id = $2`,
+			orgID, hostID).Scan(&hostLen); err != nil {
+			return fmt.Errorf("count host template steps: %w", err)
+		}
+		// Append source's steps after the host's, densely (host_len + i). The
+		// source's indices shift into a range disjoint from the host's existing
+		// 0..host_len-1, so the (org_id, blueprint_id, step_index) PK never
+		// transiently collides; step_prompt_id is untouched, preserving the
+		// (org_id, step_prompt_id) copy-only unique index.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE org_template_blueprint_steps
+			SET blueprint_id = $1, step_index = step_index + $2
+			WHERE org_id = $3 AND blueprint_id = $4
+		`, hostID, hostLen, orgID, sourceID); err != nil {
+			return fmt.Errorf("reparent source template steps: %w", err)
+		}
+		// Hard-delete the now-stepless source (template mirror — no soft-delete).
+		// Its steps already moved, and the caller validated it trigger-less, so
+		// nothing cascades.
+		res, err := tx.ExecContext(ctx,
+			`DELETE FROM org_template_blueprints WHERE org_id = $1 AND id = $2`, orgID, sourceID)
+		if err != nil {
+			return fmt.Errorf("delete source template blueprint: %w", err)
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return fmt.Errorf("template blueprint %s not found", sourceID)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE org_template_blueprints SET updated_at = now() WHERE org_id = $1 AND id = $2`, orgID, hostID); err != nil {
+			return fmt.Errorf("bump host updated_at: %w", err)
+		}
+		return nil
+	})
+}
+
+func (s *orgTemplateStore) SplitBlueprint(ctx context.Context, orgID, id string, atIndex int, newBlueprintID, newSlug, newName string) (string, error) {
+	err := s.withTemplateTx(ctx, func(tx *sql.Tx) error {
+		// Create the new trigger-less downstream blueprint (template rows carry a
+		// non-empty system_slug; the caller supplies a generated tmpl-<uuid>).
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO org_template_blueprints (id, org_id, system_slug, name, source, created_at, updated_at)
+			VALUES ($1, $2, $3, $4, 'user', now(), now())
+		`, newBlueprintID, orgID, newSlug, newName); err != nil {
+			return fmt.Errorf("create downstream template blueprint: %w", err)
+		}
+		// Peel steps [atIndex, N) onto the new blueprint, re-densified 0-based.
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE org_template_blueprint_steps
+			SET blueprint_id = $1, step_index = step_index - $2
+			WHERE org_id = $3 AND blueprint_id = $4 AND step_index >= $5
+		`, newBlueprintID, atIndex, orgID, id, atIndex); err != nil {
+			return fmt.Errorf("reparent tail template steps: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE org_template_blueprints SET updated_at = now() WHERE org_id = $1 AND id = $2`, orgID, id); err != nil {
+			return fmt.Errorf("bump upstream updated_at: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return newBlueprintID, nil
 }
 
 func (s *orgTemplateStore) CountBlueprintStepReferences(ctx context.Context, orgID, stepPromptID string) (int, error) {

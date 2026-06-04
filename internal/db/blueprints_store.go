@@ -199,6 +199,12 @@ type BlueprintStore interface {
 	// (it satisfies the team-membership RLS); the SQLite impl ignores it.
 	Create(ctx context.Context, orgID, teamID string, b domain.Blueprint) error
 
+	// Rename updates a blueprint's name (its only mutable header field — steps
+	// are managed via ReplaceSteps, composition via merge/split). Lets a
+	// blueprint carry a name independent of its entry prompt's. No-op on a
+	// missing / soft-deleted row; the handler 404s by re-reading.
+	Rename(ctx context.Context, orgID, id, name string) error
+
 	// Delete soft-deletes a blueprint (stamps deleted_at). The row + its
 	// blueprint_steps stay as the durable audit trail (a blueprint a trigger
 	// fired has run history; its step FK is RESTRICT), but request-facing reads
@@ -230,6 +236,13 @@ type BlueprintStore interface {
 	// ListSteps returns the ordered step list for a blueprint. Empty slice
 	// (not error) when the blueprint has no steps configured.
 	ListSteps(ctx context.Context, orgID string, blueprintID string) ([]domain.BlueprintStep, error)
+
+	// ListAllSteps returns every step of teamID's non-deleted blueprints in one
+	// read, ordered by (blueprint_id, step_index) — the binding canvas's bulk
+	// alternative to ListSteps-per-blueprint (avoids an N+1 over the blueprint
+	// list). Soft-deleted blueprints' steps are excluded (the canvas only renders
+	// listed blueprints). Caller groups by blueprint_id.
+	ListAllSteps(ctx context.Context, orgID, teamID string) ([]domain.BlueprintStep, error)
 
 	// CountStepReferences returns the number of distinct non-deleted blueprints
 	// that reference the given prompt as a step. Request-facing, so it filters

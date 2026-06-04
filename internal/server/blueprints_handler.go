@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -148,7 +149,81 @@ func (s *Server) handleBlueprintCreate(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, blueprintCreateResponse{Blueprint: created, FirstPromptID: firstPromptID})
 }
 
+type renameBlueprintRequest struct {
+	Name string `json:"name"`
+}
+
+// handleBlueprintUpdate renames a blueprint header. A blueprint's name is
+// independent of its entry prompt's (auto-wrap defaults them equal, but the box
+// chrome lets a user rename the blueprint without touching the prompt). The
+// org-template family has the same endpoint; this is the team-scope mirror.
+func (s *Server) handleBlueprintUpdate(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
+	id := r.PathValue("id")
+
+	var req renameBlueprintRequest
+	if !decodeJSON(w, r, &req, "") {
+		return
+	}
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+
+	var updated *domain.Blueprint
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		existing, e := tx.Blueprints.Get(r.Context(), orgID, id)
+		if e != nil || existing == nil {
+			return e
+		}
+		if e := tx.Blueprints.Rename(r.Context(), orgID, id, name); e != nil {
+			return e
+		}
+		updated, e = tx.Blueprints.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
+		internalError(w, "blueprints", err)
+		return
+	}
+	if updated == nil {
+		notFound(w, "blueprint")
+		return
+	}
+	writeJSON(w, http.StatusOK, updated)
+}
+
 // --- Blueprint steps -----------------------------------------------------
+
+// handleBlueprintStepsAll returns every step of the scope's blueprints in one
+// read — the binding canvas's bulk fetch, which avoids an N+1 of
+// GET .../{id}/steps over the blueprint list. Always an array; the client
+// groups by blueprint_id.
+func (s *Server) handleBlueprintStepsAll(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := s.requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
+	teamID := singleTeamParam(r)
+	var steps []domain.BlueprintStep
+	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		steps, e = tx.Blueprints.ListAllSteps(r.Context(), orgID, teamID)
+		return e
+	}); err != nil {
+		internalError(w, "blueprints", err)
+		return
+	}
+	if steps == nil {
+		steps = []domain.BlueprintStep{}
+	}
+	writeJSON(w, http.StatusOK, steps)
+}
 
 // handleBlueprintStepsGet returns the ordered step list for a blueprint.
 // Always returns an array (never null) so frontend code can iterate without a
