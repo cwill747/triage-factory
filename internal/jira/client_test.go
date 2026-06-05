@@ -1,11 +1,14 @@
 package jira
 
 import (
+	"context"
 	"encoding/base64"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -115,7 +118,7 @@ func TestDataCenterPATRequest(t *testing.T) {
 	srv, rec := captureServer(t, `{"key":"PROJ-1"}`)
 	c := NewClient(DataCenterPAT(srv.URL, "tok-123"))
 
-	if _, err := c.GetIssue("PROJ-1"); err != nil {
+	if _, err := c.GetIssue(t.Context(), "PROJ-1"); err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
 	auth, path := rec.read()
@@ -133,7 +136,7 @@ func TestCloudAPITokenRequest(t *testing.T) {
 	srv, rec := captureServer(t, `{"key":"PROJ-1"}`)
 	c := NewClient(CloudAPIToken(srv.URL, "me@acme.com", "tok-123"))
 
-	if _, err := c.GetIssue("PROJ-1"); err != nil {
+	if _, err := c.GetIssue(t.Context(), "PROJ-1"); err != nil {
 		t.Fatalf("GetIssue: %v", err)
 	}
 	auth, path := rec.read()
@@ -173,10 +176,65 @@ func TestNewAPIRequest(t *testing.T) {
 func TestNilAuthSchemeErrors(t *testing.T) {
 	bare := Config{BaseURL: "https://jira.example.com", Deployment: DeploymentDataCenter, APIVersion: APIv2}
 
-	if _, err := NewClient(bare).GetIssue("PROJ-1"); err == nil {
+	if _, err := NewClient(bare).GetIssue(t.Context(), "PROJ-1"); err == nil {
 		t.Error("GetIssue with nil auth scheme: got nil error, want one")
 	}
 	if _, err := bare.NewAPIRequest(t.Context(), http.MethodGet, "myself", nil); err == nil {
 		t.Error("NewAPIRequest with nil auth scheme: got nil error, want one")
+	}
+}
+
+// TestContextCancellation proves the request methods honor their context: a
+// cancelled ctx aborts the call. This is the whole point of threading ctx
+// into get/put/post/postJSON via http.NewRequestWithContext.
+func TestContextCancellation(t *testing.T) {
+	srv, _ := captureServer(t, `{"key":"PROJ-1"}`)
+	c := NewClient(DataCenterPAT(srv.URL, "tok"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the request is issued
+
+	_, err := c.GetIssue(ctx, "PROJ-1")
+	if err == nil {
+		t.Fatal("expected error from cancelled context, got nil")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want it to wrap context.Canceled", err)
+	}
+}
+
+// TestCurrentUserFetchedOnceConcurrently exercises the identity cache's
+// double-checked locking: under many concurrent callers the /myself endpoint
+// is hit exactly once, after which the cached value is served under the read
+// lock. Run with -race, it also guards the locking against data races.
+func TestCurrentUserFetchedOnceConcurrently(t *testing.T) {
+	var myselfCalls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/rest/api/2/myself" {
+			atomic.AddInt32(&myselfCalls, 1)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"name":"alice"}`)
+	}))
+	t.Cleanup(srv.Close)
+
+	// One shared client so all callers contend on the same identity cache.
+	c := NewClient(DataCenterPAT(srv.URL, "tok"))
+
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// AssignToSelf resolves currentUser before issuing its PUT.
+			if err := c.AssignToSelf(context.Background(), "PROJ-1"); err != nil {
+				t.Errorf("AssignToSelf: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if n := atomic.LoadInt32(&myselfCalls); n != 1 {
+		t.Errorf("/myself fetched %d times, want exactly 1 (cached after first)", n)
 	}
 }
