@@ -30,29 +30,18 @@ import (
 //go:embed prompts/blueprint-step-nonterminal.txt
 var blueprintStepNonterminalPrompt string
 
-// delegateBlueprint is the multi-step analog of Delegate's single-prompt
-// body. The caller supplies the resolved blueprint + its ordered (len > 1)
-// step list; this sets up the shared worktree, creates the blueprint_runs
-// row, and spawns the orchestrator goroutine. The returned id is the
-// blueprint_run id (not a step run id) — the UI / API surfaces this as "the
-// blueprint that was kicked off".
+// delegateBlueprint spawns the orchestrator goroutine for a blueprint_run the
+// caller (Delegate) has already minted through the replay fence. It sets up the
+// shared worktree, stamps the resolved worktree_path back onto the row, and
+// walks the step list. The returned id is the blueprint_run id — the UI / API
+// surfaces this as "the blueprint that was kicked off".
 //
-// Failures inside this function (empty step list, worktree setup failure, db
-// write errors) terminate the blueprint immediately with a matching
-// abort_reason rather than returning an error to the caller — the caller
-// already has the blueprint_run id and the UI subscribes to the row by id, so
-// a synchronous error wouldn't be reflected anywhere visible.
-func (s *Spawner) delegateBlueprint(orgID string, task domain.Task, blueprint *domain.Blueprint, steps []domain.BlueprintStep, triggerType, triggerID, creatorUserID string, gh *ghclient.Client, model string) (string, error) {
-	if len(steps) == 0 {
-		return "", fmt.Errorf("blueprint %q has no steps", blueprint.Name)
-	}
-
-	// Allocate the blueprint-run id up front so the goroutine and the caller
-	// both reference the same row — we want callers to be able to
-	// subscribe to blueprint_runs/{id} immediately, not wait for a setup
-	// round-trip.
-	blueprintRunID := uuid.New().String()
-
+// Failures inside the goroutine (worktree setup failure, db write errors)
+// terminate the blueprint with a matching abort_reason rather than surfacing an
+// error to the caller — the caller already holds the blueprint_run id and the
+// UI subscribes to the row by id, so a synchronous error wouldn't be reflected
+// anywhere visible.
+func (s *Spawner) delegateBlueprint(orgID string, task domain.Task, blueprint *domain.Blueprint, steps []domain.BlueprintStep, blueprintRunID, triggerType, triggerID, creatorUserID string, gh *ghclient.Client, model string) string {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.mu.Lock()
 	s.cancels[blueprintRunID] = cancel
@@ -60,6 +49,12 @@ func (s *Spawner) delegateBlueprint(orgID string, task domain.Task, blueprint *d
 	// Mark this id as a blueprint_run so the setup phase's status helpers
 	// don't broadcast agent_run_update events for a non-existent runs row.
 	s.markBlueprintRunID(blueprintRunID)
+
+	// The blueprint_run is live → place the task in_progress immediately (a
+	// no-op for non-bot-claimed tasks). The aggregate column then bounces
+	// in_progress ↔ in_review as steps park and resume, and terminateBlueprint
+	// owns the terminal column.
+	s.recomputeTaskBoardColumn(orgID, task.ID)
 
 	go func() {
 		startTime := time.Now()
@@ -71,8 +66,7 @@ func (s *Spawner) delegateBlueprint(orgID string, task domain.Task, blueprint *d
 			s.unmarkBlueprintRunID(blueprintRunID)
 		}()
 
-		// Build the shared worktree exactly once. The same setupGitHub /
-		// setupJira used by single runs — blueprint steps reuse the result.
+		// Build the shared worktree exactly once; every step reuses the result.
 		var cfg runConfig
 		var setupErr error
 		switch task.EntitySource {
@@ -85,42 +79,18 @@ func (s *Spawner) delegateBlueprint(orgID string, task domain.Task, blueprint *d
 		}
 		cfg.orgID = orgID
 		if setupErr != nil {
-			// Persist a blueprint_runs row anyway so the UI has something to
-			// show; write abort_reason and completed_at directly in the
-			// insert — MarkRunStatus won't match a row that isn't 'running'.
-			now := time.Now().UTC()
-			_, _ = s.blueprints.CreateRun(ctx, orgID, domain.BlueprintRun{
-				ID:           blueprintRunID,
-				BlueprintID:  blueprint.ID,
-				TaskID:       task.ID,
-				TriggerType:  domain.BlueprintTriggerType(triggerType),
-				TriggerID:    triggerID,
-				Status:       domain.BlueprintRunStatusFailed,
-				AbortReason:  setupErr.Error(),
-				CompletedAt:  &now,
-				WorktreePath: "",
-			})
-			if cfgEntity := taskEntityID(s.tasks, orgID, task.ID); cfgEntity != "" {
-				s.notifyDrainer(orgID, triggerType, cfgEntity)
-			}
+			// The blueprint_run row already exists (created in Delegate, still
+			// 'running'); transition it to failed. skipCleanup — there is no
+			// finished worktree to reclaim on a setup failure.
+			s.terminateBlueprint(orgID, blueprintRunID, task.ID, triggerType, creatorUserID, startTime, cfg,
+				domain.BlueprintRunStatusFailed, setupErr.Error(), nil, true)
 			return
 		}
 
-		if _, err := s.blueprints.CreateRun(ctx, orgID, domain.BlueprintRun{
-			ID:           blueprintRunID,
-			BlueprintID:  blueprint.ID,
-			TaskID:       task.ID,
-			TriggerType:  domain.BlueprintTriggerType(triggerType),
-			TriggerID:    triggerID,
-			Status:       domain.BlueprintRunStatusRunning,
-			WorktreePath: cfg.wtPath,
-		}); err != nil {
-			log.Printf("[blueprint] failed to persist blueprint_run %s: %v", blueprintRunID, err)
-			s.runBlueprintWorktreeCleanup(blueprintRunID, cfg)
-			if cfgEntity := taskEntityID(s.tasks, orgID, task.ID); cfgEntity != "" {
-				s.notifyDrainer(orgID, triggerType, cfgEntity)
-			}
-			return
+		// Stamp the resolved worktree path onto the row now that setup ran (it
+		// was created with an empty path so the fence could commit first).
+		if err := s.blueprints.SetRunWorktreePathSystem(context.Background(), orgID, blueprintRunID, cfg.wtPath); err != nil {
+			log.Printf("[blueprint] warning: set worktree_path for blueprint_run %s: %v", blueprintRunID, err)
 		}
 
 		verb := "Blueprint started"
@@ -133,7 +103,7 @@ func (s *Spawner) delegateBlueprint(orgID string, task domain.Task, blueprint *d
 		s.runBlueprint(ctx, orgID, blueprintRunID, task, blueprint, steps, cfg, startTime, model, triggerType, creatorUserID)
 	}()
 
-	return blueprintRunID, nil
+	return blueprintRunID
 }
 
 // runBlueprint orchestrates a blueprint prompt against one task. It owns the
@@ -232,6 +202,9 @@ func (s *Spawner) runBlueprint(
 			return
 		}
 		s.broadcastRunUpdate(orgID, stepRunID, "initializing")
+		// A step is starting → the blueprint's board column is in_progress
+		// (unless a prior step is parked, which the aggregate also handles).
+		s.recomputeTaskBoardColumn(orgID, task.ID)
 		var incErr error
 		if triggerType == "manual" {
 			incErr = s.tx.SyntheticClaimsWithTx(ctx, orgID, creatorUserID, func(ts db.TxStores) error {
@@ -298,6 +271,8 @@ func (s *Spawner) runBlueprint(
 		// pick up where we left off.
 		if stepRun.Status == "awaiting_input" || stepRun.Status == "pending_approval" {
 			log.Printf("[blueprint] run %s step %d paused at status=%s; blueprint remains running", blueprintRunID, i, stepRun.Status)
+			// Parked step → the aggregate column is in_review ("needs 👀").
+			s.recomputeTaskBoardColumn(orgID, task.ID)
 			return
 		}
 
@@ -681,6 +656,58 @@ func (s *Spawner) CancelBlueprint(orgID, blueprintRunID, userID string) error {
 	return nil
 }
 
+// finalizeParkedBlueprintOnCancel finalizes the owning blueprint_run when a step
+// run is cancelled through the spawner's DB-only path (Cancel with no live
+// orchestrator goroutine — the step had parked, so the orchestrator already
+// returned and nothing else will mark the blueprint_run terminal). Without this,
+// cancelling a yield-parked step would mark only the run cancelled and strand the
+// blueprint_run in 'running' (and its shared-workspace snapshot in the blob
+// store).
+//
+// It does NOT drain the per-entity queue: the drainer's manual short-circuit
+// keys off the run's trigger type, which the caller (Cancel) already passes to
+// notifyDrainer — folding the drain in here (via terminateBlueprint) would
+// couple it to the write-pool routing and drain a manual run that must not.
+// So this finalizes the blueprint row + worktree + snapshot only:
+//
+//   - marks the blueprint_run cancelled, routed by userID exactly like
+//     CancelBlueprint — a user cancel (non-empty) under the user's synthetic
+//     claims, a system cancel (empty — router cleanup / drain sweep) through the
+//     admin pool;
+//   - runs the shared-worktree cleanup;
+//   - discards the blueprint_run-keyed snapshot (idempotent — a no-op when
+//     terminateBlueprint already dropped it, or when none was taken).
+//
+// This path only runs with no live goroutine, so the blueprint is sequentially
+// paused (no other step is executing) and finalizing the whole blueprint_run on
+// the single cancelled step is correct.
+func (s *Spawner) finalizeParkedBlueprintOnCancel(ctx context.Context, orgID string, run *domain.AgentRun, userID string) {
+	if s.blueprints == nil || run.BlueprintRunID == "" {
+		return
+	}
+	if cr, err := s.blueprints.GetRunSystem(ctx, orgID, run.BlueprintRunID); err == nil && cr != nil &&
+		cr.Status == domain.BlueprintRunStatusRunning {
+		reason := "user_cancelled"
+		if userID == "" {
+			reason = "system_cancelled"
+		}
+		if userID != "" {
+			_, _ = s.markBlueprintRunStatusAsUser(ctx, orgID, userID, cr.ID, domain.BlueprintRunStatusCancelled, reason, run.BlueprintStepIndex)
+		} else {
+			_, _ = s.blueprints.MarkRunStatusSystem(ctx, orgID, cr.ID, domain.BlueprintRunStatusCancelled, reason, run.BlueprintStepIndex)
+		}
+		// Reconstruct just enough cfg for the worktree cleanup (mirrors
+		// CancelBlueprint / ResumeBlueprintAfterApproval — owner/repo/prNumber
+		// aren't persisted on blueprint_runs, so CleanupPRConfig is skipped).
+		cfg := runConfig{orgID: orgID, wtPath: cr.WorktreePath}
+		if task, _ := s.tasks.GetSystem(ctx, orgID, cr.TaskID); task != nil && task.EntitySource == "github" {
+			cfg.hasWT = true
+		}
+		s.runBlueprintWorktreeCleanup(cr.ID, cfg)
+	}
+	s.discardWorkspaceSnapshot(ctx, orgID, run.BlueprintRunID)
+}
+
 // markBlueprintRunStatusAsUser writes a blueprint_run status transition under
 // the given user's synthetic claims. Used by user-initiated CancelBlueprint
 // / Resume* paths that need to attribute the write to the requesting
@@ -696,15 +723,21 @@ func (s *Spawner) markBlueprintRunStatusAsUser(ctx context.Context, orgID, userI
 	return changed, err
 }
 
-// ResumeBlueprintAfterYield re-enters the orchestrator loop for the
-// remaining steps after a yield-resume completes successfully.
-// Currently not fully implemented: marks the blueprint aborted so it
-// doesn't silently stall in 'running'.
+// ResumeBlueprintAfterYield finalizes a blueprint after one of its step runs
+// resumed from a yield and reached a terminal state (the respond endpoint drives
+// it via ResumeAfterYield once processCompletion reports the step is no longer
+// parked). It reads the resumed step's terminal runs.outcome + position and
+// routes through terminateBlueprint, so a 1-step (or final-step) yield-resume
+// closes the task on finish and leaves it open on abort — parity with the
+// pre-collapse single-prompt yield-resume.
 //
-// userID identifies the actor for audit (the user whose response
-// resumed the yielded run). Local mode passes
-// runmode.LocalDefaultUserID; multi-mode handlers extract it from
-// JWT claims.
+// A non-final step that wants to advance mid-blueprint (continue) is the epic's
+// resume work and is not built here: the blueprint is terminated with a clear
+// reason rather than silently stalling in 'running'.
+//
+// userID identifies the actor for audit (the user whose response resumed the
+// yielded run). Local mode passes runmode.LocalDefaultUserID; multi-mode handlers
+// extract it from JWT claims.
 func (s *Spawner) ResumeBlueprintAfterYield(orgID, stepRunID, userID string) {
 	cr, stepIdx, err := s.blueprints.GetRunForRunSystem(context.Background(), orgID, stepRunID)
 	if err != nil || cr == nil {
@@ -713,21 +746,72 @@ func (s *Spawner) ResumeBlueprintAfterYield(orgID, stepRunID, userID string) {
 	if cr.Status != domain.BlueprintRunStatusRunning {
 		return
 	}
-	log.Printf("[blueprint] yield-resume not yet implemented for blueprint_run %s step run %s; aborting blueprint", cr.ID, stepRunID)
+
+	stepRun, err := s.agentRuns.GetSystem(context.Background(), orgID, stepRunID)
+	if err != nil || stepRun == nil {
+		log.Printf("[blueprint] yield-resume run %s: read step run: %v", stepRunID, err)
+		return
+	}
+	// Still dormant after the resume (yielded again / queued an approval) → the
+	// blueprint stays running; the next respond/approval drives finalization.
+	if stepRun.Status == "awaiting_input" || stepRun.Status == "pending_approval" {
+		return
+	}
+
 	task, err := s.tasks.GetSystem(context.Background(), orgID, cr.TaskID)
 	if err != nil || task == nil {
 		log.Printf("[blueprint] yield-resume: load task for blueprint_run %s: %v", cr.ID, err)
-		// Fall back to a bare MarkBlueprintRunStatus without full cleanup.
-		// User-initiated — attribute to the resuming user.
-		_, _ = s.markBlueprintRunStatusAsUser(context.Background(), orgID, userID, cr.ID, domain.BlueprintRunStatusAborted, "yield_resume_not_implemented", stepIdx)
+		_, _ = s.markBlueprintRunStatusAsUser(context.Background(), orgID, userID, cr.ID, domain.BlueprintRunStatusFailed, "yield_resume_task_load_failed", stepIdx)
 		return
 	}
 	cfg := runConfig{orgID: orgID, wtPath: cr.WorktreePath}
 	if task.EntitySource == "github" {
 		cfg.hasWT = true
 	}
+
+	// isFinal = this is the last step (and therefore the only step for N=1).
+	// Defaults to true when the index or step list can't be resolved, so an
+	// unknown position never advances into the unbuilt mid-blueprint resume.
+	isFinal := true
+	if stepIdx != nil {
+		if steps, err := s.blueprints.ListStepsSystem(context.Background(), orgID, cr.BlueprintID); err == nil && len(steps) > 0 {
+			isFinal = *stepIdx >= len(steps)-1
+		}
+	}
+
+	status, reason := blueprintTerminalForResumedStep(stepRun, isFinal)
 	s.terminateBlueprint(orgID, cr.ID, cr.TaskID, "manual", userID, cr.StartedAt, cfg,
-		domain.BlueprintRunStatusAborted, "yield_resume_not_implemented", stepIdx, false)
+		status, reason, stepIdx, false)
+}
+
+// blueprintTerminalForResumedStep maps a resumed step run's terminal state +
+// position to the blueprint's terminal status. Mirrors runBlueprint's in-loop
+// disposition for the resume path: a clean completion routes through
+// decideBlueprintStep (finish/advance/abort), and the non-terminal-completed
+// statuses map to the matching blueprint terminal.
+func blueprintTerminalForResumedStep(stepRun *domain.AgentRun, isFinal bool) (domain.BlueprintRunStatus, string) {
+	switch stepRun.Status {
+	case "completed":
+		decision, abortReason := decideBlueprintStep(stepRun.Outcome, isFinal)
+		switch decision {
+		case blueprintStepFinish:
+			return domain.BlueprintRunStatusCompleted, ""
+		case blueprintStepAbort:
+			reason := abortReason
+			if reason == "" {
+				reason = stepRun.OutcomeReason
+			}
+			return domain.BlueprintRunStatusAborted, reason
+		default: // blueprintStepAdvance — mid-blueprint resume not implemented
+			return domain.BlueprintRunStatusAborted, "multi_step_yield_resume_not_implemented"
+		}
+	case "failed", "task_unsolvable":
+		return domain.BlueprintRunStatusFailed, "step " + stepRun.Status
+	case "cancelled":
+		return domain.BlueprintRunStatusCancelled, "step cancelled"
+	default:
+		return domain.BlueprintRunStatusFailed, "step ended with status " + stepRun.Status
+	}
 }
 
 // ResumeBlueprintAfterApproval is invoked by the reviews / pending-PR

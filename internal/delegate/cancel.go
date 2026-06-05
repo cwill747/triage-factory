@@ -120,13 +120,14 @@ func (s *Spawner) Cancel(orgID, runID, userID string) error {
 		return fmt.Errorf("no active run %s", runID)
 	}
 	s.broadcastRunUpdate(orgID, runID, "cancelled")
-	// A parked single run (yield / pending_approval) carries a workspace
-	// snapshot; drop it now the run is terminal so the blob store doesn't
-	// orphan it. Blueprint steps are owned by terminateBlueprint (user cancel
-	// routes through CancelBlueprint), so skip those here.
-	if run.BlueprintRunID == "" {
-		s.discardWorkspaceSnapshot(context.Background(), orgID, run.ID)
-	}
+	// This DB-only cancel path runs only with no live orchestrator goroutine —
+	// the step had parked (yield / pending_approval), so the orchestrator already
+	// returned and the owning blueprint_run is stuck in 'running'. Finalize it
+	// (cancel the blueprint_run, clean the shared worktree, discard the
+	// blueprint_run-keyed snapshot) so neither the row nor the blob is orphaned.
+	// The per-entity drain stays below, keyed off the run's trigger type so the
+	// manual short-circuit holds.
+	s.finalizeParkedBlueprintOnCancel(bgCtx, orgID, run, userID)
 	if entityID != "" {
 		s.notifyDrainer(orgID, triggerType, entityID)
 	}
