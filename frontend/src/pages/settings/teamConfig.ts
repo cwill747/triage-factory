@@ -1,8 +1,8 @@
 // Shared types + persistence helpers for the team-level configuration
 // surface (tracked repos, GitHub-team mappings, Jira project rules, team
 // settings). The team mirror of orgConfig.ts: the same helpers back the
-// Settings team tab, the create-time TeamConfigure step, and the local
-// Setup wizard, so no surface grows its own parallel persistence path.
+// Settings team tab and the create-time TeamConfigure step (both modes), so
+// no surface grows its own parallel persistence path.
 //
 // Key difference from org: team config spans MULTIPLE endpoints, not the
 // single POST /api/settings/org. The team-settings + Jira rules ride one
@@ -190,27 +190,6 @@ export async function saveTeamSettings(teamId: string, form: TeamConfigForm): Pr
   }
   const body = (await res.json().catch(() => null)) as { warning?: string } | null
   return { ok: true, warning: body?.warning }
-}
-
-// saveTeamJiraProjects persists ONLY the Jira project rules via a sparse
-// POST /api/settings/team/{id} (the handler treats omitted ai_* fields as
-// unchanged). The Setup wizard's per-step save uses this so configuring Jira
-// projects doesn't also rewrite the team's model / auto-delegate defaults the
-// step never touched.
-export async function saveTeamJiraProjects(
-  teamId: string,
-  projects: JiraProjectConfig[],
-): Promise<SaveResult> {
-  const normalized = projects.map((p) => ({ ...p, key: p.key.trim() })).filter((p) => p.key !== '')
-  const res = await fetch(teamPath(teamId), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jira_projects: normalized }),
-  })
-  if (!res.ok) {
-    return { ok: false, error: await readError(res, 'Failed to save Jira config') }
-  }
-  return { ok: true }
 }
 
 // saveTeamRepos persists the tracked-repo set via PUT /api/settings/team/
