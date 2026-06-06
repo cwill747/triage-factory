@@ -73,20 +73,37 @@ export default function Wizard({ isLocal = false }: { isLocal?: boolean }) {
 
   const wiz = useWizard(WIZARD_STEPS, identity, initialWizardState, onFinish)
 
-  // Esc re-expands the previous step — the keyboard mirror of the Back button.
-  // Gated on canGoBack (is there a prior visible step), not the raw index, so
-  // it stays in lockstep with the Back button's enabled state.
-  const { back, advance, activeIndex, busy, canGoBack } = wiz
+  // Keyboard mirrors of the footer buttons. Esc re-expands the previous step
+  // (gated on canGoBack so it stays in lockstep with the Back button). Enter
+  // triggers Continue, but only on a step that opts in (advanceOnEnter) and only
+  // from a text input — so pressing it in the URL field probes + advances, while
+  // it never hijacks the access steps' own Connect / Register buttons.
+  const { back, advance, activeIndex, busy, canGoBack, steps, activeLoadFailed } = wiz
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && canGoBack && !busy) {
+      // Mirror the Continue button's disabled condition (busy || activeLoadFailed)
+      // so the keyboard path can't fire while a save is in flight or the active
+      // step's load failed (showing the Retry UI in place of the fields).
+      if (busy || activeLoadFailed) return
+      if (e.key === 'Escape' && canGoBack) {
         e.preventDefault()
         back()
+        return
+      }
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        const step = steps[activeIndex]
+        const target = e.target as HTMLElement | null
+        const inTextInput =
+          target instanceof HTMLInputElement && target.type !== 'button' && target.type !== 'submit'
+        if (step?.advanceOnEnter && inTextInput) {
+          e.preventDefault()
+          advance()
+        }
       }
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [back, canGoBack, busy])
+  }, [back, advance, canGoBack, busy, activeLoadFailed, steps, activeIndex])
 
   // As a step becomes active, move focus to its heading and bring the card to
   // center. scrollIntoView honors reduced motion (instant vs. smooth).
@@ -131,9 +148,20 @@ export default function Wizard({ isLocal = false }: { isLocal?: boolean }) {
 
         <div className="space-y-6">
           {WIZARD_SECTIONS.map((section) => {
+            // Only steps up to and including the active one render — the active
+            // card plus the completed bars that have receded above it. Nothing
+            // below the active step is shown (no "road ahead"), and because this
+            // keys on activeIndex, going Back re-hides the forward steps too. A
+            // section with no reached steps yet (the team section while still in
+            // org config) collapses away entirely.
             const entries = wiz.steps
               .map((step, index) => ({ step, index }))
-              .filter(({ step }) => step.section === section.id && isStepVisible(step, wiz.state))
+              .filter(
+                ({ step, index }) =>
+                  step.section === section.id &&
+                  index <= activeIndex &&
+                  isStepVisible(step, wiz.state),
+              )
             if (entries.length === 0) return null
             return (
               <section key={section.id} aria-labelledby={`setup-section-${section.id}`}>
@@ -178,7 +206,6 @@ export default function Wizard({ isLocal = false }: { isLocal?: boolean }) {
                             title={step.title}
                             summary={step.collapsedSummary(wiz.state)}
                             complete={complete}
-                            editable={wiz.canEdit(index)}
                             onEdit={() => wiz.goTo(index)}
                           />
                         )}
@@ -209,7 +236,12 @@ export default function Wizard({ isLocal = false }: { isLocal?: boolean }) {
                                     </button>
                                   </div>
                                 ) : (
-                                  step.render({ ...identity, state: wiz.state, patch: wiz.patch })
+                                  step.render({
+                                    ...identity,
+                                    state: wiz.state,
+                                    patch: wiz.patch,
+                                    error: wiz.error,
+                                  })
                                 )}
 
                                 {wiz.error && (
