@@ -15,7 +15,7 @@ import {
 
 /**
  * OrgConfigure is the create-time configure step — the second half of
- * "Start your Factory" (multi) / "Start your Triage Factory" (local). By the
+ * "Start your factory" (multi) / "Start your factory" (local). By the
  * time the founder lands here the tenant already exists with default settings
  * (POST /api/orgs in multi, POST /api/setup/start in local) and is the
  * session's active org, so the same org-scoped endpoints the Settings page

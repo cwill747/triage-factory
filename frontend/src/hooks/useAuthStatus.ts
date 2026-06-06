@@ -2,10 +2,10 @@ import { useState, useEffect } from 'react'
 
 interface AuthStatus {
   // configured = "a provisioned tenant exists" (the user has run the
-  // explicit "Start your Triage Factory" provision action). It no longer
+  // explicit "Start your factory" provision action). It no longer
   // means "GitHub creds present" — those moved to a later config step,
   // surfaced via the github/jira/github_repos fields below. No tenant ⇒
-  // first-run; the AuthGate routes to the "Start your Triage Factory" screen.
+  // first-run; the AuthGate routes to the "Start your factory" screen.
   configured: boolean
   github: boolean
   // github_ready folds the PAT signal together with a registered GitHub App

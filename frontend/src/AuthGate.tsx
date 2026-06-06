@@ -10,7 +10,7 @@ import { LOCAL_DEFAULT_ORG_ID } from './lib/githubApp'
  * multi-mode cookie-session flow.
  *
  *   Local mode → LocalAuthGate (/api/integrations/status; !configured →
- *                the "Start your Triage Factory" provision screen)
+ *                the "Start your factory" provision screen)
  *   Multi mode → MultiAuthGate (uses AuthContext)
  *
  * Multi-mode states:
@@ -38,7 +38,7 @@ function Loading() {
 function LocalAuthGate({ children }: { children: React.ReactNode }) {
   const { configured, loading } = useAuthStatus()
   if (loading) return <Loading />
-  // No provisioned tenant yet → the first-run "Start your Triage Factory"
+  // No provisioned tenant yet → the first-run "Start your factory"
   // screen, which fires POST /api/setup/start and then routes into the shared
   // configure flow. (configured = a tenant exists, not "GitHub creds set".)
   if (!configured) return <Navigate to="/start" replace />

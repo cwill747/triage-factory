@@ -47,7 +47,7 @@ func countTable(t *testing.T, database *sql.DB, table string) int {
 
 // TestIntegrationsStatus_TenantlessNotConfigured pins the first-run
 // detection: a tenant-less install reports configured=false so the
-// AuthGate routes to the "Start your Triage Factory" screen. The server
+// AuthGate routes to the "Start your factory" screen. The server
 // must serve the endpoint cleanly with zero tenant rows.
 func TestIntegrationsStatus_TenantlessNotConfigured(t *testing.T) {
 	keyring.MockInit()

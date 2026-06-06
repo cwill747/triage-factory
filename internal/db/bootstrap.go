@@ -18,7 +18,7 @@ import (
 //
 // Callers:
 //
-//   - BootstrapLocalOrg — the local "Start your Triage Factory"
+//   - BootstrapLocalOrg — the local "Start your factory"
 //     provision action (POST /api/setup/start). Creates the synthetic
 //     tenant rows, then runs the shared BootstrapNewOrg chain. Nothing
 //     provisions at boot anymore.
@@ -39,7 +39,7 @@ import (
 //
 // This is the ONE shared provision operation, triggered by a deliberate
 // user action: multi fires it via the admin's create-org flow,
-// local fires it via "Start your Triage Factory". The only differences
+// local fires it via "Start your factory". The only differences
 // are what fires it and what identity is auto-filled (local hardcodes
 // the LocalDefault* sentinels); the seed path is identical. Nothing
 // runs it at boot — a fresh local DB has zero tenant rows until the

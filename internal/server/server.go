@@ -523,7 +523,7 @@ func (s *Server) routes() {
 	// need to be logged in to manage your integration credentials.
 	s.apiMutating("POST /api/integrations/setup", s.handleIntegrationsSetup)
 	s.api("GET /api/integrations/status", s.handleIntegrationsStatus)
-	// Local-mode "Start your Triage Factory" provision action — creates
+	// Local-mode "Start your factory" provision action — creates
 	// the synthetic tenant + materializes shipped defaults via the shared
 	// bootstrap chain. Idempotent; no-op once a tenant exists.
 	s.apiMutating("POST /api/setup/start", s.handleSetupStart)

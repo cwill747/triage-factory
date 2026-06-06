@@ -1293,7 +1293,7 @@ CREATE UNIQUE INDEX curator_requests_id_org_unique ON curator_requests (id, org_
 -- === System registries (NOT tenant data) =================================
 -- No tenancy seed rows here anymore: provisioning the synthetic local
 -- org/team/user/memberships/settings is an explicit, user-triggered
--- action ("Start your Triage Factory" → db.BootstrapLocalOrg), not a
+-- action ("Start your factory" → db.BootstrapLocalOrg), not a
 -- migration- or boot-time side effect. A fresh local DB boots with zero
 -- tenant rows; deleted shipped defaults stay deleted across restarts
 -- because nothing re-seeds at boot. Multi-mode never seeded tenant rows

@@ -199,7 +199,7 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 	// "configured" now means "a provisioned tenant exists" — the local
 	// shim hands every request the LocalDefault* org id regardless of
 	// whether that org row actually exists, so probe the row directly.
-	// No tenant ⇒ the user hasn't run "Start your Triage Factory" yet and
+	// No tenant ⇒ the user hasn't run "Start your factory" yet and
 	// the AuthGate routes them to the first-run screen; GitHub-creds-
 	// present is now a later config step, surfaced via the github/jira
 	// fields below rather than gating first-run. GetOrgSystem reads org
@@ -324,7 +324,7 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, result)
 }
 
-// handleSetupStart is the local-mode "Start your Triage Factory"
+// handleSetupStart is the local-mode "Start your factory"
 // provision action (POST /api/setup/start). On a tenant-less install it
 // runs the shared BootstrapLocalOrg chain: create the synthetic tenant
 // rows, then seed the org template + materialize the founder team's

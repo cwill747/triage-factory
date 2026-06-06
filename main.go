@@ -438,7 +438,7 @@ func main() {
 			log.Fatalf("failed to migrate database: %v", err)
 		}
 		// No tenant rows exist on a fresh local DB anymore — provisioning
-		// is the explicit "Start your Triage Factory" action
+		// is the explicit "Start your factory" action
 		// (db.BootstrapLocalOrg via POST /api/setup/start), not a boot- or
 		// migration-time side effect. The server, pollers, scorer, router,
 		// and spawner all start and idle cleanly with zero tenant rows.

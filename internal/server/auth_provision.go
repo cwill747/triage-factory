@@ -16,7 +16,7 @@ import (
 // Org creation is a deliberate user action in both deployment modes
 // (the SKY-435 parity contract): the multi-mode onboarding entry's
 // "Start your Factory" CTA → the create-org flow, and local mode's
-// "Start your Triage Factory" action. The OAuth callback therefore
+// "Start your factory" action. The OAuth callback therefore
 // never mints an org on first login — a fresh user lands with zero
 // memberships and the frontend routes them to the onboarding screen.
 //

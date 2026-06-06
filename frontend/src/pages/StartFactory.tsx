@@ -9,7 +9,7 @@ import { LOCAL_DEFAULT_ORG_ID } from '../lib/githubApp'
  * tenant-less, so the app routes (behind LocalAuthGate) redirect an
  * unconfigured user here. There's no org-name field: local provisions the
  * fixed synthetic sentinel tenant, so the only input is the deliberate
- * "Start your Triage Factory" action that fires POST /api/setup/start
+ * "Start your factory" action that fires POST /api/setup/start
  * (idempotent — see handleSetupStart). On success we route into the shared
  * OrgConfigure → TeamConfigure flow; the configure route's own LocalAuthGate
  * re-reads /api/integrations/status and now sees configured=true.
@@ -82,7 +82,7 @@ export default function StartFactory() {
           disabled={starting}
           className="w-full bg-accent hover:bg-accent/90 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium rounded-xl px-4 py-2.5 text-[13px] transition-colors"
         >
-          {starting ? 'Starting…' : 'Start your Triage Factory'}
+          {starting ? 'Starting…' : 'Start your factory'}
         </button>
 
         {error && <p className="text-[11px] text-red-500 text-center">{error}</p>}
