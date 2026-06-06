@@ -87,6 +87,107 @@ func TestGitHubGroupCandidates_MembershipAndCounts(t *testing.T) {
 	}
 }
 
+// TestGitHubGroupCandidates_CredentialsMissing covers the disambiguation the
+// setup wizard relies on: a team that tracks repos but whose org has NO
+// resolvable GitHub credential must report credentials_missing=true with an
+// empty candidate list, so the UI can tell "reconnect GitHub" apart from
+// "these orgs have no teams." A tracked repo exists (so there's an owner to
+// resolve) but no creds are seeded, so ClientFor returns ErrNoGitHubCredentials
+// for the sole owner.
+func TestGitHubGroupCandidates_CredentialsMissing(t *testing.T) {
+	keyring.MockInit()
+	srv := newTestServer(t)
+
+	// Track a repo (gives the candidate path an owner to resolve) but seed
+	// no GitHub credential — the org PAT is absent and there's no App.
+	seedConfiguredRepo(t, srv, "acme", "api")
+
+	rec := doJSON(t, srv, http.MethodGet, "/api/settings/team/default/github-groups", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET github-groups = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp teamGitHubGroupsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v; raw=%s", err, rec.Body.String())
+	}
+	if !resp.CredentialsMissing {
+		t.Errorf("credentials_missing=false with a tracked repo and no creds; want true")
+	}
+	if len(resp.Candidates) != 0 {
+		t.Errorf("got %d candidates, want 0: %+v", len(resp.Candidates), resp.Candidates)
+	}
+}
+
+// TestGitHubGroupCandidates_ResolvedButNoTeams is the load-bearing complement
+// to the missing-creds case: an empty candidate list with a WORKING credential
+// must report credentials_missing=false. This is the exact disambiguation the
+// flag exists for — "this org's teams are empty" must not read as "reconnect
+// GitHub." The owner resolves via the org PAT but GraphQL returns no teams.
+func TestGitHubGroupCandidates_ResolvedButNoTeams(t *testing.T) {
+	keyring.MockInit()
+	srv := newTestServer(t)
+	ctx := context.Background()
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/graphql") {
+			// Owner resolves (PAT), but the org genuinely has no teams.
+			_, _ = w.Write([]byte(`{"data":{"organization":{"teams":{
+				"pageInfo":{"hasNextPage":false,"endCursor":""},"nodes":[]}}}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(ts.Close)
+
+	if err := srv.orgs.UpdateSettings(ctx, runmode.LocalDefaultOrgID, domain.OrgSettings{GitHubBaseURL: ts.URL}); err != nil {
+		t.Fatalf("set org github base: %v", err)
+	}
+	if err := integrations.Save(ctx, srv.secrets, runmode.LocalDefaultOrgID, auth.Credentials{
+		GitHubURL: ts.URL,
+		GitHubPAT: "ghp-test",
+	}); err != nil {
+		t.Fatalf("seed creds: %v", err)
+	}
+	seedConfiguredRepo(t, srv, "acme", "api")
+
+	rec := doJSON(t, srv, http.MethodGet, "/api/settings/team/default/github-groups", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET github-groups = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp teamGitHubGroupsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v; raw=%s", err, rec.Body.String())
+	}
+	if resp.CredentialsMissing {
+		t.Errorf("credentials_missing=true with a working credential and no teams; want false")
+	}
+	if len(resp.Candidates) != 0 {
+		t.Errorf("got %d candidates, want 0: %+v", len(resp.Candidates), resp.Candidates)
+	}
+}
+
+// TestGitHubGroupCandidates_NoReposNotMissing guards the inverse: with no
+// tracked repos there is no owner to resolve, so credentials_missing must stay
+// false — an unconfigured team is not a creds failure, and the wizard reaches
+// this step only after repos are persisted anyway.
+func TestGitHubGroupCandidates_NoReposNotMissing(t *testing.T) {
+	keyring.MockInit()
+	srv := newTestServer(t)
+
+	rec := doJSON(t, srv, http.MethodGet, "/api/settings/team/default/github-groups", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET github-groups = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var resp teamGitHubGroupsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode body: %v; raw=%s", err, rec.Body.String())
+	}
+	if resp.CredentialsMissing {
+		t.Errorf("credentials_missing=true with no tracked repos; want false")
+	}
+}
+
 // TestUserTeamsMulti_ReconstructsViaGraphQL drives the multi-mode path
 // (userTeamsMulti) directly: it resolves the caller's host-verified login,
 // fans out one GraphQL organization.teams(userLogins:) query per
