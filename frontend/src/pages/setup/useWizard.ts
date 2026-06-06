@@ -56,7 +56,7 @@ export function useWizard(
   steps: WizardStep[],
   identity: WizardIdentity,
   makeInitialState: () => WizardState,
-  onFinish: () => void,
+  onFinish: (state: WizardState) => void,
 ): WizardController {
   const { orgId, teamId, isLocal } = identity
 
@@ -154,14 +154,16 @@ export function useWizard(
         await step.persist({ orgId, teamId, isLocal, state, patch })
         // Advance to the next step that applies; an omitted step (e.g. Jira
         // projects without a Jira tracker) is skipped. No visible step after
-        // this one ⇒ this was the last step, so finish. Read visibility off
-        // stateRef, which patch() keeps in sync synchronously, so a persist
-        // that patched visibility-affecting state (e.g. jiraConnected) is
-        // reflected here — the closure `state` and a not-yet-flushed render
-        // would both still be stale.
+        // this one ⇒ this was the last step, so finish. Read visibility (and
+        // the finish state below) off stateRef, which patch() keeps in sync
+        // synchronously, so a persist that patched visibility- or finish-
+        // affecting state (e.g. jiraConnected) is reflected here — the closure
+        // `state` and a not-yet-flushed render would both still be stale.
         const next = nextVisibleIndex(steps, stateRef.current, activeIndex)
         if (next === -1) {
-          onFinish()
+          // Pass the fresh ref so onFinish's finish branch (the local Jira
+          // carry-over hand-off) sees the same post-persist state.
+          onFinish(stateRef.current)
           return
         }
         setActiveIndex(next)
