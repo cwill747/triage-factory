@@ -1401,7 +1401,28 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
   canvas.style.height = '100%'
   canvas.style.display = 'block'
   canvas.style.touchAction = 'none'
+  // Explicit z-order so the fade overlay (z-index 1) reliably paints above
+  // the canvas. A GPU-composited WebGL layer can otherwise ignore a static
+  // sibling's stacking on some browser/GPU combos; `relative` with no
+  // offsets keeps layout identical but puts the canvas in the z-order.
+  canvas.style.position = 'relative'
+  canvas.style.zIndex = '0'
   container.appendChild(canvas)
+
+  // Black overlay the cinematic director fades through for its
+  // Forza-style cut transitions. Above the canvas, non-interactive; the
+  // director owns its opacity (0 clear … 1 black). Inline-styled to match
+  // the canvas — this layer is scene-managed, not React-managed.
+  if (getComputedStyle(container).position === 'static') container.style.position = 'relative'
+  const fadeOverlay = document.createElement('div')
+  fadeOverlay.setAttribute('aria-hidden', 'true')
+  fadeOverlay.style.position = 'absolute'
+  fadeOverlay.style.inset = '0'
+  fadeOverlay.style.background = '#000'
+  fadeOverlay.style.opacity = '0'
+  fadeOverlay.style.pointerEvents = 'none'
+  fadeOverlay.style.zIndex = '1'
+  container.appendChild(fadeOverlay)
 
   const initialRect = container.getBoundingClientRect()
   const dpr = window.devicePixelRatio || 1
@@ -2586,57 +2607,77 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
   // machinery actually sits, not the geometric floor center.
   const actionCenter = new Vector3(FLOOR_SIZE / 2, FLOOR_SIZE / 2 - 800, 0)
 
-  // S1 vertical overpass — tallest/longest arch; the hero close-up.
-  const s1BridgeCenter = worldXY(
-    BRIDGE_COL + 0.5,
-    BRIDGE_NORTH_ROW + BRIDGE_CELL_COUNT / 2,
-    BRIDGE_PEAK_HEIGHT / 2,
-  )
+  // CI Passed station. This shot was originally the S1 bridge close-up,
+  // but at a low angle it read as the splitter junction at the bridge's
+  // foot, so it now frames CI Passed — just east of those splitters.
+  // (The over/under crossing remains the dedicated bridge shot.)
+  const ciPassedCenter = stationCenter(CI_PASSED, 30)
   // Over/under crossing — one belt passes under the span, one over.
   const crossingCenter = worldXY(
     (BRIDGE_UNDER_POLE_1_COL + OVER_BRIDGE_MERGER_COL) / 2 + 0.5,
     (BRIDGE_UNDER_POLE_1_ROW + OVER_BRIDGE_MERGER_ROW) / 2 + 0.5,
     14,
   )
+  // Merger just east of CI Failed, where its output meets the loop-back
+  // traffic — the subject of a tight, slowly rotating close-up.
+  const ciFailedMergerCenter = worldXY(LOOP_MERGER_COL + 0.5, LOOP_MERGER_ROW + 0.5, 12)
 
   // A belt-truck shot: the camera holds a low angle while the target
   // glides end→end along a long run at a steady ~220 wu/s.
-  const truckShot = (id: string, from: Vector3, to: Vector3): Shot => ({
-    id,
-    base: 7,
-    region: {
+  const truckShot = (id: string, from: Vector3, to: Vector3): Shot => {
+    const region = {
       cx: (from.x + to.x) / 2,
       cy: (from.y + to.y) / 2,
       halfX: Math.abs(to.x - from.x) / 2 + FLOOR_CELL,
       halfY: Math.abs(to.y - from.y) / 2 + FLOOR_CELL,
-    },
-    resolve: () => ({
-      alpha: Math.PI / 2,
-      beta: 0.32,
-      radius: 1000,
-      target: from.clone(),
-      targetTo: to.clone(),
-      hold: Math.min(11, Math.max(6, Vector3.Distance(from, to) / 220)),
-    }),
-  })
+    }
+    return {
+      id,
+      base: 7,
+      region,
+      resolve: () => {
+        // Don't ride an empty belt. A truck shot is only worth it when
+        // chips are actually traveling the run — otherwise it's a slow
+        // pan over a dead conveyor. (Static structures like the bridges
+        // read fine empty; a motion shot needs motion.) Declining here
+        // makes the director re-pick something with life in it.
+        const live = chipController
+          .collectChipXY()
+          .some(
+            (c) =>
+              Math.abs(c.x - region.cx) <= region.halfX &&
+              Math.abs(c.y - region.cy) <= region.halfY,
+          )
+        if (!live) return null
+        return {
+          alpha: Math.PI / 2,
+          beta: 0.6,
+          radius: 720,
+          target: from.clone(),
+          targetTo: to.clone(),
+          hold: Math.min(11, Math.max(6, Vector3.Distance(from, to) / 220)),
+        }
+      },
+    }
+  }
 
   const cinematicDeck: Shot[] = [
     {
-      id: 's1-bridge',
-      base: 10,
+      id: 'ci-passed',
+      base: 7,
       region: {
-        cx: s1BridgeCenter.x,
-        cy: s1BridgeCenter.y,
-        halfX: 1.5 * FLOOR_CELL,
-        halfY: (BRIDGE_CELL_COUNT / 2 + 1) * FLOOR_CELL,
+        cx: ciPassedCenter.x,
+        cy: ciPassedCenter.y,
+        halfX: 2.5 * FLOOR_CELL,
+        halfY: 2.5 * FLOOR_CELL,
       },
       resolve: () => ({
-        alpha: Math.PI / 2 + 0.6,
-        beta: 0.22,
-        radius: 540,
-        target: s1BridgeCenter.clone(),
-        hold: 6.5,
-        driftAlpha: 0.05,
+        alpha: Math.PI / 2 + 0.4,
+        beta: 0.7,
+        radius: 380,
+        target: ciPassedCenter.clone(),
+        hold: 6,
+        driftAlpha: 0.04,
       }),
     },
     {
@@ -2650,11 +2691,32 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
       },
       resolve: () => ({
         alpha: Math.PI / 2 - 0.5,
-        beta: 0.28,
-        radius: 680,
+        beta: 0.72,
+        radius: 480,
         target: crossingCenter.clone(),
         hold: 7,
         driftAlpha: 0.04,
+      }),
+    },
+    {
+      // Ultra close-up on the merger just east of CI Failed, orbiting
+      // slowly L→R. Tightest zoom the camera allows; reads as a detailed
+      // junction even when idle, so it helps fill the quiet-floor rotation.
+      id: 'ci-failed-merger',
+      base: 8,
+      region: {
+        cx: ciFailedMergerCenter.x,
+        cy: ciFailedMergerCenter.y,
+        halfX: 2 * FLOOR_CELL,
+        halfY: 2 * FLOOR_CELL,
+      },
+      resolve: () => ({
+        alpha: Math.PI / 2,
+        beta: 1.1,
+        radius: 270, // ≈ the camera's tightest zoom (lowerRadiusLimit)
+        target: ciFailedMergerCenter.clone(),
+        hold: 9,
+        driftAlpha: -0.05, // slow sweep (reversed)
       }),
     },
     truckShot(
@@ -2683,11 +2745,11 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
       },
       resolve: () => ({
         alpha: Math.PI / 2 + 0.3,
-        beta: 0.25,
-        radius: 900,
+        beta: 0.45,
+        radius: 640,
         target: stationCenter(REVIEW_REQUESTED, 0),
         hold: 6.5,
-        craneBeta: 0.05, // 0.25 → ~0.58 over the hold
+        craneBeta: 0.06, // 0.45 → ~0.84 over the hold
         driftAlpha: 0.03,
       }),
     },
@@ -2695,10 +2757,11 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
       id: 'establishing',
       base: 5,
       region: null,
+      wide: true,
       resolve: () => ({
         alpha: Math.PI / 2,
-        beta: 0.36,
-        radius: 2400,
+        beta: 0.52,
+        radius: 1600,
         target: actionCenter.clone(),
         hold: 8,
         driftAlpha: 0.02,
@@ -2708,10 +2771,11 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
       id: 'blueprint',
       base: 5,
       region: null,
+      wide: true,
       resolve: () => ({
         alpha: Math.PI / 2,
-        beta: 0.09,
-        radius: 2600,
+        beta: 0.18,
+        radius: 1900,
         target: actionCenter.clone(),
         hold: 9,
         driftTargetX: 16,
@@ -2736,9 +2800,9 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
         if (!best) return null
         return {
           alpha: Math.PI / 2 + 0.4,
-          beta: 0.5,
-          radius: 470,
-          target: stationCenter(best.spec, 0),
+          beta: 0.72,
+          radius: 360,
+          target: stationCenter(best.spec, 20),
           hold: 5.5,
           driftAlpha: 0.05,
         }
@@ -2746,8 +2810,14 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
     },
   ]
 
-  const cinematic = new CinematicDirector(renderer.camera, renderer.scene, cinematicDeck, () =>
-    chipController.collectChipXY(),
+  const cinematic = new CinematicDirector(
+    renderer.camera,
+    renderer.scene,
+    cinematicDeck,
+    () => chipController.collectChipXY(),
+    (opacity) => {
+      fadeOverlay.style.opacity = String(opacity)
+    },
   )
   // Re-attach user camera controls once the camera has fully eased back
   // to the pre-entry pose (fires on every exit, manual or self).
@@ -2764,6 +2834,7 @@ export async function createIsoScene(container: HTMLDivElement): Promise<IsoScen
       cinematic.dispose()
       ro.disconnect()
       renderer.destroy()
+      fadeOverlay.remove()
       canvas.remove()
     },
     resetView: () => renderer.resetView(),
