@@ -99,13 +99,17 @@ type EventHandlerStore interface {
 	// blueprint_id is also immutable. updated_at is refreshed.
 	Update(ctx context.Context, orgID string, h domain.EventHandler) error
 
-	// SetEnabled flips just the enabled bit. Used for the
-	// "disable instead of delete" path on system rows — they're
-	// shipped on every boot via Seed.
+	// SetEnabled flips just the enabled bit — the user-facing enable/disable
+	// toggle. (It is no longer the system-row "disable instead of delete" path:
+	// system rows hard-delete like any other now that Seed runs only at
+	// provisioning time, not every boot — see Delete.)
 	SetEnabled(ctx context.Context, orgID string, id string, enabled bool) error
 
-	// Delete hard-deletes a handler. Handlers gate this on
-	// source='user' — system rows go through SetEnabled(false).
+	// Delete hard-deletes a handler unconditionally — system rows included.
+	// Nothing re-seeds at boot anymore (provisioning's materializer runs once
+	// per fresh tenant via Bootstrap*), so a deleted shipped default is durable;
+	// there is no soft-disable-instead-of-delete fallback for system rows. The
+	// "disable, don't delete" convention was a relic of boot-time re-seeding.
 	Delete(ctx context.Context, orgID string, id string) error
 
 	// Reorder updates sort_order for each rule based on its position
