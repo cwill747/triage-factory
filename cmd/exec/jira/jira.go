@@ -4,11 +4,15 @@ import (
 	"fmt"
 	"os"
 
-	jiraclient "github.com/sky-ai-eng/triage-factory/internal/jira"
+	"github.com/sky-ai-eng/triage-factory/cmd/exec/agenthost"
 )
 
-// Handle dispatches jira subcommands.
-func Handle(client *jiraclient.Client, args []string) {
+// Handle dispatches jira subcommands. host is the agenthost.Client every
+// Jira API call routes through: in the sandbox it ships the call to the
+// host daemon (which holds the ForSystem credential); in local mode the
+// in-process LocalClient builds the same client directly. host is nil on
+// the help route, which returns before any call.
+func Handle(host agenthost.Client, args []string) {
 	if len(args) == 0 || args[0] == "--help" || args[0] == "-h" {
 		printHelp()
 		return
@@ -19,7 +23,7 @@ func Handle(client *jiraclient.Client, args []string) {
 
 	switch resource {
 	case "ticket":
-		handleTicket(client, cmdArgs)
+		handleTicket(host, cmdArgs)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown jira resource: %s\n", resource)
 		os.Exit(1)
@@ -38,7 +42,7 @@ const HelpText = `Jira Ticket Commands:
   jira ticket edit <key> [--summary <text>] [--description <text>] [--priority <p>] [--type <t>] [--add-label <l>] [--remove-label <l>]  Update fields on an existing issue
   jira ticket set-parent <key> --parent <parent_key>           Link issue under a parent
   jira ticket set-priority <key> --priority <priority>         Update issue priority
-  jira ticket search --jql <jql> [--fields <f1,f2,...>] [--max <N>]  Search issues via JQL
+  jira ticket search --jql <jql> [--fields <f1,f2,...>] [--max <N>] (default 50)  Search issues via JQL
   jira ticket list-children <key>                              List child issues (subtasks + epic children)
   jira ticket list-types <project>                             List available issue types
   jira ticket list-priorities                                  List available priority levels`

@@ -113,18 +113,21 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 }
 
-// connReadTimeout caps how long the daemon waits for a frame to
-// arrive after accept. A connecting client that never sends a frame
-// is either confused or malicious; either way, no reason to hold the
-// goroutine open.
-const connReadTimeout = 10 * time.Second
+// connIOTimeout bounds a single frame's I/O on a connection — reading
+// the request frame after accept, and writing the response (or error)
+// frame. A client that never sends a frame, or never drains the reply,
+// is confused or malicious; either way, no reason to hold the goroutine
+// open. The dispatch between the read and the write is NOT bounded by
+// this — it gets its own, longer budget (callTimeout) — so a slow DB or
+// upstream API call doesn't trip the frame deadline.
+const connIOTimeout = 10 * time.Second
 
 // handleConn reads one request, dispatches it, writes one response,
 // closes. Any malformed input is responded to with an error frame
 // rather than silently dropped — the client has to know the call
 // failed.
 func (s *Server) handleConn(conn net.Conn) {
-	if err := conn.SetDeadline(time.Now().Add(connReadTimeout)); err != nil {
+	if err := conn.SetDeadline(time.Now().Add(connIOTimeout)); err != nil {
 		log.Printf("[agenthost] set deadline: %v", err)
 		return
 	}
@@ -143,10 +146,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		return
 	}
 
-	// Clear the read deadline now that the request is in hand —
-	// the dispatch below may make DB calls that take longer than
-	// connReadTimeout. We re-arm a write deadline before writing
-	// the response.
+	// Clear the read deadline now that the request is in hand — the
+	// dispatch below may make DB or upstream API calls (e.g. a host-side
+	// Jira request) that take longer than connIOTimeout. We re-arm a
+	// write deadline before writing the response.
 	_ = conn.SetReadDeadline(time.Time{})
 
 	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
@@ -165,7 +168,7 @@ func (s *Server) handleConn(conn net.Conn) {
 		}
 	}
 
-	if err := conn.SetWriteDeadline(time.Now().Add(connReadTimeout)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(connIOTimeout)); err != nil {
 		log.Printf("[agenthost] set write deadline: %v", err)
 		return
 	}
@@ -175,7 +178,7 @@ func (s *Server) handleConn(conn net.Conn) {
 }
 
 func (s *Server) sendError(conn net.Conn, msg string) {
-	if err := conn.SetWriteDeadline(time.Now().Add(connReadTimeout)); err != nil {
+	if err := conn.SetWriteDeadline(time.Now().Add(connIOTimeout)); err != nil {
 		return
 	}
 	_ = writeFrame(conn, response{Error: msg})
@@ -367,6 +370,133 @@ func (s *Server) dispatch(ctx context.Context, method string, rawArgs json.RawMe
 			return nil, err
 		}
 		return buildAgentRunFooterResult{Footer: footer}, nil
+
+	// --- jira: build ForSystem host-side, make the REST call, return the
+	// result / error. The per-request LocalClient reads the credential
+	// from this daemon's (host-side, Vault-backed) stores, so nothing
+	// reaches the sandbox but the typed result or the error string. ---
+
+	case methodJiraGetIssue:
+		var a jiraKeyArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		issue, err := client.JiraGetIssue(ctx, a.Key)
+		if err != nil {
+			return nil, err
+		}
+		return jiraIssueResult{Issue: issue}, nil
+
+	case methodJiraTransitionTo:
+		var a jiraTransitionArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		return emptyResult{}, client.JiraTransitionTo(ctx, a.Key, a.Status)
+
+	case methodJiraGetTransitions:
+		var a jiraKeyArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		transitions, err := client.JiraGetTransitions(ctx, a.Key)
+		if err != nil {
+			return nil, err
+		}
+		return jiraTransitionsResult{Transitions: transitions}, nil
+
+	case methodJiraAddComment:
+		var a jiraCommentArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		return emptyResult{}, client.JiraAddComment(ctx, a.Key, a.Body)
+
+	case methodJiraAssignToSelf:
+		var a jiraKeyArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		return emptyResult{}, client.JiraAssignToSelf(ctx, a.Key)
+
+	case methodJiraUnassign:
+		var a jiraKeyArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		return emptyResult{}, client.JiraUnassign(ctx, a.Key)
+
+	case methodJiraCreateIssue:
+		var a jiraCreateIssueArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		key, err := client.JiraCreateIssue(ctx, a.Project, a.IssueType, a.Summary, a.Description, a.ParentKey, a.Priority)
+		if err != nil {
+			return nil, err
+		}
+		return jiraCreateIssueResult{Key: key}, nil
+
+	case methodJiraUpdateIssue:
+		var a jiraUpdateIssueArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		return emptyResult{}, client.JiraUpdateIssue(ctx, a.Key, a.Fields)
+
+	case methodJiraSetParent:
+		var a jiraSetParentArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		return emptyResult{}, client.JiraSetParent(ctx, a.Key, a.ParentKey)
+
+	case methodJiraGetChildIssues:
+		var a jiraKeyArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		issues, err := client.JiraGetChildIssues(ctx, a.Key)
+		if err != nil {
+			return nil, err
+		}
+		return jiraIssuesResult{Issues: issues}, nil
+
+	case methodJiraSearchIssues:
+		var a jiraSearchArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		issues, err := client.JiraSearchIssues(ctx, a.JQL, a.Fields, a.MaxResults)
+		if err != nil {
+			return nil, err
+		}
+		return jiraIssuesResult{Issues: issues}, nil
+
+	case methodJiraListPriorities:
+		priorities, err := client.JiraListPriorities(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return jiraPrioritiesResult{Priorities: priorities}, nil
+
+	case methodJiraSetPriority:
+		var a jiraSetPriorityArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		return emptyResult{}, client.JiraSetPriority(ctx, a.Key, a.Priority)
+
+	case methodJiraListIssueTypes:
+		var a jiraProjectArgs
+		if err := dec(&a); err != nil {
+			return nil, err
+		}
+		types, err := client.JiraListIssueTypes(ctx, a.Project)
+		if err != nil {
+			return nil, err
+		}
+		return jiraIssueTypesResult{IssueTypes: types}, nil
 
 	default:
 		return nil, fmt.Errorf("%w: %s", ErrUnknownMethod, method)
