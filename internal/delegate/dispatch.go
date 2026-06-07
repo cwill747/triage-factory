@@ -100,24 +100,52 @@ func (s *Spawner) reconcileRunQueue(ctx context.Context) {
 	}
 }
 
-// drainRunQueue claims and dispatches queued runs until the queue is empty (or
-// ctx is cancelled). Unlike the event-queue worker, each claimed run runs its
-// agent inline before the next claim — a single dispatcher processes one step at
-// a time, matching the pre-queue single-goroutine sequencing.
+// drainRunQueue claims queued runs and hands each to a goroutine, bounded by
+// the process-wide concurrency semaphore, until the queue is empty (or ctx is
+// cancelled). It acquires a slot BEFORE each claim, so at capacity it blocks on
+// a free slot rather than reserving a run it can't yet run (no claimed-but-idle
+// 'running' rows). Each claimed run executes — setup, agent, reactor — off the
+// dispatcher, so the loop keeps claiming the next run (up to the cap) without
+// waiting for the previous one to finish. The claim is FOR UPDATE SKIP LOCKED,
+// so this is the same mechanism a future N-worker dispatcher uses; the
+// semaphore is what keeps a burst of queued steps from fanning into an
+// unbounded number of agent subprocesses on one host.
 func (s *Spawner) drainRunQueue(ctx context.Context) {
+	// Capture the semaphore once and use it for both acquire and release so a
+	// startup-time SetMaxConcurrentRuns can't strand a token on a replaced
+	// channel.
+	sem := s.semaphore()
 	for {
 		if ctx.Err() != nil {
 			return
 		}
+		// Acquire a concurrency slot BEFORE claiming, so we never flip a run to
+		// 'running' that then sits idle waiting for a slot. Blocks at capacity
+		// until a finishing run releases its slot; a shutdown breaks the wait
+		// (in-flight runs are ctx-cancelled, and the boot reconcile re-queues
+		// anything left mid-flight).
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		run, err := s.runQueue.ClaimNextRun(ctx)
 		if err != nil {
+			<-sem
 			log.Printf("[dispatch] claim next run: %v (retrying on the next scan)", err)
 			return
 		}
 		if run == nil {
-			return // queue drained
+			<-sem
+			return // queue drained — release the slot we acquired but didn't use
 		}
-		s.dispatchClaimedRun(ctx, run)
+		// run is a fresh per-iteration `:=` binding (not a loop variable), so each
+		// goroutine captures its own; the deferred receive hands the slot back on
+		// terminal.
+		go func() {
+			defer func() { <-sem }()
+			s.dispatchClaimedRun(ctx, run)
+		}()
 	}
 }
 
@@ -267,7 +295,10 @@ func (s *Spawner) dispatchClaimedRun(ctx context.Context, run *domain.AgentRun) 
 	s.cancels[run.ID] = stepCancel
 	s.mu.Unlock()
 
-	s.runAgent(stepCtx, run.ID, *task, mission, cfg, time.Now(), run.Model, run.TriggerType, run.CreatorUserID)
+	// run.SessionID is empty on a first claim and non-empty when this run was
+	// re-claimed mid-flight by a crash — runAgent resumes it when the warm
+	// session survived, else starts fresh.
+	s.runAgent(stepCtx, run.ID, *task, mission, cfg, time.Now(), run.Model, run.TriggerType, run.CreatorUserID, run.SessionID)
 
 	s.mu.Lock()
 	delete(s.cancels, run.ID)
