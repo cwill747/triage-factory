@@ -3,8 +3,87 @@
 // active (expanded) step's heading + body live in Wizard.tsx, where they can
 // own the focus ref and the expand/collapse animation.
 
-import { Check } from 'lucide-react'
-import { inputClass } from '../settings/primitives'
+import { useRef } from 'react'
+import { ChevronRight } from 'lucide-react'
+import { nextRadioIndex } from '../../lib/rovingRadio'
+import { glassInputClass } from '../settings/primitives'
+
+// ChoiceCards is the flush two-panel picker shared by the GitHub access-method,
+// account-type, and clone-protocol steps: side-by-side options (a hairline
+// between, no box), each a title + a one-line detail, with a chevron that fades
+// in on hover to signal it advances. Action-on-click — the caller's onChoose
+// both records the choice and advances (the step is selfAdvancing), so there's
+// no Continue. The currently-selected option (when revisiting) reads in accent.
+export function ChoiceCards<T extends string>({
+  options,
+  selected,
+  onChoose,
+  ariaLabel,
+}: {
+  options: { kind: T; title: string; detail: string }[]
+  selected: T | null
+  onChoose: (kind: T) => void
+  ariaLabel?: string
+}) {
+  const btnRefs = useRef<(HTMLButtonElement | null)[]>([])
+  // Roving tabIndex: focus enters on the current choice, or the first option
+  // when nothing's been picked yet.
+  const selectedIndex = options.findIndex((o) => o.kind === selected)
+  const tabbable = selectedIndex < 0 ? 0 : selectedIndex
+  // Arrow keys move *focus* between the options, not selection: choosing here
+  // advances the wizard (selfAdvancing), so an arrow press must never commit +
+  // advance. The user lands focus, then activates with Enter/Space (native
+  // button → onClick → onChoose).
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    const current = btnRefs.current.findIndex((b) => b === document.activeElement)
+    const next = nextRadioIndex(e.key, current, options.length)
+    if (next === null) return
+    e.preventDefault()
+    btnRefs.current[next]?.focus()
+  }
+  return (
+    <div
+      role="radiogroup"
+      aria-label={ariaLabel}
+      onKeyDown={onKeyDown}
+      className="grid grid-cols-2 divide-x divide-[var(--color-border-subtle)]"
+    >
+      {options.map((opt, i) => {
+        const isSelected = selected === opt.kind
+        return (
+          <button
+            key={opt.kind}
+            ref={(el) => {
+              btnRefs.current[i] = el
+            }}
+            type="button"
+            role="radio"
+            aria-checked={isSelected}
+            tabIndex={i === tabbable ? 0 : -1}
+            onClick={() => onChoose(opt.kind)}
+            className={`group flex flex-col gap-1 rounded-lg text-left outline-none transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent/50 ${i === 0 ? 'pr-5' : 'pl-5'}`}
+          >
+            <span className="flex items-center gap-1.5">
+              <span
+                className={`text-[14px] font-medium transition-colors ${
+                  isSelected ? 'text-accent' : 'text-text-secondary group-hover:text-text-primary'
+                }`}
+              >
+                {opt.title}
+              </span>
+              <ChevronRight
+                size={14}
+                aria-hidden
+                className="text-accent opacity-0 transition-opacity group-hover:opacity-100"
+              />
+            </span>
+            <span className="text-[11px] leading-snug text-text-tertiary">{opt.detail}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
 
 // UrlField is the base-URL input shared by the GitHub and Jira URL steps: a
 // controlled field bound straight to wizard state (no local draft), so the
@@ -30,15 +109,19 @@ export function UrlField({
   return (
     <div className="space-y-2">
       <label className="block">
-        <span className="mb-1.5 block text-[11px] text-text-tertiary">{label}</span>
+        <span className="mb-2 block text-[11px] font-medium uppercase tracking-wide text-text-tertiary">
+          {label}
+        </span>
         <input
           type="url"
           value={value}
           placeholder={placeholder || 'https://…'}
           onChange={(e) => onChange(e.target.value)}
           aria-invalid={invalid || undefined}
-          className={`${inputClass}${
-            invalid ? ' !border-[var(--color-dismiss)] focus:!border-[var(--color-dismiss)]' : ''
+          className={`${glassInputClass}${
+            invalid
+              ? ' !border-[var(--color-dismiss)] focus:!border-[var(--color-dismiss)] focus:!shadow-[0_0_0_4px_rgba(168,69,69,0.16)]'
+              : ''
           }`}
         />
       </label>
@@ -61,37 +144,18 @@ export function SectionDivider({ title, id }: { title: string; id: string }) {
   )
 }
 
-// StepMarker is the leading dot of a bar: a green check once complete, else
-// the (1-based) step number in a neutral circle.
-function StepMarker({ number, complete }: { number: number; complete: boolean }) {
-  if (complete) {
-    return (
-      <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[var(--color-claim)]/15 text-[var(--color-claim)]">
-        <Check size={12} strokeWidth={3} aria-hidden />
-      </span>
-    )
-  }
-  return (
-    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-black/[0.05] text-[10px] font-medium text-text-tertiary">
-      {number}
-    </span>
-  )
-}
-
 // CollapsedStepBar renders a completed step that has receded above the active
-// one: a compact bar with the marker, the title, and the summary of what was
-// saved, as a button that re-expands it for editing. Only steps at or before
-// the active step are ever rendered (nothing below the active step shows), so
-// every collapsed bar is a reachable, editable one — there is no inert
-// "upcoming" variant.
+// one: a thin, flush row — no card/pill chrome, and no marker (the wizard's
+// gutter thread owns the marker) — with the title and the summary of what was
+// saved, that re-expands on click. Only steps at or before the active step are
+// ever rendered (nothing below the active step shows), so every row is reachable
+// and editable; there is no inert "upcoming" variant.
 export function CollapsedStepBar({
-  number,
   title,
   summary,
   complete,
   onEdit,
 }: {
-  number: number
   title: string
   summary: string
   complete: boolean
@@ -102,16 +166,17 @@ export function CollapsedStepBar({
       type="button"
       onClick={onEdit}
       aria-label={complete ? `${title} — completed. Edit.` : `${title} — in progress. Edit.`}
-      className="group flex w-full items-center gap-2.5 rounded-xl border border-border-subtle bg-surface-raised/60 px-4 py-2.5 text-left transition-colors hover:border-accent/40 hover:bg-surface-raised"
+      className="group flex w-full items-baseline gap-2.5 py-1 text-left"
     >
-      <StepMarker number={number} complete={complete} />
-      <span className="text-[13px] font-medium text-text-secondary">{title}</span>
+      <span className="text-[12px] font-medium uppercase tracking-[0.12em] text-text-tertiary transition-colors group-hover:text-text-secondary">
+        {title}
+      </span>
       {complete && (
-        <span className="truncate text-[12px] text-text-tertiary" title={summary}>
-          {summary}
+        <span className="truncate text-[12px] text-text-tertiary/80" title={summary}>
+          · {summary}
         </span>
       )}
-      <span className="ml-auto text-[11px] text-text-tertiary transition-colors group-hover:text-accent">
+      <span className="ml-auto text-[11px] text-text-tertiary opacity-0 transition-opacity group-hover:text-accent group-hover:opacity-100">
         Edit
       </span>
     </button>

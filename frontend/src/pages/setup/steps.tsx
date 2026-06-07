@@ -1,9 +1,11 @@
 // The wizard's step registry — one atomic action per stack entry. The
-// ORGANIZATION steps (GitHub URL → GitHub access → GitHub poll interval →
+// ORGANIZATION steps (GitHub URL → GitHub access method → [App: account type →
+// register | PAT: token → clone protocol (local only)] → GitHub poll interval →
 // Trackers → [Jira URL → Jira access → Jira poll interval, shown only when Jira
 // is the chosen/connected tracker] → org max model tier) and the four TEAM
-// steps for the first team (Repositories, GitHub teams, Jira projects, team
-// default model), composing the existing shared field groups into the same step
+// steps for
+// the first team (Repositories, GitHub teams, Jira projects, team default
+// model), composing the existing shared field groups into the same step
 // contract with no new host plumbing.
 //
 // The split is deliberate: each integration's URL, access, and cadence are
@@ -26,7 +28,15 @@
 // steps connect on Continue (PAT) or via an external launch (App register), so
 // their per-step persist either performs the connect or is a no-op advance.
 
-import { GitHubUrlStep, GitHubAccessStep, DEFAULT_GITHUB_URL } from './GitHubStep'
+import {
+  GitHubUrlStep,
+  GitHubModeStep,
+  GitHubAccountTypeStep,
+  GitHubAppStep,
+  GitHubPatStep,
+  GitHubCloneStep,
+  DEFAULT_GITHUB_URL,
+} from './GitHubStep'
 import TrackersStep from './TrackersStep'
 import { JiraUrlStep, JiraAccessStep } from './JiraStep'
 import {
@@ -39,8 +49,7 @@ import {
 } from '../../lib/reachability'
 import { toast } from '../../components/Toast/toastStore'
 import RepoPickerModal from '../../components/RepoPickerModal'
-import ModelGroup from '../settings/ModelGroup'
-import ModelTierSelector, { type ModelTierOption } from '../settings/ModelTierSelector'
+import { OrgModelStep, TeamModelStep } from './ModelStep'
 import PollerTimingGroup from '../settings/PollerTimingGroup'
 import GitHubTeamGroup from '../settings/GitHubTeamGroup'
 import JiraProjectRulesGroup from '../settings/JiraProjectRulesGroup'
@@ -60,7 +69,7 @@ import {
   teamConfigFromSettings,
   teamProjectsBlocked,
 } from '../settings/teamConfig'
-import type { WizardState, WizardStep } from './types'
+import type { LoadContext, WizardState, WizardStep } from './types'
 
 // Fresh wizard state before any load lands. Reuses the same empty-form
 // factories the Settings/create pages use, so the shell starts from the
@@ -71,7 +80,9 @@ export const initialWizardState = (): WizardState => ({
   hasGitHubPat: false,
   githubReady: false,
   githubUrlConfirmed: false,
-  githubAccessTab: 'app',
+  githubAccessTab: null,
+  githubAppOwnerType: 'user',
+  isLocal: false,
   jiraConnected: false,
   jiraUrlConfirmed: false,
   tracker: 'none',
@@ -128,7 +139,7 @@ async function fetchIntegrationsState(): Promise<{ githubReady: boolean; jiraCon
 // seed from the connection signals: a connected org has, by definition, a
 // previously-confirmed URL and access, so it resumes past those steps; the
 // access tab defaults to PAT for an org with a stored token, else App.
-async function loadOrg(): Promise<Partial<WizardState>> {
+async function loadOrg(ctx: LoadContext): Promise<Partial<WizardState>> {
   const [org, integrations] = await Promise.all([fetchOrgSettings(), fetchIntegrationsState()])
   if (!org) throw new Error('Could not load organization settings')
   const orgForm = orgConfigFromSettings(org)
@@ -136,6 +147,7 @@ async function loadOrg(): Promise<Partial<WizardState>> {
   return {
     org: orgForm,
     orgLoaded: true,
+    isLocal: ctx.isLocal,
     hasGitHubPat: org.has_github_pat,
     githubReady: integrations.githubReady,
     // Seeded only from a live connection — NOT from a stored base URL. A stored
@@ -143,7 +155,10 @@ async function loadOrg(): Promise<Partial<WizardState>> {
     // advance any value unchecked. An unconnected org always re-probes on
     // Continue (the URL step's whole job), connected resumes past it.
     githubUrlConfirmed: integrations.githubReady,
-    githubAccessTab: org.has_github_pat ? 'pat' : 'app',
+    // A returning org pre-selects its method (PAT if a token is stored, else App
+    // when already connected); a fresh org starts unselected so the picker opens
+    // with neither chosen and advances on the first click.
+    githubAccessTab: org.has_github_pat ? 'pat' : integrations.githubReady ? 'app' : null,
     jiraConnected: integrations.jiraConnected,
     jiraUrlConfirmed: integrations.jiraConnected,
     tracker: integrations.jiraConnected ? 'jira' : 'none',
@@ -206,15 +221,6 @@ async function persistTeamSettings(
   return result.warning
 }
 
-// The team default-model options: the three concrete tiers (no "no cap" — a
-// team always delegates with *some* model). Rendered by the same shared
-// ModelTierSelector the org max-tier step uses, so the two read identically.
-const TEAM_MODEL_OPTIONS: ModelTierOption[] = [
-  { value: 'haiku', label: 'Haiku', hint: 'Fastest, cheapest' },
-  { value: 'sonnet', label: 'Sonnet', hint: 'Balanced' },
-  { value: 'opus', label: 'Opus', hint: 'Most capable' },
-]
-
 // Step · GitHub URL (mandatory, first org step). The base-URL reachability
 // gate: Continue probes the host (URL-only, no creds) and, on success, saves
 // the base URL and marks it confirmed; an unreachable host rejects, bouncing
@@ -263,40 +269,89 @@ const githubUrlStep: WizardStep = {
   render: (ctx) => <GitHubUrlStep {...ctx} />,
 }
 
-// Step · GitHub access (mandatory). App (default) / PAT switcher. Continue
-// performs the PAT connect (saveOrgConfig validates creds + base URL and
-// surfaces the server's error) — there is no separate Connect button. The App
-// tab advances once the App is registered+installed (github_ready); its own
-// external Register launch lives in GitHubAppPanel, which a redirect can't fold
-// into Continue. isComplete is the server's github_ready signal, so the
-// mandatory backbone blocks the stack until GitHub is connected by any means.
-const githubAccessStep: WizardStep = {
-  id: 'org-github-access',
+// Step · GitHub access method (the mode picker). App vs PAT, as its own step;
+// it starts unselected and advances on click (selfAdvancing — no Continue
+// button), the in-body action both recording the choice and moving on. Complete
+// once a method is chosen; the mandatory GitHub gate lives on whichever config
+// step the choice makes visible.
+const githubModeStep: WizardStep = {
+  id: 'org-github-mode',
   section: 'org',
   title: 'GitHub access',
+  selfAdvancing: true,
+  isComplete: (s) => s.githubAccessTab !== null,
+  persist: async () => {},
+  collapsedSummary: (s) =>
+    s.githubAccessTab === 'pat'
+      ? 'Personal access token'
+      : s.githubAccessTab === 'app'
+        ? 'GitHub App'
+        : 'Not chosen',
+  render: (ctx) => <GitHubModeStep {...ctx} />,
+}
+
+// Step · App account type (visible when App is the chosen method, before the
+// registration step). Personal vs Organization — which GitHub account the App
+// is registered under — as a flush two-panel picker, action-on-click
+// (selfAdvancing). Always complete (defaults to Personal); the value rides
+// state.githubAppOwnerType into the registration step.
+const githubAccountStep: WizardStep = {
+  id: 'org-github-account',
+  section: 'org',
+  title: 'App account type',
+  visible: (s) => s.githubAccessTab === 'app',
+  selfAdvancing: true,
+  isComplete: () => true,
+  persist: async () => {},
+  collapsedSummary: (s) =>
+    s.githubAppOwnerType === 'org' ? 'Organization account' : 'Personal account',
+  render: (ctx) => <GitHubAccountTypeStep {...ctx} />,
+}
+
+// connectedSummary — shared by the App / PAT config steps: the connected host,
+// or "Not connected".
+const connectedSummary = (s: WizardState) =>
+  s.githubReady ? `Connected · ${hostOf(s.org.github_url || DEFAULT_GITHUB_URL)}` : 'Not connected'
+
+// Step · GitHub App (mandatory, visible when App is the chosen method). The App
+// registration is GitHubAppPanel's external Register launch (a redirect can't
+// fold into Continue), so persist is a no-op — Continue just advances once the
+// App is registered+installed (github_ready), which validate gates.
+const githubAppStep: WizardStep = {
+  id: 'org-github-app',
+  section: 'org',
+  title: 'GitHub App',
+  visible: (s) => s.githubAccessTab === 'app',
+  isComplete: (s) => s.githubReady,
+  validate: (s) => (s.githubReady ? null : 'Register and install your GitHub App to continue.'),
+  persist: async () => {},
+  collapsedSummary: connectedSummary,
+  render: (ctx) => <GitHubAppStep {...ctx} />,
+}
+
+// Step · Personal access token (mandatory, visible when PAT is the chosen
+// method). No separate Connect button — Continue performs the connect:
+// saveOrgConfig POSTs the org form; the backend validates the PAT against the
+// base URL and 422s on a bad token. A freshly-entered token is trusted on a
+// successful save; an empty field relied on a *stored* token, which the save
+// does NOT re-validate, so confirm against the server's github_ready signal
+// rather than optimistically marking connected.
+const githubPatStep: WizardStep = {
+  id: 'org-github-pat',
+  section: 'org',
+  title: 'Personal access token',
+  visible: (s) => s.githubAccessTab === 'pat',
   isComplete: (s) => s.githubReady,
   validate: (s) => {
     if (s.githubReady) return null
-    if (s.githubAccessTab === 'app') return 'Register and install your GitHub App to continue.'
     return !s.hasGitHubPat && s.org.github_pat.trim() === ''
       ? 'Enter a personal access token to connect.'
       : null
   },
   persist: async ({ state, patch }) => {
-    // Already connected (PAT, App, or a prior run) ⇒ advance. Otherwise this is
-    // the PAT path: saveOrgConfig POSTs the full org form; the backend
-    // validates the PAT against the base URL and returns a clear error on a bad
-    // token — exactly the creds error the old candidate path swallowed.
     if (state.githubReady) return
     const result = await saveOrgConfig(state.org)
     if (!result.ok) throw new Error(result.error)
-    // A freshly-entered token IS validated by the save (the backend 422s on a
-    // bad PAT), so it's safe to claim connected. An empty field relied on a
-    // *stored* token, which saveOrgConfig does NOT re-validate — confirm against
-    // the server's folded github_ready signal rather than optimistically marking
-    // connected, so a stored-but-expired token (or a failed integrations-status
-    // load that left githubReady false despite hasGitHubPat) can't finish the
-    // wizard with no working connection.
     if (state.org.github_pat.trim() === '') {
       const { githubReady } = await fetchIntegrationsState()
       if (!githubReady) {
@@ -305,11 +360,25 @@ const githubAccessStep: WizardStep = {
     }
     patch({ githubReady: true, hasGitHubPat: true, org: { ...state.org, github_pat: '' } })
   },
-  collapsedSummary: (s) =>
-    s.githubReady
-      ? `Connected · ${hostOf(s.org.github_url || DEFAULT_GITHUB_URL)}`
-      : 'Not connected',
-  render: (ctx) => <GitHubAccessStep {...ctx} />,
+  collapsedSummary: connectedSummary,
+  render: (ctx) => <GitHubPatStep {...ctx} />,
+}
+
+// Step · Clone protocol (visible when PAT is the chosen method AND local — multi
+// hardwires HTTPS). SSH vs HTTPS for how repos clone to the machine, as a flush
+// two-panel picker, action-on-click (selfAdvancing). Always complete (defaults
+// to SSH); persist saves the org form. Switching to SSH triggers the backend's
+// SSH preflight, which a default-SSH org never hits.
+const githubCloneStep: WizardStep = {
+  id: 'org-github-clone',
+  section: 'org',
+  title: 'Clone protocol',
+  visible: (s) => s.githubAccessTab === 'pat' && s.isLocal,
+  selfAdvancing: true,
+  isComplete: () => true,
+  persist: ({ state }) => persistOrg(state),
+  collapsedSummary: (s) => `Clone via ${s.org.github_clone_protocol.toUpperCase()}`,
+  render: (ctx) => <GitHubCloneStep {...ctx} />,
 }
 
 // Step · GitHub poll interval. Sits right after the GitHub steps so each
@@ -324,15 +393,26 @@ const githubPollerStep: WizardStep = {
   persist: ({ state }) => persistOrg(state),
   collapsedSummary: (s) => `GitHub every ${intervalLabel(s.org.github_poll_interval)}`,
   render: ({ state, patch }) => (
-    <PollerTimingGroup
-      value={{
-        github_poll_interval: state.org.github_poll_interval,
-        jira_poll_interval: state.org.jira_poll_interval,
-      }}
-      onChange={(p) => patch({ org: { ...state.org, ...p } })}
-      showJira={false}
-      showHeading={false}
-    />
+    <div className="space-y-5">
+      <div className="space-y-1.5">
+        <h2 className="text-[19px] font-medium tracking-tight text-text-primary">
+          How often should we poll GitHub?
+        </h2>
+        <p className="text-[13px] leading-relaxed text-text-tertiary">
+          More frequent polling surfaces new PRs and reviews sooner; less frequent is lighter on
+          rate limits.
+        </p>
+      </div>
+      <PollerTimingGroup
+        value={{
+          github_poll_interval: state.org.github_poll_interval,
+          jira_poll_interval: state.org.jira_poll_interval,
+        }}
+        onChange={(p) => patch({ org: { ...state.org, ...p } })}
+        showJira={false}
+        bare
+      />
+    </div>
   ),
 }
 
@@ -425,26 +505,36 @@ const jiraPollerStep: WizardStep = {
   persist: ({ state }) => persistOrg(state),
   collapsedSummary: (s) => `Jira every ${intervalLabel(s.org.jira_poll_interval)}`,
   render: ({ state, patch }) => (
-    <PollerTimingGroup
-      value={{
-        github_poll_interval: state.org.github_poll_interval,
-        jira_poll_interval: state.org.jira_poll_interval,
-      }}
-      onChange={(p) => patch({ org: { ...state.org, ...p } })}
-      showGitHub={false}
-      showHeading={false}
-    />
+    <div className="space-y-5">
+      <div className="space-y-1.5">
+        <h2 className="text-[19px] font-medium tracking-tight text-text-primary">
+          How often should we poll Jira?
+        </h2>
+        <p className="text-[13px] leading-relaxed text-text-tertiary">
+          The cadence for the Jira tracker — independent of the GitHub poll interval.
+        </p>
+      </div>
+      <PollerTimingGroup
+        value={{
+          github_poll_interval: state.org.github_poll_interval,
+          jira_poll_interval: state.org.jira_poll_interval,
+        }}
+        onChange={(p) => patch({ org: { ...state.org, ...p } })}
+        showGitHub={false}
+        bare
+      />
+    </div>
   ),
 }
 
-// Step 4 · Org max model tier. The shared ModelTierSelector (via ModelGroup) —
-// a card row, not a dropdown — that the team-default-model step reuses.
-// Optional (no cap is a legitimate end state), so it never blocks the stack.
+// Step 4 · Org max model tier — the ceiling ladder. Keeps an explicit Continue
+// (not selfAdvancing): picking a cap records it, but the user confirms with
+// Continue — "no cap" is a legitimate end state, so the step is always complete
+// and never blocks. No load of its own — reads the GitHub step's seeded org
+// form; persistOrg guards against saving when that load failed.
 const orgModelStep: WizardStep = {
   id: 'org-model',
   section: 'org',
-  // No load of its own — reads the GitHub step's seeded org form; persistOrg
-  // guards against saving when that load failed.
   title: 'Max model tier',
   isComplete: () => true,
   persist: ({ state }) => persistOrg(state),
@@ -452,12 +542,7 @@ const orgModelStep: WizardStep = {
     s.org.max_llm_model_tier
       ? `Capped at ${TIER_LABELS[s.org.max_llm_model_tier] ?? s.org.max_llm_model_tier}`
       : 'No model cap',
-  render: ({ state, patch }) => (
-    <ModelGroup
-      value={{ max_llm_model_tier: state.org.max_llm_model_tier }}
-      onChange={(p) => patch({ org: { ...state.org, ...p } })}
-    />
-  ),
+  render: (ctx) => <OrgModelStep {...ctx} />,
 }
 
 // Step 5 · Repositories (first team step). Embeds the shared RepoPickerModal
@@ -537,6 +622,7 @@ const githubTeamsStep: WizardStep = {
       teamId={teamId}
       includeMembership
       onLoaded={(github_groups) => patch({ team: { ...state.team, github_groups } })}
+      bare
     />
   ),
 }
@@ -566,6 +652,7 @@ const jiraProjectsStep: WizardStep = {
       value={state.team.jira_projects}
       onChange={(jira_projects) => patch({ team: { ...state.team, jira_projects } })}
       connected={state.jiraConnected}
+      bare
     />
   ),
 }
@@ -588,20 +675,7 @@ const teamModelStep: WizardStep = {
   },
   collapsedSummary: (s) =>
     `Default model: ${TIER_LABELS[s.team.default_model] ?? s.team.default_model}`,
-  render: ({ state, patch }) => (
-    <div className="space-y-3">
-      <p className="text-[13px] leading-relaxed text-text-secondary">
-        The model this team delegates with by default. Capped by the workspace max tier — a higher
-        pick is clamped down to it.
-      </p>
-      <ModelTierSelector
-        value={state.team.default_model}
-        onChange={(default_model) => patch({ team: { ...state.team, default_model } })}
-        options={TEAM_MODEL_OPTIONS}
-        ariaLabel="Team default model"
-      />
-    </div>
-  ),
+  render: (ctx) => <TeamModelStep {...ctx} />,
 }
 
 // Ordered registry. Section grouping is derived from each step's `section`;
@@ -609,7 +683,11 @@ const teamModelStep: WizardStep = {
 // Jira-projects step is conditionally omitted via its `visible` predicate.
 export const WIZARD_STEPS: WizardStep[] = [
   githubUrlStep,
-  githubAccessStep,
+  githubModeStep,
+  githubAccountStep,
+  githubAppStep,
+  githubPatStep,
+  githubCloneStep,
   githubPollerStep,
   trackersStep,
   jiraUrlStep,

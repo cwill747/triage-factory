@@ -10,6 +10,32 @@
 export const inputClass =
   'w-full bg-white/50 border border-border-subtle rounded-xl px-4 py-2.5 text-[13px] text-text-primary placeholder-text-tertiary focus:outline-none focus:ring-2 focus:ring-accent/30 focus:border-accent/40 transition-colors disabled:opacity-60 disabled:cursor-not-allowed'
 
+// glassInputClass is the flush, frosted input used by the setup wizard (the URL
+// steps, and the field groups when composed in `bare` mode) — a translucent
+// surface-overlay fill over a glass edge, with a soft accent focus ring. Lives
+// here next to inputClass so both the settings groups and the setup flow read
+// the same field material without a cross-package import.
+export const glassInputClass =
+  'w-full rounded-2xl border border-[var(--color-border-glass)] bg-[var(--color-surface-overlay)]/60 px-4 py-3 text-[14px] text-text-primary placeholder:text-text-tertiary backdrop-blur-md outline-none transition-[border-color,background-color,box-shadow] focus:border-accent/40 focus:bg-[var(--color-surface-overlay)] focus:shadow-[0_0_0_4px_var(--color-accent-soft)] disabled:opacity-60 disabled:cursor-not-allowed'
+
+// Segmented toggle styling (SSH/HTTPS, the App's Personal/Org switch), with a
+// flush glass variant for the setup wizard's `bare` field groups: a glass track
+// and an accent-tinted selected segment. The carded default keeps the white
+// chip. Kept here so the same control reads identically wherever it's composed.
+export const segmentedWrap = (bare = false) =>
+  bare
+    ? 'inline-flex rounded-xl border border-[var(--color-border-glass)] bg-[var(--color-surface-overlay)]/50 p-0.5 backdrop-blur-md'
+    : 'inline-flex rounded-lg border border-border-glass bg-black/[0.02] p-0.5'
+
+export const segmentedBtn = (selected: boolean, bare = false) =>
+  `rounded-md px-3 py-1 text-[12px] font-medium transition-colors ${
+    selected
+      ? bare
+        ? 'bg-accent/[0.12] text-accent shadow-sm'
+        : 'bg-white text-text-primary shadow-sm'
+      : 'text-text-tertiary hover:text-text-secondary'
+  }`
+
 // Poll-interval options shared by the GitHub + Jira timing selects. The
 // values are Go duration strings (the wire format org_settings round-trips).
 export const POLL_INTERVAL_OPTIONS: { value: string; label: string }[] = [

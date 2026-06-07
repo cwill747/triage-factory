@@ -42,6 +42,10 @@ export const WIZARD_SECTIONS: WizardSection[] = [
 // selected for display but never persists a connection.
 export type TrackerKind = 'none' | 'jira' | 'linear'
 
+// The GitHub access method an org connects with — its own picker step, gating
+// the App vs PAT config steps. App is the default in both modes.
+export type GitHubAccessMode = 'app' | 'pat'
+
 export interface WizardState {
   org: OrgConfigForm
   // True once the org form has been seeded from the server (the GitHub step's
@@ -66,11 +70,18 @@ export interface WizardState {
   // (githubReady) implies a previously-confirmed URL, so it's seeded from
   // githubReady on load.
   githubUrlConfirmed: boolean
-  // Which access method the GitHub access step is showing — App (default) or
-  // PAT. Lifted out of the step body into shared state so the step's Continue
-  // (which now performs the PAT connect, no separate button) can branch on it
-  // from persist(). Seeded to 'pat' for a returning org with a stored token.
-  githubAccessTab: 'app' | 'pat'
+  // Which access method is selected — App, PAT, or null (nothing chosen yet).
+  // The mode picker step starts unselected (null) and advances on click; the
+  // choice gates the App / PAT config steps' visibility, and the PAT step's
+  // Continue (the connect) reads it. Seeded non-null for a returning org (PAT if
+  // a token is stored, else App when already connected), null for a fresh org.
+  githubAccessTab: GitHubAccessMode | null
+  // The GitHub App owner type (personal vs org), chosen in its own step when App
+  // is the method; fed into GitHubAppPanel's registration. Defaults to 'user'.
+  githubAppOwnerType: 'user' | 'org'
+  // Whether the wizard is running in local mode — seeded from the load context.
+  // Gates the clone-protocol step (local-only; multi hardwires HTTPS).
+  isLocal: boolean
   // Whether the org currently has a working Jira connection (PAT + base URL).
   // Gates the poller step's Jira interval and the team Jira-projects step.
   jiraConnected: boolean
@@ -118,6 +129,11 @@ export interface StepContext extends WizardIdentity {
   // itself still renders once in the host's shared error line. Absent on the
   // persist path — persist surfaces errors by rejecting, not by reading this.
   error?: string | null
+  // Advance the wizard (validate → persist → next). Threaded in for render only,
+  // for a self-advancing step (the GitHub mode picker) whose in-body action
+  // both records the choice and moves on — no Continue button. Absent on the
+  // persist path.
+  advance?: () => void
 }
 
 // The step contract. Trivial or real, every step implements this so the host
@@ -163,6 +179,11 @@ export interface WizardStep {
   // left off where the step body owns a competing submit — the access steps'
   // Connect / Register — so Enter there doesn't fire the wrong action.
   advanceOnEnter?: boolean
+
+  // When true, the host renders no Continue button — the step's in-body action
+  // advances the flow itself (the GitHub mode picker: click App/PAT → move on).
+  // Back is still shown so the step is escapable.
+  selfAdvancing?: boolean
 
   // Compact label for the collapsed confirmation bar (e.g. "Capped at Sonnet").
   collapsedSummary: (state: WizardState) => string

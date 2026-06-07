@@ -147,6 +147,14 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+/* Tailwind v4 dropped the default cursor: pointer on buttons; restore it for
+   every enabled button so clickable controls read as interactive. Wrapped in
+   :where() for zero specificity so explicit cursor-* utilities (cursor-wait,
+   cursor-not-allowed, etc.) always override it. */
+:where(button:not(:disabled)) {
+  cursor: pointer;
+}
+
 /* ── react-diff-view theme overrides ── */
 /* Base stylesheet imported above provides layout. We retheme via CSS variables + overrides. */
 .diff {
