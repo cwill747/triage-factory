@@ -13,12 +13,10 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-// promptsHandler serves the prompt + event-type endpoints. It is the first
-// domain carved off the Server god-struct: it holds only the narrow deps
-// these handlers need — the DB handle (for the event-types catalog read) and
-// the transactional store runner — rather than reaching into the ~30-field
-// Server. routes() constructs one and registers its methods through the same
-// api()/apiMutating() middleware wrappers, so auth/CSRF are unchanged.
+// promptsHandler serves the prompt and event-type endpoints. It holds only
+// the deps these routes need — the DB handle (for the event-types catalog
+// read) and the transactional store runner — and routes() registers its
+// methods through the api()/apiMutating() middleware wrappers.
 type promptsHandler struct {
 	db *sql.DB
 	tx db.TxRunner

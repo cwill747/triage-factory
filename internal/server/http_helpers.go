@@ -62,8 +62,8 @@ func isUniqueViolation(err error) bool {
 // the frontend can prompt the user to pick one. In local mode the
 // shim guarantees a sentinel orgID so the empty branch never fires.
 //
-// Package-level so per-domain handler structs (not methods on *Server) can
-// call it directly. Usage: `orgID, ok := requireOrg(w, r); if !ok { return }`.
+// Package-level so any handler can use the org gate — a per-domain handler
+// struct or a Server method. Usage: `orgID, ok := requireOrg(w, r); if !ok { return }`.
 func requireOrg(w http.ResponseWriter, r *http.Request) (string, bool) {
 	orgID := OrgIDFrom(r.Context())
 	if orgID != "" {
@@ -76,10 +76,8 @@ func requireOrg(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return "", false
 }
 
-// requireOrg (method) delegates to the package-level function. It keeps
-// existing s.requireOrg(...) call sites working while handlers migrate off
-// the Server god-struct onto per-domain structs (which call the function
-// directly); it collapses to just the function once no callers remain.
+// requireOrg is the Server-method form of the package-level requireOrg, so
+// handlers written as Server methods can use the same org gate.
 func (s *Server) requireOrg(w http.ResponseWriter, r *http.Request) (string, bool) {
 	return requireOrg(w, r)
 }
