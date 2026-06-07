@@ -3,6 +3,7 @@ import { useAuthStatus } from './hooks/useAuthStatus'
 import { useAuth, useOptionalAuth } from './contexts/AuthContext'
 import { useOrgContext, useActiveOrgId } from './contexts/OrgContext'
 import { useGitHubIdentity } from './hooks/useGitHubIdentity'
+import { useJiraIdentity } from './hooks/useJiraIdentity'
 import { LOCAL_DEFAULT_ORG_ID } from './lib/githubApp'
 
 /**
@@ -153,6 +154,75 @@ export function RequireGitHubIdentity({
     const target = location.pathname + location.search
     const rt = target && target !== '/' ? '?return_to=' + encodeURIComponent(target) : ''
     return <Navigate to={'/orgs/' + orgId + '/connect-github' + rt} replace />
+  }
+  return <>{children}</>
+}
+
+/**
+ * RequireJiraIdentity is the Jira sibling of RequireGitHubIdentity, composed
+ * inside the shell *after* it (order: org access → GitHub identity → Jira
+ * identity). It blocks the app until the user has a stored per-user Jira
+ * credential for the active org's Jira host, redirecting to the Connect page
+ * (its own route, NOT behind this gate, so there's no loop) otherwise.
+ *
+ * Unlike GitHub, Jira is an OPTIONAL tracker: a GitHub-only org has no Jira to
+ * bind, so the gate self-disables there. Both signals come from the SAME read,
+ * /identity/jira (useJiraIdentity): `host` is the org's configured Jira host
+ * (empty ⇒ GitHub-only org, nothing to gate) and `connected` is whether this
+ * user has bound a credential. One source of truth, so "is Jira configured" and
+ * "is the user bound" can never disagree across a two-endpoint window. In every
+ * real org state an empty host is equivalent to "no org Jira PAT" — the org's
+ * Jira URL and PAT are set and cleared together.
+ *
+ * Fail-closed: a status-read error is held as a retryable panel, checked BEFORE
+ * the configured/connected branches, so a transient failure is never rendered
+ * through (which would silently skip the Jira check or admit an unbound user).
+ * This is why the configured-signal is read off this same fetch rather than the
+ * `jira` flag from /api/integrations/status — useAuthStatus has no error state,
+ * so a failed read there is indistinguishable from "GitHub-only" and the gate
+ * would fall open. The bind failure shapes (bad token, host-unreachable) surface
+ * on the Connect page itself.
+ *
+ * Runs in BOTH modes. Multi resolves the active org from OrgContext; local has
+ * no OrgContext, so it passes `isLocal` and the gate keys on the sentinel org.
+ */
+export function RequireJiraIdentity({
+  children,
+  isLocal = false,
+}: {
+  children: React.ReactNode
+  isLocal?: boolean
+}) {
+  const ctxOrgId = useActiveOrgId()
+  const orgId = isLocal ? LOCAL_DEFAULT_ORG_ID : ctxOrgId
+  const location = useLocation()
+  const { state, refresh } = useJiraIdentity(orgId)
+
+  if (!orgId || state.status === 'loading') {
+    return <Loading />
+  }
+  // Fail-closed: hold a transient read error rather than rendering through (a
+  // render-through would both skip the Jira check and leak the unbound app).
+  if (state.status === 'error') {
+    return (
+      <div className="min-h-screen bg-surface flex items-center justify-center">
+        <div className="text-center space-y-3">
+          <p className="text-text-secondary text-sm">Couldn&apos;t check your Jira connection.</p>
+          <button type="button" onClick={refresh} className="text-accent text-sm underline">
+            Retry
+          </button>
+        </div>
+      </div>
+    )
+  }
+  // No Jira host configured for this org → GitHub-only, no Jira gate.
+  if (state.data.host === '') {
+    return <>{children}</>
+  }
+  if (!state.data.connected) {
+    const target = location.pathname + location.search
+    const rt = target && target !== '/' ? '?return_to=' + encodeURIComponent(target) : ''
+    return <Navigate to={'/orgs/' + orgId + '/connect-jira' + rt} replace />
   }
   return <>{children}</>
 }
