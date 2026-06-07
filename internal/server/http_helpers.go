@@ -62,8 +62,9 @@ func isUniqueViolation(err error) bool {
 // the frontend can prompt the user to pick one. In local mode the
 // shim guarantees a sentinel orgID so the empty branch never fires.
 //
-// Usage: `orgID, ok := s.requireOrg(w, r); if !ok { return }`.
-func (s *Server) requireOrg(w http.ResponseWriter, r *http.Request) (string, bool) {
+// Package-level so per-domain handler structs (not methods on *Server) can
+// call it directly. Usage: `orgID, ok := requireOrg(w, r); if !ok { return }`.
+func requireOrg(w http.ResponseWriter, r *http.Request) (string, bool) {
 	orgID := OrgIDFrom(r.Context())
 	if orgID != "" {
 		return orgID, true
@@ -73,6 +74,14 @@ func (s *Server) requireOrg(w http.ResponseWriter, r *http.Request) (string, boo
 		"message": "no active org selected; call POST /api/me/active-org to choose one",
 	})
 	return "", false
+}
+
+// requireOrg (method) delegates to the package-level function. It keeps
+// existing s.requireOrg(...) call sites working while handlers migrate off
+// the Server god-struct onto per-domain structs (which call the function
+// directly); it collapses to just the function once no callers remain.
+func (s *Server) requireOrg(w http.ResponseWriter, r *http.Request) (string, bool) {
+	return requireOrg(w, r)
 }
 
 // decodeJSON decodes the request body into v. On failure it writes a

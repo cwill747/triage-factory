@@ -718,7 +718,8 @@ func (s *Server) routes() {
 	s.api("GET /api/factory/snapshot", s.handleFactorySnapshot)
 	s.apiMutating("POST /api/factory/delegate", s.handleFactoryDelegate)
 
-	s.api("GET /api/event-types", s.handleEventTypes)
+	ph := &promptsHandler{db: s.db, tx: s.tx}
+	s.api("GET /api/event-types", ph.handleEventTypes)
 	s.api("GET /api/event-schemas", s.handleEventSchemasList)
 	s.api("GET /api/event-schemas/{event_type}", s.handleEventSchemaGet)
 	// Unified event_handlers endpoints (SKY-259). Replace the former
@@ -732,12 +733,12 @@ func (s *Server) routes() {
 	s.apiMutating("DELETE /api/event-handlers/{id}", s.handleEventHandlerDelete)
 	s.apiMutating("POST /api/event-handlers/{id}/toggle", s.handleEventHandlerToggle)
 	s.apiMutating("POST /api/event-handlers/{id}/promote", s.handleEventHandlerPromote)
-	s.api("GET /api/prompts", s.handlePromptsList)
-	s.apiMutating("POST /api/prompts", s.handlePromptCreate)
-	s.api("GET /api/prompts/{id}", s.handlePromptGet)
-	s.apiMutating("PUT /api/prompts/{id}", s.handlePromptPut)
-	s.apiMutating("DELETE /api/prompts/{id}", s.handlePromptDelete)
-	s.api("GET /api/prompts/{id}/stats", s.handlePromptStats)
+	s.api("GET /api/prompts", ph.handlePromptsList)
+	s.apiMutating("POST /api/prompts", ph.handlePromptCreate)
+	s.api("GET /api/prompts/{id}", ph.handlePromptGet)
+	s.apiMutating("PUT /api/prompts/{id}", ph.handlePromptPut)
+	s.apiMutating("DELETE /api/prompts/{id}", ph.handlePromptDelete)
+	s.api("GET /api/prompts/{id}/stats", ph.handlePromptStats)
 	s.api("GET /api/blueprints", s.handleBlueprintsList)
 	s.apiMutating("POST /api/blueprints", s.handleBlueprintCreate)
 	s.apiMutating("PUT /api/blueprints/{id}", s.handleBlueprintUpdate)
