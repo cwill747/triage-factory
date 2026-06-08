@@ -572,9 +572,6 @@ function BindingGraphInner({
   promptToBlueprintRef.current = promptToBlueprint
   const triggeredRef = useRef(triggeredBlueprints)
   triggeredRef.current = triggeredBlueprints
-  // Full step objects per blueprint (carry the per-step brief), needed to
-  // reconstruct a PUT-steps body on reorder without dropping briefs.
-  const stepObjsRef = useRef<Record<string, BlueprintStep[]>>({})
   const nodesRef = useRef<Node[]>(nodes)
   nodesRef.current = nodes
   const onPromptClickRef = useRef(onPromptClick)
@@ -598,6 +595,10 @@ function BindingGraphInner({
   // True while a delete batch is in flight, so a held/double Delete (or a
   // double-click of the confirm dialog's Delete) doesn't dispatch twice.
   const deletingRef = useRef(false)
+  // Edge reconnection (rule 4): tracks whether a reconnect drag landed on a
+  // valid handle. onReconnectStart clears it; onReconnect sets it. If it's still
+  // false in onReconnectEnd, the edge was dropped on empty space → detach it.
+  const edgeReconnectSuccessful = useRef(true)
   // Mirror of deleteConfirm so onBeforeDelete (narrow deps, doesn't close over
   // the state) can early-return while the dialog is already open — a focused
   // Cancel button isn't in xyflow's key-guard list, so Delete/Backspace would
@@ -667,15 +668,13 @@ function BindingGraphInner({
       // — a prompt belongs to exactly one blueprint, so every step prompt is a
       // member of exactly one box — no shared-prompt-across-boxes collision.
       // firstPrompt: blueprint → its entry prompt; stepsByBlueprint: ordered
-      // prompt ids; stepObjs: full step rows (for the reorder PUT).
+      // prompt ids.
       const firstPrompt: Record<string, string> = {}
       const stepsByBlueprint: Record<string, string[]> = {}
-      const stepObjs: Record<string, BlueprintStep[]> = {}
       const nodeList: Prompt[] = []
       const seen = new Set<string>()
       for (const b of blueprintList) {
         const ordered = [...(stepsByBp.get(b.id) ?? [])].sort((x, y) => x.step_index - y.step_index)
-        stepObjs[b.id] = ordered
         stepsByBlueprint[b.id] = ordered.map((s) => s.step_prompt_id)
         if (ordered.length > 0) {
           firstPrompt[b.id] = ordered[0].step_prompt_id
@@ -691,7 +690,6 @@ function BindingGraphInner({
       setBlueprints(blueprintList)
       setBlueprintFirstPrompt(firstPrompt)
       setBlueprintSteps(stepsByBlueprint)
-      stepObjsRef.current = stepObjs
 
       const saved = layoutRef.current
       const boundIds = new Set((tRes as TriggerHandler[]).map((t) => t.event_type))
@@ -1058,6 +1056,10 @@ function BindingGraphInner({
     // Only wire to prompts that are actually on the canvas — a step whose prompt
     // is absent (e.g. mid-fetch or a deleted prompt) gets no dangling edge.
     const presentPrompts = new Set(prompts.map((p) => p.id))
+    // Reconnection (rule 4) is enabled on the head (target) end only, in both
+    // team and org-template scope (each has its own reconnect / retarget routes,
+    // reached via the scope-derived bases).
+    const reconnectable: Edge['reconnectable'] = 'target'
     const triggerEdges: Edge[] = triggers
       // Drop triggers whose blueprint has no resolvable entry prompt so we never
       // emit an edge pointing at a node that isn't on the canvas.
@@ -1075,6 +1077,7 @@ function BindingGraphInner({
         animated: t.enabled,
         data: { kind: 'trigger' },
         deletable: false,
+        reconnectable,
         style: {
           stroke: t.enabled ? 'var(--color-accent)' : 'var(--color-text-tertiary)',
           strokeWidth: t.enabled ? 2 : 1,
@@ -1108,6 +1111,7 @@ function BindingGraphInner({
           // Disconnecting this edge splits the blueprint before step i+1.
           data: { kind: 'sequence', blueprintId: bpId, atStepIndex: i + 1 },
           deletable: false,
+          reconnectable,
           style: { stroke: 'var(--color-text-tertiary)', strokeWidth: 1.5 },
           markerEnd: { type: MarkerType.ArrowClosed, color: 'var(--color-text-tertiary)' },
         })
@@ -1116,63 +1120,14 @@ function BindingGraphInner({
     return [...sequenceEdges, ...triggerEdges]
   }, [triggers, activeEventIds, blueprintFirstPrompt, blueprintSteps, prompts])
 
-  // Persist a reordered step list (drag-to-reorder within a box → PUT steps).
-  const persistReorder = useCallback(
-    async (blueprintId: string, orderedPromptIds: string[]) => {
-      const briefByPrompt = new Map(
-        (stepObjsRef.current[blueprintId] ?? []).map((s) => [s.step_prompt_id, s.brief]),
-      )
-      const steps = orderedPromptIds.map((pid) => ({
-        step_prompt_id: pid,
-        brief: briefByPrompt.get(pid) ?? '',
-      }))
-      try {
-        const res = await fetch(
-          `${blueprintsBase(template)}/${encodeURIComponent(blueprintId)}/steps`,
-          {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ steps }),
-          },
-        )
-        if (!res.ok) {
-          toast.error(await readError(res, 'Failed to reorder steps'))
-        }
-      } catch (err) {
-        toast.error(`Failed to reorder steps: ${err instanceof Error ? err.message : String(err)}`)
-      } finally {
-        // Re-render from the backend's truth either way (success applies the new
-        // order; failure reverts to the persisted order).
-        fetchAll()
-      }
-    },
-    [template, fetchAll],
-  )
-
-  // After a drag ends, if the dragged prompt's blueprint members now sort into a
-  // different order along the flow axis, persist the reorder. Spatial order is
-  // the gesture: nudging without crossing a sibling is a no-op.
-  const maybeReorder = useCallback(
-    (nonBox: Node[], draggedNodeId: string) => {
-      const pid = draggedNodeId.slice(2)
-      const bp = promptToBlueprintRef.current[pid]
-      if (!bp) return
-      const stepIds = blueprintStepsRef.current[bp] ?? []
-      if (stepIds.length < 2) return
-      const members = stepIds.map((id) => nonBox.find((n) => n.id === `p:${id}`))
-      if (members.some((n) => !n)) return
-      const sorted = [...(members as Node[])].sort(
-        (a, b) => a.position.x - b.position.x || a.position.y - b.position.y,
-      )
-      const newOrder = sorted.map((n) => n.id.slice(2))
-      if (newOrder.join('|') === stepIds.join('|')) return
-      persistReorder(bp, newOrder)
-    },
-    [persistReorder],
-  )
-
-  // Handle node changes (dragging) — apply, persist positions, recompute boxes,
-  // and detect a reorder on drag-end.
+  // Handle node changes (dragging) — apply, persist positions, recompute boxes.
+  //
+  // Dragging is purely cosmetic: layout is fully independent of step order, so
+  // moving a node (or a whole box) only updates its saved canvas position and
+  // never rewrites the blueprint's steps. Any layout is allowed. Step order is a
+  // product of the chain topology (the arrows), edited via connect/merge/split,
+  // and the sequence edges always render that true order regardless of where the
+  // nodes sit — so there is deliberately no position-derived reorder here.
   const onNodesChange = useCallback(
     (changes: NodeChange[]) => {
       // A blueprint box drags as a unit: translate its position delta onto its
@@ -1246,16 +1201,8 @@ function BindingGraphInner({
       const next = [...boxes, ...nonBox]
       nodesRef.current = next
       setNodes(next)
-
-      // Reorder detection on drag-end — only a direct prompt drag can reorder; a
-      // box drag moves every member by the same delta, so order is unchanged.
-      for (const change of changes) {
-        if (change.type === 'position' && change.dragging === false && change.id.startsWith('p:')) {
-          maybeReorder(nonBox, change.id)
-        }
-      }
     },
-    [computeBoxNodes, maybeReorder],
+    [computeBoxNodes],
   )
 
   // Connect: route the gesture (decision 7 enforcement lives in planConnection).
@@ -1552,6 +1499,142 @@ function BindingGraphInner({
     [template, fetchAll],
   )
 
+  // --- Edge reconnection (rule 4: drag an arrow's head onto a new target) ---
+  // Re-target lands on a free chain entry; drop-on-empty detaches. Both scopes
+  // (team + org template) have their own reconnect / retarget routes, reached
+  // via the scope-derived bases below.
+
+  // Re-point a trigger edge onto a different blueprint's entry: an in-place
+  // blueprint_id move that preserves the trigger row + its run history.
+  const doRetargetTrigger = useCallback(
+    async (triggerId: string, targetBlueprintId: string) => {
+      try {
+        const res = await fetch(
+          `${handlersBase(template)}/${encodeURIComponent(triggerId)}/retarget`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ blueprint_id: targetBlueprintId }),
+          },
+        )
+        if (!res.ok) {
+          toast.error(await readError(res, 'Failed to move trigger'))
+        }
+      } catch (err) {
+        toast.error(`Failed to move trigger: ${err instanceof Error ? err.message : String(err)}`)
+      } finally {
+        fetchAll()
+      }
+    },
+    [template, fetchAll],
+  )
+
+  // Re-point a sequence edge onto a different blueprint's entry: atomic
+  // split-here + merge-there, peeling the old downstream into a new orphan.
+  const doReconnectSequence = useCallback(
+    async (blueprintId: string, atStepIndex: number, targetBlueprintId: string) => {
+      try {
+        const res = await fetch(
+          `${blueprintsBase(template)}/${encodeURIComponent(blueprintId)}/reconnect`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              at_step_index: atStepIndex,
+              target_blueprint_id: targetBlueprintId,
+            }),
+          },
+        )
+        if (!res.ok) {
+          toast.error(await readError(res, 'Failed to reconnect step'))
+          return
+        }
+        toast.info('Steps after the reconnect point are now a separate blueprint.')
+      } catch (err) {
+        toast.error(`Failed to reconnect step: ${err instanceof Error ? err.message : String(err)}`)
+      } finally {
+        fetchAll()
+      }
+    },
+    [template, fetchAll],
+  )
+
+  const onReconnectStart = useCallback(() => {
+    edgeReconnectSuccessful.current = false
+  }, [])
+
+  // A reconnect drag landed on a handle. Resolve the edge kind + the new target,
+  // validate it's a free chain entry (≤1 input), and route to the right move.
+  // Setting the success flag first means a refused/no-op reconnect is never
+  // mistaken for a drop-on-empty delete.
+  //
+  // We never call ReactFlow's reconnectEdge / setEdges — `edges` is derived from
+  // server state and only changes on the fetchAll a successful move triggers. So
+  // a refused or failed reconnect simply doesn't mutate `edges`, and @xyflow
+  // snaps the dragged endpoint back to the original edge on drop (its
+  // reconnectable contract: the host app owns whether the change is committed).
+  const onReconnect = useCallback(
+    (oldEdge: Edge, newConnection: Connection) => {
+      edgeReconnectSuccessful.current = true
+      if (!scopeReady) return
+      const newTarget = newConnection.target ?? ''
+      if (!newTarget.startsWith('p:')) {
+        toast.error('A connection has to end on a prompt')
+        return
+      }
+      // Dropped back on the same head — nothing changed.
+      if (newTarget === oldEdge.target) return
+      const tid = newTarget.slice(2)
+      const targetBp = promptToBlueprintRef.current[tid]
+      if (!targetBp) {
+        toast.error('That prompt is not part of a blueprint')
+        return
+      }
+      // A valid re-target lands on a free chain entry: step 0 of a trigger-less
+      // blueprint (its head carries no inbound edge).
+      if (firstPromptRef.current[targetBp] !== tid) {
+        toast.error('That prompt already has an input — a step takes a single incoming edge')
+        return
+      }
+      if (triggeredRef.current.has(targetBp)) {
+        toast.error('That blueprint already has a trigger — detach it first')
+        return
+      }
+      const kind = (oldEdge.data as { kind?: string } | undefined)?.kind
+      if (kind === 'trigger') {
+        doRetargetTrigger(oldEdge.id, targetBp)
+        return
+      }
+      if (kind === 'sequence') {
+        const data = oldEdge.data as { blueprintId: string; atStepIndex: number }
+        if (targetBp === data.blueprintId) {
+          toast.error('A blueprint can’t wire into itself')
+          return
+        }
+        doReconnectSequence(data.blueprintId, data.atStepIndex, targetBp)
+      }
+    },
+    [scopeReady, doRetargetTrigger, doReconnectSequence],
+  )
+
+  // A reconnect drag ended. If it didn't land on a handle (success still false),
+  // the user dropped the head on empty space → detach: a trigger edge removes
+  // the trigger, a sequence edge splits the blueprint at that point.
+  const onReconnectEnd = useCallback(
+    (_event: MouseEvent | TouchEvent, edge: Edge) => {
+      if (edgeReconnectSuccessful.current) return
+      const kind = (edge.data as { kind?: string } | undefined)?.kind
+      if (kind === 'trigger') {
+        doDeleteTrigger(edge.id)
+      } else if (kind === 'sequence') {
+        const data = edge.data as { blueprintId: string; atStepIndex: number }
+        doSplit(data.blueprintId, data.atStepIndex)
+      }
+      edgeReconnectSuccessful.current = true
+    },
+    [doDeleteTrigger, doSplit],
+  )
+
   // Click an edge: plain click on a trigger edge opens its config; shift-click
   // any edge opens a contextual menu (trigger: edit/remove; sequence: split).
   const onEdgeClick: EdgeMouseHandler = useCallback((event, edge) => {
@@ -1712,6 +1795,9 @@ function BindingGraphInner({
         nodeTypes={nodeTypes}
         onNodesChange={onNodesChange}
         onConnect={onConnect}
+        onReconnectStart={onReconnectStart}
+        onReconnect={onReconnect}
+        onReconnectEnd={onReconnectEnd}
         onEdgeClick={onEdgeClick}
         onBeforeDelete={onBeforeDelete}
         fitView

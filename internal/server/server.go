@@ -739,6 +739,7 @@ func (s *Server) routes() {
 	s.apiMutating("DELETE /api/event-handlers/{id}", eh.handleEventHandlerDelete)
 	s.apiMutating("POST /api/event-handlers/{id}/toggle", eh.handleEventHandlerToggle)
 	s.apiMutating("POST /api/event-handlers/{id}/promote", eh.handleEventHandlerPromote)
+	s.apiMutating("POST /api/event-handlers/{id}/retarget", eh.handleEventHandlerRetarget)
 	s.api("GET /api/prompts", ph.handlePromptsList)
 	s.apiMutating("POST /api/prompts", ph.handlePromptCreate)
 	s.api("GET /api/prompts/{id}", ph.handlePromptGet)
@@ -755,6 +756,7 @@ func (s *Server) routes() {
 	s.apiMutating("PUT /api/blueprints/{id}/steps", bh.handleBlueprintStepsPut)
 	s.apiMutating("POST /api/blueprints/{id}/merge", bh.handleBlueprintMerge)
 	s.apiMutating("POST /api/blueprints/{id}/split", bh.handleBlueprintSplit)
+	s.apiMutating("POST /api/blueprints/{id}/reconnect", bh.handleBlueprintReconnect)
 	s.apiMutating("POST /api/blueprints/duplicate", bh.handleBlueprintDuplicate)
 	s.api("GET /api/blueprint-runs/{id}", bh.handleBlueprintRunGet)
 	s.apiMutating("POST /api/blueprint-runs/{id}/cancel", bh.handleBlueprintRunCancel)
@@ -779,6 +781,7 @@ func (s *Server) routes() {
 	s.apiMutating("PUT /api/org-template/blueprints/{id}/steps", ot.handleOrgTemplateBlueprintStepsPut)
 	s.apiMutating("POST /api/org-template/blueprints/{id}/merge", ot.handleOrgTemplateBlueprintMerge)
 	s.apiMutating("POST /api/org-template/blueprints/{id}/split", ot.handleOrgTemplateBlueprintSplit)
+	s.apiMutating("POST /api/org-template/blueprints/{id}/reconnect", ot.handleOrgTemplateBlueprintReconnect)
 	s.api("GET /api/org-template/event-handlers", ot.handleOrgTemplateHandlersList)
 	s.apiMutating("POST /api/org-template/event-handlers", ot.handleOrgTemplateHandlerCreate)
 	s.apiMutating("PUT /api/org-template/event-handlers/reorder", ot.handleOrgTemplateHandlerReorder)
@@ -787,6 +790,7 @@ func (s *Server) routes() {
 	s.apiMutating("DELETE /api/org-template/event-handlers/{id}", ot.handleOrgTemplateHandlerDelete)
 	s.apiMutating("POST /api/org-template/event-handlers/{id}/toggle", ot.handleOrgTemplateHandlerToggle)
 	s.apiMutating("POST /api/org-template/event-handlers/{id}/promote", ot.handleOrgTemplateHandlerPromote)
+	s.apiMutating("POST /api/org-template/event-handlers/{id}/retarget", ot.handleOrgTemplateHandlerRetarget)
 
 	// GitHub App manifest registration. The launch endpoint serves a
 	// script-free bounce page (carrying its own per-response CSP) that
