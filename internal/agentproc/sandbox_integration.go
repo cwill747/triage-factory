@@ -25,6 +25,47 @@ func shouldSandbox() bool {
 	return runmode.Current() == runmode.ModeMulti && runtime.GOOS == "linux"
 }
 
+// sandboxWorkRoot is where the run's Cwd (the run-root) is bind-mounted
+// inside the gVisor sandbox; mirrors sandbox/spec.go's Cwd="/work" mount and
+// the translateEnvForSandbox / translateAddDirsForSandbox rewrites.
+const sandboxWorkRoot = "/work"
+
+// AgentVisibleRoot returns the absolute path the agent observes for hostRoot
+// when hostRoot is the run's Cwd (the run-root). In sandbox mode the run-root
+// is always bind-mounted at /work, so the agent sees "/work" regardless of
+// the host path; un-sandboxed the agent runs directly against hostRoot.
+//
+// Callers interpolate this into the prompts and tool-result messages they
+// hand the agent so a concrete absolute memory/scratch path lands where the
+// agent's file tools can actually write it. Those tools do no shell env
+// expansion, so a bare "$TRIAGE_FACTORY_RUN_ROOT/..." reference would be
+// written verbatim; pre-expanding to this value is what makes the path
+// resolve identically whether the run is sandboxed or not.
+func AgentVisibleRoot(hostRoot string) string {
+	if shouldSandbox() {
+		return sandboxWorkRoot
+	}
+	return hostRoot
+}
+
+// AgentVisibleBinary returns the path the agent must use to invoke the TF
+// CLI. Under the sandbox the host binary is bind-mounted at sandboxTFBinary
+// (/usr/local/bin/triagefactory) and the host path doesn't exist inside the
+// rootfs, so the agent sees the canonical mount path; un-sandboxed it runs
+// the host binary directly.
+//
+// This is the {{BINARY_PATH}} value prompts interpolate, and it mirrors
+// rewriteAllowedToolsForSandbox, which re-points the `Bash(<selfBin> exec *)`
+// allowlist pattern to the same mount — without this the prompt would tell a
+// sandboxed agent to run a host path that ENOENTs and that the per-tool path
+// check would reject anyway.
+func AgentVisibleBinary(hostBin string) string {
+	if shouldSandbox() {
+		return sandboxTFBinary
+	}
+	return hostBin
+}
+
 // buildSandboxEnv constructs the *base* env exposed to the
 // sandboxed agent — the slice the sandbox's ConfigureProxies hook
 // then appends ANTHROPIC_BASE_URL / placeholder credentials onto

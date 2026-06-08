@@ -208,7 +208,17 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 		metadataJSON = ""
 	}
 
-	prompt := buildPrompt(task, metadataJSON, mission, cfg.scope, cfg.toolsRef, selfBin, runID)
+	// Resolve the paths the agent will actually observe, which differ from the
+	// host paths under the sandbox: the run-root is bind-mounted at "/work" and
+	// the TF binary at sandboxTFBinary. Pre-expanding these into the prompt is
+	// what makes the agent's file tools (no shell expansion) and its
+	// `{{BINARY_PATH}} exec ...` invocations resolve regardless of sandbox mode.
+	// selfBin itself stays the host path below for BuildAllowedToolsWithExtras —
+	// agentproc.Run rewrites the allowlist's binary path for the sandbox on its
+	// own (rewriteAllowedToolsForSandbox).
+	agentRunRoot := agentproc.AgentVisibleRoot(cfg.runRoot)
+	agentBin := agentproc.AgentVisibleBinary(selfBin)
+	prompt := buildPrompt(task, metadataJSON, mission, cfg.scope, cfg.toolsRef, agentBin, runID, agentRunRoot, namespace)
 
 	s.updateStatus(orgID, runID, "agent_starting")
 	if ctx.Err() != nil {
