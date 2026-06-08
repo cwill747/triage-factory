@@ -34,7 +34,7 @@ type Server struct {
 	users        db.UsersStore           // display_name + Jira binding on the user row; host-scoped GitHub identity via user_github_identities (SKY-396)
 	blueprints   db.BlueprintStore       // used by event-handler + project test fixtures
 	tasks        db.TaskStore            // SKY-283: task lifecycle, claim, queue + factory snapshot reads
-	agentRuns    db.AgentRunStore        // SKY-285: agent run lifecycle + transcript + yields
+	agentRuns    db.AgentRunStore        // SKY-285: agent run lifecycle + transcript
 	repos        db.RepoStore            // SKY-288: repo_profiles CRUD for repos/settings/projects handlers and curator pinned-repo materialization
 	projects     db.ProjectStore         // SKY-290: projects CRUD for projects/curator/backfill/project_entities handlers
 	curatorStore db.CuratorStore         // curator-runtime CRUD (curator_requests / curator_messages / curator_pending_context) — handler-side writes go through here so Postgres mode honors RLS and uses the right placeholder syntax
@@ -615,7 +615,6 @@ func (s *Server) routes() {
 	s.apiMutating("POST /api/agent/runs/{runID}/cancel", ag.handleAgentCancel)
 	s.apiMutating("POST /api/agent/runs/{runID}/takeover", ag.handleAgentTakeover)
 	s.apiMutating("POST /api/agent/runs/{runID}/release", ag.handleAgentRelease)
-	s.apiMutating("POST /api/agent/runs/{runID}/respond", ag.handleAgentRespond)
 	s.api("GET /api/agent/runs", ag.handleAgentRuns)
 	s.api("GET /api/agent/takeovers/held", ag.handleHeldTakeovers)
 
