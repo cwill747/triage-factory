@@ -30,14 +30,12 @@ type Server struct {
 	db           *sql.DB
 	prompts      db.PromptStore
 	swipes       db.SwipeStore
-	agents       db.AgentStore     // SKY-261 D-Claims: resolves the org's agent for claim stamps
-	teamAgents   db.TeamAgentStore // SKY-261 D-Claims: re-checks team_agents.enabled on swipe-delegate / factory-delegate
-	users        db.UsersStore     // display_name + Jira binding on the user row; host-scoped GitHub identity via user_github_identities (SKY-396)
-	blueprints   db.BlueprintStore
+	agents       db.AgentStore           // SKY-261 D-Claims: resolves the org's agent for claim stamps
+	teamAgents   db.TeamAgentStore       // SKY-261 D-Claims: re-checks team_agents.enabled on swipe-delegate / factory-delegate
+	users        db.UsersStore           // display_name + Jira binding on the user row; host-scoped GitHub identity via user_github_identities (SKY-396)
+	blueprints   db.BlueprintStore       // used by event-handler + project test fixtures
 	tasks        db.TaskStore            // SKY-283: task lifecycle, claim, queue + factory snapshot reads
 	agentRuns    db.AgentRunStore        // SKY-285: agent run lifecycle + transcript + yields
-	reviews      db.ReviewStore          // SKY-286: pending_reviews CRUD for reviews handler, swipe-discard, agent status payload
-	pendingPRs   db.PendingPRStore       // SKY-287: pending_prs CRUD for pending_prs handler, agent status payload, drag-back-to-queue cleanup
 	repos        db.RepoStore            // SKY-288: repo_profiles CRUD for repos/settings/projects handlers and curator pinned-repo materialization
 	projects     db.ProjectStore         // SKY-290: projects CRUD for projects/curator/backfill/project_entities handlers
 	curatorStore db.CuratorStore         // curator-runtime CRUD (curator_requests / curator_messages / curator_pending_context) — handler-side writes go through here so Postgres mode honors RLS and uses the right placeholder syntax
@@ -394,8 +392,6 @@ func New(database *sql.DB, stores db.Stores, takeoverDir string, serverPort int)
 		blueprints:   stores.Blueprints,
 		tasks:        stores.Tasks,
 		agentRuns:    stores.AgentRuns,
-		reviews:      stores.Reviews,
-		pendingPRs:   stores.PendingPRs,
 		repos:        stores.Repos,
 		projects:     stores.Projects,
 		events:       stores.Events,
@@ -606,14 +602,15 @@ func (s *Server) routes() {
 	s.apiMutating("POST /api/tasks/{id}/requeue", s.handleRequeue)
 	s.apiMutating("POST /api/tasks/{id}/advance", s.handleTaskAdvance)
 
-	s.api("GET /api/agent/runs/{runID}", s.handleAgentStatus)
-	s.api("GET /api/agent/runs/{runID}/messages", s.handleAgentMessages)
-	s.apiMutating("POST /api/agent/runs/{runID}/cancel", s.handleAgentCancel)
-	s.apiMutating("POST /api/agent/runs/{runID}/takeover", s.handleAgentTakeover)
-	s.apiMutating("POST /api/agent/runs/{runID}/release", s.handleAgentRelease)
-	s.apiMutating("POST /api/agent/runs/{runID}/respond", s.handleAgentRespond)
-	s.api("GET /api/agent/runs", s.handleAgentRuns)
-	s.api("GET /api/agent/takeovers/held", s.handleHeldTakeovers)
+	ag := &agentHandler{tx: s.tx, ws: s.ws, takeoverDir: s.takeoverDir, spawner: func() *delegate.Spawner { return s.spawner }}
+	s.api("GET /api/agent/runs/{runID}", ag.handleAgentStatus)
+	s.api("GET /api/agent/runs/{runID}/messages", ag.handleAgentMessages)
+	s.apiMutating("POST /api/agent/runs/{runID}/cancel", ag.handleAgentCancel)
+	s.apiMutating("POST /api/agent/runs/{runID}/takeover", ag.handleAgentTakeover)
+	s.apiMutating("POST /api/agent/runs/{runID}/release", ag.handleAgentRelease)
+	s.apiMutating("POST /api/agent/runs/{runID}/respond", ag.handleAgentRespond)
+	s.api("GET /api/agent/runs", ag.handleAgentRuns)
+	s.api("GET /api/agent/takeovers/held", ag.handleHeldTakeovers)
 
 	// Projects (SKY-215). Pure CRUD over the projects table; the
 	// Curator runtime that populates curator_session_id lands in
@@ -641,10 +638,11 @@ func (s *Server) routes() {
 	// Curator chat per project (SKY-216). The Curator package owns the
 	// long-lived CC session lifecycle; these endpoints are the API
 	// the Projects page (SKY-217) will hit.
-	s.apiMutating("POST /api/projects/{id}/curator/messages", s.handleCuratorSend)
-	s.api("GET /api/projects/{id}/curator/messages", s.handleCuratorHistory)
-	s.apiMutating("DELETE /api/projects/{id}/curator/messages/in-flight", s.handleCuratorCancel)
-	s.apiMutating("POST /api/projects/{id}/curator/reset", s.handleCuratorReset)
+	ch := &curatorHandler{db: s.db, tx: s.tx, ws: s.ws, runtime: func() *curator.Curator { return s.curator }}
+	s.apiMutating("POST /api/projects/{id}/curator/messages", ch.handleCuratorSend)
+	s.api("GET /api/projects/{id}/curator/messages", ch.handleCuratorHistory)
+	s.apiMutating("DELETE /api/projects/{id}/curator/messages/in-flight", ch.handleCuratorCancel)
+	s.apiMutating("POST /api/projects/{id}/curator/reset", ch.handleCuratorReset)
 
 	// Websocket: wrapped via s.api so the handshake sees claims in
 	// r.Context() (sentinel in local mode, real values in multi).
@@ -681,34 +679,38 @@ func (s *Server) routes() {
 	// AuthGate boot endpoint — is mounted pre-auth above; per-user
 	// identity that used to live on /api/config moved to /api/me.
 	s.api("GET /api/team/members", s.handleTeamMembers)
-	s.apiMutating("POST /api/skills/import", s.handleSkillsImport)
+	sk := &skillsHandler{db: s.db, prompts: s.prompts}
+	s.apiMutating("POST /api/skills/import", sk.handleSkillsImport)
 	s.api("GET /api/github/repos", s.handleGitHubRepos)
-	s.apiMutating("POST /api/github/preflight-ssh", s.handleGitHubPreflightSSH)
+	se := &settingsHandler{tx: s.tx}
+	s.apiMutating("POST /api/github/preflight-ssh", se.handleGitHubPreflightSSH)
 	// URL-only host reachability (the wizard's URL sub-step) — no auth sent,
 	// distinct from the creds stage (auth.ValidateGitHub / /api/jira/connect).
-	s.apiMutating("POST /api/github/reachability", s.handleGitHubReachability)
+	s.apiMutating("POST /api/github/reachability", handleGitHubReachability)
 	s.api("GET /api/repos", s.handleRepoProfiles)
 	s.apiMutating("PATCH /api/repos/{owner}/{repo}", s.handleRepoUpdate)
 	s.api("GET /api/repos/{owner}/{repo}/branches", s.handleRepoBranches)
-	s.apiMutating("POST /api/jira/reachability", s.handleJiraReachability)
-	s.apiMutating("POST /api/jira/connect", s.handleJiraConnect)
-	s.api("GET /api/jira/statuses", s.handleJiraStatuses)
+	s.apiMutating("POST /api/jira/reachability", handleJiraReachability)
+	s.apiMutating("POST /api/jira/connect", se.handleJiraConnect)
+	s.api("GET /api/jira/statuses", se.handleJiraStatuses)
 	s.api("GET /api/jira/stock", s.handleJiraStockGet)
 	s.apiMutating("POST /api/jira/stock", s.handleJiraStockPost)
 
-	s.api("GET /api/reviews/{id}", s.handleReviewGet)
-	s.apiMutating("PATCH /api/reviews/{id}", s.handleReviewUpdate)
-	s.api("GET /api/reviews/{id}/diff", s.handleReviewDiff)
-	s.apiMutating("POST /api/reviews/{id}/submit", s.handleReviewSubmit)
-	s.apiMutating("PUT /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentUpdate)
-	s.apiMutating("DELETE /api/reviews/{id}/comments/{commentId}", s.handleReviewCommentDelete)
-	s.api("GET /api/agent/runs/{runID}/review", s.handleRunReview)
+	rh := &reviewsHandler{tx: s.tx, ws: s.ws, agentRuns: s.agentRuns, ghClient: func() *ghclient.Client { return s.ghClient }, spawner: func() *delegate.Spawner { return s.spawner }}
+	s.api("GET /api/reviews/{id}", rh.handleReviewGet)
+	s.apiMutating("PATCH /api/reviews/{id}", rh.handleReviewUpdate)
+	s.api("GET /api/reviews/{id}/diff", rh.handleReviewDiff)
+	s.apiMutating("POST /api/reviews/{id}/submit", rh.handleReviewSubmit)
+	s.apiMutating("PUT /api/reviews/{id}/comments/{commentId}", rh.handleReviewCommentUpdate)
+	s.apiMutating("DELETE /api/reviews/{id}/comments/{commentId}", rh.handleReviewCommentDelete)
+	s.api("GET /api/agent/runs/{runID}/review", rh.handleRunReview)
 
-	s.api("GET /api/pending-prs/{id}", s.handlePendingPRGet)
-	s.apiMutating("PATCH /api/pending-prs/{id}", s.handlePendingPRUpdate)
-	s.api("GET /api/pending-prs/{id}/diff", s.handlePendingPRDiff)
-	s.apiMutating("POST /api/pending-prs/{id}/submit", s.handlePendingPRSubmit)
-	s.api("GET /api/agent/runs/{runID}/pending-pr", s.handleRunPendingPR)
+	pp := &pendingPRsHandler{tx: s.tx, ws: s.ws, agentRuns: s.agentRuns, ghClient: func() *ghclient.Client { return s.ghClient }, spawner: func() *delegate.Spawner { return s.spawner }}
+	s.api("GET /api/pending-prs/{id}", pp.handlePendingPRGet)
+	s.apiMutating("PATCH /api/pending-prs/{id}", pp.handlePendingPRUpdate)
+	s.api("GET /api/pending-prs/{id}/diff", pp.handlePendingPRDiff)
+	s.apiMutating("POST /api/pending-prs/{id}/submit", pp.handlePendingPRSubmit)
+	s.api("GET /api/agent/runs/{runID}/pending-pr", pp.handleRunPendingPR)
 
 	fh := &factoryHandler{tx: s.tx}
 	s.api("GET /api/factory/snapshot", fh.handleFactorySnapshot)
@@ -716,8 +718,8 @@ func (s *Server) routes() {
 
 	ph := &promptsHandler{db: s.db, tx: s.tx}
 	s.api("GET /api/event-types", ph.handleEventTypes)
-	s.api("GET /api/event-schemas", s.handleEventSchemasList)
-	s.api("GET /api/event-schemas/{event_type}", s.handleEventSchemaGet)
+	s.api("GET /api/event-schemas", handleEventSchemasList)
+	s.api("GET /api/event-schemas/{event_type}", handleEventSchemaGet)
 	// Unified event_handlers endpoints (SKY-259). Replace the former
 	// /api/task-rules + /api/triggers split — kind is passed as ?kind=
 	// on list, in the body on create, derived on update.
@@ -736,18 +738,19 @@ func (s *Server) routes() {
 	s.apiMutating("PUT /api/prompts/{id}", ph.handlePromptPut)
 	s.apiMutating("DELETE /api/prompts/{id}", ph.handlePromptDelete)
 	s.api("GET /api/prompts/{id}/stats", ph.handlePromptStats)
-	s.api("GET /api/blueprints", s.handleBlueprintsList)
-	s.apiMutating("POST /api/blueprints", s.handleBlueprintCreate)
-	s.apiMutating("PUT /api/blueprints/{id}", s.handleBlueprintUpdate)
-	s.apiMutating("DELETE /api/blueprints/{id}", s.handleBlueprintDelete)
-	s.api("GET /api/blueprint-steps", s.handleBlueprintStepsAll)
-	s.api("GET /api/blueprints/{id}/steps", s.handleBlueprintStepsGet)
-	s.apiMutating("PUT /api/blueprints/{id}/steps", s.handleBlueprintStepsPut)
-	s.apiMutating("POST /api/blueprints/{id}/merge", s.handleBlueprintMerge)
-	s.apiMutating("POST /api/blueprints/{id}/split", s.handleBlueprintSplit)
-	s.apiMutating("POST /api/blueprints/duplicate", s.handleBlueprintDuplicate)
-	s.api("GET /api/blueprint-runs/{id}", s.handleBlueprintRunGet)
-	s.apiMutating("POST /api/blueprint-runs/{id}/cancel", s.handleBlueprintRunCancel)
+	bh := &blueprintsHandler{tx: s.tx, spawner: func() *delegate.Spawner { return s.spawner }}
+	s.api("GET /api/blueprints", bh.handleBlueprintsList)
+	s.apiMutating("POST /api/blueprints", bh.handleBlueprintCreate)
+	s.apiMutating("PUT /api/blueprints/{id}", bh.handleBlueprintUpdate)
+	s.apiMutating("DELETE /api/blueprints/{id}", bh.handleBlueprintDelete)
+	s.api("GET /api/blueprint-steps", bh.handleBlueprintStepsAll)
+	s.api("GET /api/blueprints/{id}/steps", bh.handleBlueprintStepsGet)
+	s.apiMutating("PUT /api/blueprints/{id}/steps", bh.handleBlueprintStepsPut)
+	s.apiMutating("POST /api/blueprints/{id}/merge", bh.handleBlueprintMerge)
+	s.apiMutating("POST /api/blueprints/{id}/split", bh.handleBlueprintSplit)
+	s.apiMutating("POST /api/blueprints/duplicate", bh.handleBlueprintDuplicate)
+	s.api("GET /api/blueprint-runs/{id}", bh.handleBlueprintRunGet)
+	s.apiMutating("POST /api/blueprint-runs/{id}/cancel", bh.handleBlueprintRunCancel)
 
 	// Org template editor (SKY-381) — org-admin-gated, multi-mode only.
 	// Mirrors the /api/prompts + /api/event-handlers families at org-template
