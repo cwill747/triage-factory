@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
@@ -139,6 +140,209 @@ func (ag *agentHandler) handleAgentCancel(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "cancelled"})
+}
+
+// runVisible reports whether runID exists and is visible to the caller's org
+// (and team, under RLS). The steering control ops resolve a run by id against
+// in-memory state (the process registry, the permission broker), so this is the
+// authorization gate that stops a known run id from one tenant being acted on by
+// another: a non-existent or not-visible run reads as false → the caller 404s.
+func (ag *agentHandler) runVisible(ctx context.Context, orgID, userID, runID string) (bool, error) {
+	var exists bool
+	err := ag.tx.WithTx(ctx, orgID, userID, func(tx db.TxStores) error {
+		run, e := tx.AgentRuns.Get(ctx, orgID, runID)
+		if e != nil {
+			return e
+		}
+		exists = run != nil
+		return nil
+	})
+	return exists, err
+}
+
+// handleAgentMessage records a free-form user message on a run, broadcasts it
+// to watchers, then routes it: a live run is steered in place, an `open` run is
+// woken via resume. The run is read in the same tx that records the message, so
+// a run not visible to the caller's org reads as 404 (the authz gate before any
+// control op) and an existing run's message is recorded before routing — the
+// transcript stays optimistic (the user's words show immediately). A run that
+// can take no message (terminal / no live process) is 409.
+func (ag *agentHandler) handleAgentMessage(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
+	runID := r.PathValue("runID")
+
+	var body struct {
+		Text string `json:"text"`
+	}
+	if !decodeJSON(w, r, &body, "") {
+		return
+	}
+	if strings.TrimSpace(body.Text) == "" {
+		badRequest(w, "text is required")
+		return
+	}
+
+	spawner := ag.spawner()
+	if spawner == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
+		return
+	}
+
+	// Read + record in one tx: the Get authorizes against the run under the
+	// caller's org (RLS), so a missing / cross-org run is a 404 before SendMessage
+	// reaches the registry; an existing run gets the user message persisted (with
+	// the row id carried back onto msg.ID for the broadcast's client dedup).
+	msg := &domain.AgentMessage{RunID: runID, Role: "user", Subtype: "text", Content: body.Text}
+	var runExists bool
+	if err := ag.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		run, e := tx.AgentRuns.Get(r.Context(), orgID, runID)
+		if e != nil {
+			return e
+		}
+		if run == nil {
+			return nil
+		}
+		runExists = true
+		id, e := tx.AgentRuns.InsertMessage(r.Context(), orgID, msg)
+		if e != nil {
+			return e
+		}
+		msg.ID = int(id)
+		return nil
+	}); err != nil {
+		internalError(w, "agent", err)
+		return
+	}
+	if !runExists {
+		notFound(w, "run")
+		return
+	}
+	ag.ws.Broadcast(websocket.Event{
+		Type:  "agent_message",
+		OrgID: orgID,
+		RunID: runID,
+		Data:  msg,
+	})
+
+	if err := spawner.SendMessage(r.Context(), orgID, runID, userID, body.Text); err != nil {
+		writeJSON(w, steerErrorStatus(err), map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "sent"})
+}
+
+// handleAgentInterrupt stops a live run's current turn, leaving the process
+// alive for further input. The run is authorized under the caller's org first
+// (404 if not visible) — the process registry is keyed by run id alone, so this
+// gate keeps a known run id from interrupting another tenant's run. An existing
+// run with no live process is 409 — nothing to interrupt.
+func (ag *agentHandler) handleAgentInterrupt(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
+	runID := r.PathValue("runID")
+	spawner := ag.spawner()
+	if spawner == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
+		return
+	}
+	exists, err := ag.runVisible(r.Context(), orgID, userID, runID)
+	if err != nil {
+		internalError(w, "agent", err)
+		return
+	}
+	if !exists {
+		notFound(w, "run")
+		return
+	}
+	if err := spawner.Interrupt(r.Context(), runID); err != nil {
+		writeJSON(w, steerErrorStatus(err), map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "interrupted"})
+}
+
+// steerErrorStatus maps a SendMessage / Interrupt error to an HTTP status. A
+// run that can't take the op right now — no live process (ErrNoLiveProcess),
+// not steerable (ErrRunNotSteerable), or a lost resume race
+// (ErrRunNotResumable) — is 409 Conflict so the client refreshes and re-reads
+// the run's state. Everything else is a server-side 500.
+func steerErrorStatus(err error) int {
+	switch {
+	case errors.Is(err, delegate.ErrNoLiveProcess),
+		errors.Is(err, delegate.ErrRunNotSteerable),
+		errors.Is(err, delegate.ErrRunNotResumable):
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
+// handleAgentPermission answers a pending tool-permission prompt a run surfaced
+// via a `permission_request` WS event. Body: {"behavior":"allow"|"deny",
+// "message"?:string,"updated_input"?:object}. The run is authorized under the
+// caller's org (RLS) first — like the message/interrupt endpoints — so a run not
+// visible to this org is 404; a request that isn't pending (already answered,
+// timed out, or never existed) is also 404.
+func (ag *agentHandler) handleAgentPermission(w http.ResponseWriter, r *http.Request) {
+	orgID, ok := requireOrg(w, r)
+	if !ok {
+		return
+	}
+	userID := ClaimsFrom(r.Context()).Subject
+	runID := r.PathValue("runID")
+	requestID := r.PathValue("requestID")
+
+	var body struct {
+		Behavior     string         `json:"behavior"`
+		Message      string         `json:"message"`
+		UpdatedInput map[string]any `json:"updated_input"`
+	}
+	if !decodeJSON(w, r, &body, "") {
+		return
+	}
+	if body.Behavior != "allow" && body.Behavior != "deny" {
+		badRequest(w, `behavior must be "allow" or "deny"`)
+		return
+	}
+
+	spawner := ag.spawner()
+	if spawner == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "delegation not configured"})
+		return
+	}
+
+	// Authorize the run under the caller's org before touching the broker — the
+	// broker's own org check is a backstop, not a team-level RLS gate.
+	exists, err := ag.runVisible(r.Context(), orgID, userID, runID)
+	if err != nil {
+		internalError(w, "agent", err)
+		return
+	}
+	if !exists {
+		notFound(w, "run")
+		return
+	}
+
+	err = spawner.ResolvePermission(orgID, runID, requestID, agentproc.PermissionDecision{
+		Behavior:     body.Behavior,
+		Message:      body.Message,
+		UpdatedInput: body.UpdatedInput,
+	})
+	switch {
+	case errors.Is(err, delegate.ErrNoPendingPermission):
+		notFound(w, "permission request")
+	case err != nil:
+		internalError(w, "agent", err)
+	default:
+		writeJSON(w, http.StatusOK, map[string]string{"status": "resolved"})
+	}
 }
 
 func (ag *agentHandler) handleAgentTakeover(w http.ResponseWriter, r *http.Request) {
