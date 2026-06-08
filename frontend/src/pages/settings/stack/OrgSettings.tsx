@@ -10,8 +10,15 @@
 // org-form sections all persist through the single POST /api/settings/org, so
 // each saves {...baseline.org, ...ownFields} against the LIVE baseline — saving
 // one never flushes another's unsaved edits. Selector/panel sections (the
-// access-method picker, the App register panel) and connect/disconnect commit
-// no org-form slice, so they carry no Save footer.
+// access-method picker, the App register panel) carry no Save footer. Jira
+// disconnect is footer-less too — it commits inline on its own button — though
+// note it DOES mutate org settings (JiraAccessGroup.disconnect POSTs
+// /api/settings/org to clear jira_base_url, on top of DELETE
+// /api/integrations/jira); footer-less is about how it commits, not whether it
+// persists. The Jira *connect* is the exception that proves the rule it used to
+// break: its Save footer ("Connect") drives POST /api/jira/connect rather than
+// the org POST, but it's a footer all the same — the same one-button shape as
+// the GitHub PAT section.
 
 import { useCallback, useEffect, useState } from 'react'
 import { toast } from '../../../components/Toast/toastStore'
@@ -37,6 +44,7 @@ import PollerTimingGroup from '../PollerTimingGroup'
 import JiraAccessGroup from '../JiraAccessGroup'
 import TeamManagementSection from '../../../components/TeamManagementSection'
 import { saveOrgConfig, type OrgConfigForm } from '../orgConfig'
+import { connectJira } from '../jiraConnect'
 import SettingsSection from './SettingsSection'
 
 const TIER_LABELS: Record<string, string> = { haiku: 'Haiku', sonnet: 'Sonnet', opus: 'Opus' }
@@ -311,36 +319,75 @@ export default function OrgSettings({
         </div>
       </SettingsSection>
 
-      {/* ── Jira connection (connect/disconnect inline) ── */}
-      <SettingsSection
-        title="Jira connection"
-        summary={
-          draft.jiraConnected ? `Connected · ${hostOf(baseline.org.jira_url)}` : 'Not connected'
-        }
-      >
-        <JiraAccessGroup
-          value={{ jira_url: draft.org.jira_url, jira_pat: draft.org.jira_pat }}
-          onChange={(p) => patch({ org: { ...draft.org, ...p } })}
-          connected={draft.jiraConnected}
-          onConnected={(url) => {
-            setDraft((d) => ({
-              ...d,
-              jiraConnected: true,
-              org: { ...d.org, jira_url: url, jira_pat: '' },
-            }))
-            setBaseline((b) => ({ ...b, jiraConnected: true, org: { ...b.org, jira_url: url } }))
+      {/* ── Jira connection ── When disconnected, this is a form section whose
+          Save ("Connect") performs the connect on the section's button — the
+          same shape as the GitHub PAT section, no separate Connect button.
+          Once connected there's nothing to save, so it reverts to an action
+          section carrying just the inline Disconnect. */}
+      {draft.jiraConnected ? (
+        <SettingsSection
+          title="Jira connection"
+          summary={`Connected · ${hostOf(baseline.org.jira_url)}`}
+        >
+          <JiraAccessGroup
+            value={{ jira_url: draft.org.jira_url, jira_pat: draft.org.jira_pat }}
+            onChange={(p) => patch({ org: { ...draft.org, ...p } })}
+            connected
+            onDisconnected={() => {
+              setDraft((d) => ({
+                ...d,
+                jiraConnected: false,
+                org: { ...d.org, jira_url: '', jira_pat: '' },
+              }))
+              setBaseline((b) => ({ ...b, jiraConnected: false, org: { ...b.org, jira_url: '' } }))
+            }}
+            bare
+          />
+        </SettingsSection>
+      ) : (
+        <SettingsSection
+          title="Jira connection"
+          summary="Not connected"
+          saveLabel="Connect"
+          // dirty reflects any draft change against the baseline — it arms the
+          // discard guard + unsaved dot, so a partially-typed URL/PAT isn't
+          // silently dropped on collapse. The "needs BOTH fields" rule that
+          // gates the connect lives in saveDisabled instead (mirrors the old
+          // Connect button's disabled condition).
+          dirty={draft.org.jira_url !== baseline.org.jira_url || draft.org.jira_pat.trim() !== ''}
+          saveDisabled={draft.org.jira_url.trim() === '' || draft.org.jira_pat.trim() === ''}
+          saving={isSaving('jira-connect')}
+          onSave={async () => {
+            setSavingKey('jira-connect', true)
+            try {
+              const url = normalizeBaseUrl(draft.org.jira_url)
+              const result = await connectJira(url, draft.org.jira_pat)
+              if (!result.ok) {
+                toast.error(result.error)
+                return false
+              }
+              setDraft((d) => ({
+                ...d,
+                jiraConnected: true,
+                org: { ...d.org, jira_url: url, jira_pat: '' },
+              }))
+              setBaseline((b) => ({ ...b, jiraConnected: true, org: { ...b.org, jira_url: url } }))
+              toast.success('Jira connected')
+              return true
+            } finally {
+              setSavingKey('jira-connect', false)
+            }
           }}
-          onDisconnected={() => {
-            setDraft((d) => ({
-              ...d,
-              jiraConnected: false,
-              org: { ...d.org, jira_url: '', jira_pat: '' },
-            }))
-            setBaseline((b) => ({ ...b, jiraConnected: false, org: { ...b.org, jira_url: '' } }))
-          }}
-          bare
-        />
-      </SettingsSection>
+          onCancel={() => revertOrg(['jira_url', 'jira_pat'])}
+        >
+          <JiraAccessGroup
+            value={{ jira_url: draft.org.jira_url, jira_pat: draft.org.jira_pat }}
+            onChange={(p) => patch({ org: { ...draft.org, ...p } })}
+            connected={false}
+            bare
+          />
+        </SettingsSection>
+      )}
 
       {/* ── Jira polling (only once connected) ── */}
       {draft.jiraConnected && (
