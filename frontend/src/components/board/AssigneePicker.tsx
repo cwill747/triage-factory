@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Bot } from 'lucide-react'
 import type { Task, TeamMember, TeamBot } from '../../types'
 
 // AssigneePicker is SKY-330's per-card assignee selector. Replaces
@@ -111,10 +112,10 @@ export default function AssigneePicker({
         }}
         onPointerDown={(e) => e.stopPropagation()}
         title={readOnly ? `Finished by ${currentAssignee.label}` : currentAssignee.label}
-        className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium border transition-colors ${
+        className={`inline-flex items-center gap-1 text-[10px] font-medium leading-none transition-colors ${
           readOnly
-            ? 'border-border-subtle bg-black/[0.02] text-text-tertiary cursor-default'
-            : 'border-border-subtle bg-white/60 text-text-secondary hover:border-accent/30 hover:text-text-primary cursor-pointer'
+            ? 'cursor-default text-text-tertiary'
+            : 'cursor-pointer text-text-secondary hover:text-text-primary'
         }`}
       >
         <AssigneeAvatar entry={currentAssignee} />
@@ -139,7 +140,11 @@ export default function AssigneePicker({
           {/* Bot — only when enabled for this team */}
           {bot && (
             <PickerRow
-              avatar={<AvatarCircle initials="🤖" tone="bot" />}
+              avatar={
+                <span className="inline-flex h-5 w-5 items-center justify-center rounded-full bg-accent/15 text-accent">
+                  <Bot size={12} aria-hidden />
+                </span>
+              }
               label={bot.display_name || 'Bot'}
               sublabel={
                 claimedByBot
@@ -272,7 +277,10 @@ function initialsFor(s: string): string {
 function AssigneeAvatar({ entry }: { entry: AssigneeEntry }) {
   switch (entry.kind) {
     case 'bot':
-      return <span className="text-[11px]">🤖</span>
+      // A crisp lucide icon (inherits the chip's currentColor + hover) rather
+      // than an emoji — emoji glyphs sit low in their line-box and dropped the
+      // chip below its row-mates (elapsed / expand) in the agent card header.
+      return <Bot size={13} aria-hidden className="shrink-0" />
     case 'user':
       return <AvatarCircle initials={initialsFor(entry.label)} tone="user" small />
     case 'unknown':

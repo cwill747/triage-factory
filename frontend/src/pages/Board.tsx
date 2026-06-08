@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from 'react'
 import type {
   Task,
   AgentRun,
@@ -18,13 +18,14 @@ import PromptPicker from '../components/PromptPicker'
 import ReviewOverlay from '../components/ReviewOverlay'
 import PendingPROverlay from '../components/PendingPROverlay'
 import AssigneePicker from '../components/board/AssigneePicker'
-import BoardColumn from '../components/board/BoardColumn'
+import { toast } from '../components/Toast/toastStore'
+import BoardColumn, { CollapsedColumn } from '../components/board/BoardColumn'
 import {
   applyColumnFilter,
   emptyFilter,
   type ColumnFilterState,
 } from '../components/board/columnFilter'
-import { motion, AnimatePresence } from 'motion/react'
+import { GlassBackdrop } from './setup/glass'
 import {
   DndContext,
   DragOverlay,
@@ -54,6 +55,13 @@ const COLUMN_TITLES: Record<ColumnId, string> = {
   in_review: 'In Review',
   done: 'Done',
 }
+
+// Lane geometry, used to center the strip on the midpoint of the *open*
+// columns. COL_W must match the expanded BoardColumn width (w-[430px]); RAIL_W
+// the collapsed CollapsedColumn (w-5 = 20px); GAP the row's gap-6 (24px).
+const COL_W = 430
+const RAIL_W = 20
+const GAP = 24
 
 // Filter persistence: per-user, per-column. Storage key is namespaced
 // by the user's id so a re-login (different user on the same browser)
@@ -93,6 +101,38 @@ function defaultFilters(): FilterMap {
     in_progress: { ...emptyFilter },
     in_review: { ...emptyFilter },
     done: { ...emptyFilter },
+  }
+}
+
+// Collapse persistence: same per-user localStorage scheme as filters. Claimed
+// and In Review start collapsed — a fresh board greets you with Queued / In
+// Progress / Done (the lanes that hold work) plus two thin rails, so five lanes
+// fit without shrinking anything. (A per-user backend UI-prefs store is the
+// eventual home; localStorage holds the line until then.)
+type CollapseMap = Record<ColumnId, boolean>
+
+const COLLAPSE_STORAGE_PREFIX = 'sky330.board.collapsed.v1'
+
+function collapseStorageKey(userID: string): string {
+  return `${COLLAPSE_STORAGE_PREFIX}.${userID || 'anon'}`
+}
+
+function defaultCollapsed(): CollapseMap {
+  return { queued: false, claimed: true, in_progress: false, in_review: true, done: false }
+}
+
+function loadCollapsed(userID: string): CollapseMap {
+  try {
+    const raw = localStorage.getItem(collapseStorageKey(userID))
+    if (!raw) return defaultCollapsed()
+    const parsed = JSON.parse(raw) as Partial<CollapseMap>
+    const out = defaultCollapsed()
+    for (const col of ALL_COLUMNS) {
+      if (typeof parsed[col] === 'boolean') out[col] = parsed[col] as boolean
+    }
+    return out
+  } catch {
+    return defaultCollapsed()
   }
 }
 
@@ -165,6 +205,27 @@ export default function Board() {
     }
   }, [filters, filtersOwnerID, currentUserID])
 
+  // Collapsed-lane state — same per-user persistence dance as filters.
+  const [collapsed, setCollapsed] = useState<CollapseMap>(() => loadCollapsed(''))
+  const [collapsedOwnerID, setCollapsedOwnerID] = useState<string>('')
+  useEffect(() => {
+    if (!currentUserID) return
+    setCollapsed(loadCollapsed(currentUserID))
+    setCollapsedOwnerID(currentUserID)
+  }, [currentUserID])
+  useEffect(() => {
+    if (collapsedOwnerID !== currentUserID) return
+    try {
+      localStorage.setItem(collapseStorageKey(currentUserID), JSON.stringify(collapsed))
+    } catch {
+      // Quota / disabled storage — silently skip; collapse works in-memory.
+    }
+  }, [collapsed, collapsedOwnerID, currentUserID])
+  const toggleCollapse = useCallback(
+    (col: ColumnId) => setCollapsed((c) => ({ ...c, [col]: !c[col] })),
+    [],
+  )
+
   // Snoozed visibility toggle for the Queued column. Off by default;
   // snoozed tasks are intentionally deferred and don't need to clutter
   // the column. When on, they render at the tail with a "wakes Mar 5"
@@ -175,6 +236,10 @@ export default function Board() {
   // itself (via useDroppable's isOver), so we don't need to track it
   // up here anymore.
   const [activeId, setActiveId] = useState<string | null>(null)
+  // The column the drag is currently over — resolved at the board level so it
+  // counts hovering a *card* inside a column, not just the column's empty area
+  // (each card is its own droppable, so the column's own isOver misses them).
+  const [activeDropCol, setActiveDropCol] = useState<ColumnId | null>(null)
 
   // Delegate flow
   const [showPromptPicker, setShowPromptPicker] = useState(false)
@@ -494,26 +559,32 @@ export default function Board() {
     [agentRuns],
   )
 
-  const filtered = useMemo<Record<ColumnId, Task[]>>(() => {
-    return {
-      queued: applyColumnFilter(queued, filters.queued),
-      claimed: applyColumnFilter(claimed, filters.claimed),
-      in_progress: applyColumnFilter(sortByRunAttention(inProgress), filters.in_progress),
-      in_review: applyColumnFilter(sortByRunAttention(inReview), filters.in_review),
-      done: applyColumnFilter(done, filters.done),
-    }
-  }, [queued, claimed, inProgress, inReview, done, filters, sortByRunAttention])
-
-  const totalCounts = useMemo<Record<ColumnId, number>>(
-    () => ({
-      queued: queued.length,
-      claimed: claimed.length,
-      in_progress: inProgress.length,
-      in_review: inReview.length,
-      done: done.length,
-    }),
-    [queued, claimed, inProgress, inReview, done],
+  // Resolve a task's claimee to a display name for the claimee sort. Agent
+  // claims read the bot's name; user claims read the roster (with "You" for the
+  // viewer); unclaimed returns '' (sorts last).
+  const resolveClaimee = useCallback(
+    (t: Task): string => {
+      if (t.claimed_by_agent_id) return bot?.display_name ?? 'Agent'
+      if (t.claimed_by_user_id) {
+        const m = members.find((mm) => mm.user_id === t.claimed_by_user_id)
+        if (m) return m.is_current_user ? 'You' : m.display_name
+        return t.claimed_by_user_id === currentUserID ? 'You' : 'User'
+      }
+      return ''
+    },
+    [members, bot, currentUserID],
   )
+
+  const filtered = useMemo<Record<ColumnId, Task[]>>(() => {
+    const opts = { resolveClaimee }
+    return {
+      queued: applyColumnFilter(queued, filters.queued, opts),
+      claimed: applyColumnFilter(claimed, filters.claimed, opts),
+      in_progress: applyColumnFilter(sortByRunAttention(inProgress), filters.in_progress, opts),
+      in_review: applyColumnFilter(sortByRunAttention(inReview), filters.in_review, opts),
+      done: applyColumnFilter(done, filters.done, opts),
+    }
+  }, [queued, claimed, inProgress, inReview, done, filters, sortByRunAttention, resolveClaimee])
 
   const rawByColumn = useMemo<Record<ColumnId, Task[]>>(
     () => ({
@@ -534,32 +605,103 @@ export default function Board() {
     return map
   }, [queued, claimed, inProgress, inReview, done])
 
+  // taskId → column lookup, built once per board state. getColumn is called
+  // per dnd onDragOver event (which fires rapidly while dragging), so an O(1)
+  // map beats re-scanning all five lists on every move.
+  const columnByTask = useMemo<Map<string, ColumnId>>(() => {
+    const m = new Map<string, ColumnId>()
+    for (const t of queued) m.set(t.id, 'queued')
+    for (const t of claimed) m.set(t.id, 'claimed')
+    for (const t of inProgress) m.set(t.id, 'in_progress')
+    for (const t of inReview) m.set(t.id, 'in_review')
+    for (const t of done) m.set(t.id, 'done')
+    return m
+  }, [queued, claimed, inProgress, inReview, done])
+
   const getColumn = useCallback(
-    (taskId: string): ColumnId | null => {
-      if (queued.some((t) => t.id === taskId)) return 'queued'
-      if (claimed.some((t) => t.id === taskId)) return 'claimed'
-      if (inProgress.some((t) => t.id === taskId)) return 'in_progress'
-      if (inReview.some((t) => t.id === taskId)) return 'in_review'
-      if (done.some((t) => t.id === taskId)) return 'done'
-      return null
-    },
-    [queued, claimed, inProgress, inReview, done],
+    (taskId: string): ColumnId | null => columnByTask.get(taskId) ?? null,
+    [columnByTask],
   )
 
-  // SKY-330: default scroll position centers Claimed/In Progress/
-  // In Review in the viewport on mount. Queued (left) and Done (right)
-  // require explicit scroll. The scroll container snaps once, then
-  // the user has full control.
+  // SKY-330: the board opens at the left (Queued first). With Claimed + In
+  // Review collapsed by default, the lane strip is compact enough that the
+  // work-bearing lanes fit without a forced scroll offset — so we start at the
+  // natural left edge rather than snapping past Queued (the old fixed 544px
+  // offset assumed every column was a full 520px, which no longer holds).
   const scrollRef = useRef<HTMLDivElement>(null)
-  const didInitialScroll = useRef(false)
+
+  // Dynamic edge-fade. The outermost walls — left of Queued, right of Done —
+  // stay solid (there's nowhere further to scroll), and the fade ramps in on a
+  // side only as content scrolls past it. `left`/`right` are 0→1 fractions of a
+  // full FADE_PX fade; recomputed on scroll + resize.
+  const FADE_PX = 40
+  const [edgeFade, setEdgeFade] = useState({ left: 0, right: 1 })
+  // Viewport width of the scrollport — feeds the centered-lane geometry below.
+  const [containerW, setContainerW] = useState(0)
+  const recomputeFade = useCallback(() => {
+    const el = scrollRef.current
+    if (!el) return
+    setContainerW((w) => (w === el.clientWidth ? w : el.clientWidth))
+    const maxScroll = el.scrollWidth - el.clientWidth
+    const left = maxScroll <= 0 ? 0 : Math.min(el.scrollLeft / FADE_PX, 1)
+    const right = maxScroll <= 0 ? 0 : Math.min((maxScroll - el.scrollLeft) / FADE_PX, 1)
+    setEdgeFade((prev) => (prev.left === left && prev.right === right ? prev : { left, right }))
+  }, [])
   useEffect(() => {
-    if (loading || didInitialScroll.current || !scrollRef.current) return
-    // Scroll so Claimed (the second column) is leftmost-visible.
-    // Each column is 520px wide + 24px gap (gap-6), so offset = 1
-    // column = 544. Width is set in BoardColumn.tsx; keep in sync.
-    scrollRef.current.scrollLeft = 544
-    didInitialScroll.current = true
-  }, [loading])
+    if (loading) return
+    recomputeFade()
+    const el = scrollRef.current
+    if (!el) return
+    const onResize = () => recomputeFade()
+    window.addEventListener('resize', onResize)
+    const ro = new ResizeObserver(() => recomputeFade())
+    ro.observe(el)
+    return () => {
+      window.removeEventListener('resize', onResize)
+      ro.disconnect()
+    }
+  }, [loading, recomputeFade])
+
+  const fadeMask = useMemo(() => {
+    const l = FADE_PX * edgeFade.left
+    const r = FADE_PX * edgeFade.right
+    const grad = `linear-gradient(to right, rgba(0,0,0,${1 - edgeFade.left}) 0, #000 ${l}px, #000 calc(100% - ${r}px), rgba(0,0,0,${1 - edgeFade.right}) 100%)`
+    return { maskImage: grad, WebkitMaskImage: grad }
+  }, [edgeFade])
+
+  // Centered-lane geometry. We want the viewport center to land on the midpoint
+  // of the *open* (expanded) columns — one open → that column; two → their
+  // midpoint; none → the center of the collapsed rails. Widths are fixed, so we
+  // compute positions analytically rather than measuring the DOM. Symmetric
+  // padding parks the strip so that midpoint sits dead-center when it fits, and
+  // a matching scroll offset (applied below) handles the overflow case.
+  const lane = useMemo(() => {
+    let x = 0
+    const centers: number[] = []
+    for (const col of ALL_COLUMNS) {
+      const w = collapsed[col] ? RAIL_W : COL_W
+      if (!collapsed[col]) centers.push(x + w / 2)
+      x += w + GAP
+    }
+    const stripW = x - GAP
+    const centroid = centers.length
+      ? centers.reduce((a, b) => a + b, 0) / centers.length
+      : stripW / 2
+    const half = containerW / 2
+    const padLeft = Math.max(0, half - centroid)
+    const padRight = Math.max(0, half - (stripW - centroid))
+    return { padLeft, padRight, targetScroll: padLeft + centroid - half }
+  }, [collapsed, containerW])
+
+  // Park the scroll so the open-columns midpoint is centered (clamped to the
+  // scrollable range for the overflow case). Re-runs on collapse + resize.
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (!el || loading) return
+    const max = el.scrollWidth - el.clientWidth
+    el.scrollLeft = Math.max(0, Math.min(lane.targetScroll, max))
+    recomputeFade()
+  }, [lane, loading, recomputeFade])
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }))
 
@@ -567,117 +709,132 @@ export default function Board() {
     setActiveId(String(event.active.id))
   }
 
-  const handleDragOver = (_event: DragOverEvent) => {
-    // BoardColumn owns its own isOver highlight via useDroppable;
-    // nothing to track at this level. Kept as a hook for future
-    // cross-column behaviors (e.g. preview-the-drop-effect).
+  const handleDragOver = (event: DragOverEvent) => {
+    // Resolve whichever column the cursor is over — a column id directly, or
+    // the column owning the card under the cursor — and hand it to that column
+    // so its border-trace fires even when you're hovering its cards.
+    const overId = event.over?.id
+    if (overId == null) {
+      setActiveDropCol(null)
+      return
+    }
+    const id = String(overId)
+    setActiveDropCol(ALL_COLUMNS.includes(id as ColumnId) ? (id as ColumnId) : getColumn(id))
   }
 
   const handleDragEnd = async (event: DragEndEvent) => {
     const { active, over } = event
     setActiveId(null)
+    setActiveDropCol(null)
 
-    if (!over) return
-    const taskId = String(active.id)
-    const sourceCol = getColumn(taskId)
-    const task = allTasks.get(taskId)
-    if (!sourceCol || !task) return
+    try {
+      if (!over) return
+      const taskId = String(active.id)
+      const sourceCol = getColumn(taskId)
+      const task = allTasks.get(taskId)
+      if (!sourceCol || !task) return
 
-    const overId = String(over.id)
-    let targetCol: ColumnId
-    if (ALL_COLUMNS.includes(overId as ColumnId)) {
-      targetCol = overId as ColumnId
-    } else {
-      targetCol = getColumn(overId) || sourceCol
-    }
+      const overId = String(over.id)
+      let targetCol: ColumnId
+      if (ALL_COLUMNS.includes(overId as ColumnId)) {
+        targetCol = overId as ColumnId
+      } else {
+        targetCol = getColumn(overId) || sourceCol
+      }
 
-    // Same column — no-op (we don't persist intra-column order).
-    if (sourceCol === targetCol) return
+      // Same column — no-op (we don't persist intra-column order).
+      if (sourceCol === targetCol) return
 
-    // Externally terminal tasks (merged/closed PRs) can't be dragged.
-    const terminalEvents = ['github:pr:merged', 'github:pr:closed']
-    if (terminalEvents.includes(task.event_type)) return
+      // Externally terminal tasks (merged/closed PRs) can't be dragged.
+      const terminalEvents = ['github:pr:merged', 'github:pr:closed']
+      if (terminalEvents.includes(task.event_type)) return
 
-    // Bot-claimed tasks in In Progress / In Review are bot-managed —
-    // the user shouldn't drag them around (status is set by the
-    // spawner's auto-advance). Takeover happens via the assignee
-    // picker. Silently refuse the drag rather than nag.
-    if (task.claimed_by_agent_id && (sourceCol === 'in_progress' || sourceCol === 'in_review')) {
-      return
-    }
+      // Bot-claimed tasks in In Progress / In Review are bot-managed —
+      // the user shouldn't drag them around (status is set by the
+      // spawner's auto-advance). Takeover happens via the assignee
+      // picker. Silently refuse the drag rather than nag.
+      if (task.claimed_by_agent_id && (sourceCol === 'in_progress' || sourceCol === 'in_review')) {
+        return
+      }
 
-    // Queue → anywhere: requires a claim first. Queue → Claimed is
-    // the natural drag; Queue → In Progress / In Review skips a step
-    // (rare but allowed for the user's convenience — claims then
-    // advances). Queue → Done is dismiss.
-    if (sourceCol === 'queued') {
+      // Queue → anywhere: requires a claim first. Queue → Claimed is
+      // the natural drag; Queue → In Progress / In Review skips a step
+      // (rare but allowed for the user's convenience — claims then
+      // advances). Queue → Done is dismiss.
+      if (sourceCol === 'queued') {
+        if (targetCol === 'done') {
+          await fetch(`/api/tasks/${taskId}/swipe`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ action: 'dismiss', hesitation_ms: 0 }),
+          })
+          fetchTasks()
+          return
+        }
+        // Claim first, then advance if needed.
+        await fetch(`/api/tasks/${taskId}/swipe`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'claim', hesitation_ms: 0 }),
+        })
+        if (targetCol === 'in_progress' || targetCol === 'in_review') {
+          await fetch(`/api/tasks/${taskId}/advance`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ to: targetCol }),
+          })
+        }
+        fetchTasks()
+        return
+      }
+
+      // Any → Queued: requeue. Clears the claim and resets status.
+      if (targetCol === 'queued') {
+        await fetch(`/api/tasks/${taskId}/requeue`, { method: 'POST' })
+        fetchTasks()
+        return
+      }
+
+      // Any → Done: complete (preserves the card in Done; distinct
+      // from queue → done which dismisses).
       if (targetCol === 'done') {
         await fetch(`/api/tasks/${taskId}/swipe`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'dismiss', hesitation_ms: 0 }),
+          body: JSON.stringify({ action: 'complete', hesitation_ms: 0 }),
         })
         fetchTasks()
         return
       }
-      // Claim first, then advance if needed.
-      await fetch(`/api/tasks/${taskId}/swipe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'claim', hesitation_ms: 0 }),
-      })
+
+      // Claimed / In Progress / In Review transitions (user-claimed
+      // only — bot tasks short-circuited above). Backward transitions
+      // (e.g. In Review → In Progress) are allowed by the backend
+      // AdvanceStatusForUser guard.
+      if (targetCol === 'claimed') {
+        // Claimed isn't a real status — it's "status=queued + claim
+        // held". Going "back to Claimed" from In Progress/In Review
+        // means flipping status to queued without releasing the claim.
+        // The current store doesn't expose that exact transition; the
+        // closest is requeue (which clears claim too). For v1, the
+        // back-to-Claimed gesture isn't supported — the user can drag
+        // forward through stages or all the way back to Queued.
+        return
+      }
       if (targetCol === 'in_progress' || targetCol === 'in_review') {
         await fetch(`/api/tasks/${taskId}/advance`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ to: targetCol }),
         })
+        fetchTasks()
+        return
       }
-      fetchTasks()
-      return
-    }
-
-    // Any → Queued: requeue. Clears the claim and resets status.
-    if (targetCol === 'queued') {
-      await fetch(`/api/tasks/${taskId}/requeue`, { method: 'POST' })
-      fetchTasks()
-      return
-    }
-
-    // Any → Done: complete (preserves the card in Done; distinct
-    // from queue → done which dismisses).
-    if (targetCol === 'done') {
-      await fetch(`/api/tasks/${taskId}/swipe`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'complete', hesitation_ms: 0 }),
-      })
-      fetchTasks()
-      return
-    }
-
-    // Claimed / In Progress / In Review transitions (user-claimed
-    // only — bot tasks short-circuited above). Backward transitions
-    // (e.g. In Review → In Progress) are allowed by the backend
-    // AdvanceStatusForUser guard.
-    if (targetCol === 'claimed') {
-      // Claimed isn't a real status — it's "status=queued + claim
-      // held". Going "back to Claimed" from In Progress/In Review
-      // means flipping status to queued without releasing the claim.
-      // The current store doesn't expose that exact transition; the
-      // closest is requeue (which clears claim too). For v1, the
-      // back-to-Claimed gesture isn't supported — the user can drag
-      // forward through stages or all the way back to Queued.
-      return
-    }
-    if (targetCol === 'in_progress' || targetCol === 'in_review') {
-      await fetch(`/api/tasks/${taskId}/advance`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ to: targetCol }),
-      })
-      fetchTasks()
-      return
+    } catch {
+      // A network blip on the swipe/advance/requeue mutation would otherwise
+      // leave the board silently in the wrong state; surface it and let the
+      // next fetchTasks reconcile.
+      toast.error('Move failed — please try again')
     }
   }
 
@@ -770,28 +927,17 @@ export default function Board() {
 
   if (loading) {
     return (
-      <div className="flex items-center justify-center min-h-[70vh]">
-        <p className="text-[13px] text-text-tertiary">Loading board...</p>
-      </div>
+      <>
+        <GlassBackdrop />
+        <div className="flex items-center justify-center min-h-[70vh]">
+          <p className="text-[13px] text-text-tertiary">Loading board…</p>
+        </div>
+      </>
     )
   }
 
-  // Per-column header extras
-  const queuedHeader = (
-    <button
-      type="button"
-      onClick={() => setShowSnoozed((v) => !v)}
-      title={showSnoozed ? 'Hide snoozed tasks' : 'Show snoozed tasks'}
-      className={`text-[10px] px-2 py-0.5 rounded-full transition-colors ${
-        showSnoozed
-          ? 'bg-snooze/10 text-snooze font-medium'
-          : 'text-text-tertiary hover:text-text-secondary'
-      }`}
-    >
-      {showSnoozed ? '⏾ snoozed shown' : '⏾ show snoozed'}
-    </button>
-  )
-
+  // Per-column header extras. (Queued's snoozed toggle now lives inside the
+  // filter panel — see the `snooze` prop below — not as a header button.)
   const doneHeader = (
     <span
       className="text-[10px] text-text-tertiary"
@@ -808,63 +954,100 @@ export default function Board() {
       onDragStart={handleDragStart}
       onDragOver={handleDragOver}
       onDragEnd={handleDragEnd}
+      onDragCancel={() => {
+        setActiveId(null)
+        setActiveDropCol(null)
+      }}
     >
-      <HeldTakeoversBanner />
+      <GlassBackdrop />
 
-      {/* Per-page team filter. Renders nothing at ≤1 team. */}
-      {teams.length >= 2 && (
-        <div className="flex items-center justify-end px-1 pb-3">
-          <TeamScopeSelect value={teamFilter} onChange={setTeamFilter} />
-        </div>
-      )}
+      {/* Full-height stage. Pulled up under the nav (-mt) — this page wants the
+          columns close to the chrome, not floating in a big top gap like the
+          form pages do. The banner + team filter take what they need; the
+          scroll area fills the rest to the page bottom (hard floor on short
+          screens). */}
+      <div className="-mt-4 flex h-[calc(100dvh-7rem)] min-h-[26rem] flex-col">
+        <HeldTakeoversBanner />
 
-      {/* SKY-330: horizontal-scroll container for 5 columns. Default
-          scroll position (set on mount) shows Claimed → In Review;
-          user scrolls left for Queued, right for Done. */}
-      <div ref={scrollRef} className="overflow-x-auto pb-4">
-        <div className="flex gap-6 min-h-[70vh] px-1">
-          {ALL_COLUMNS.map((colId) => (
-            <BoardColumn
-              key={colId}
-              id={colId}
-              title={COLUMN_TITLES[colId]}
-              totalCount={totalCounts[colId]}
-              filteredCount={filtered[colId].length}
-              tasks={rawByColumn[colId]}
-              filter={filters[colId]}
-              onFilterChange={(next) => setFilters((prev) => ({ ...prev, [colId]: next }))}
-              headerExtra={
-                colId === 'queued' ? queuedHeader : colId === 'done' ? doneHeader : undefined
-              }
-            >
-              <ColumnContents
-                colId={colId}
-                tasks={filtered[colId]}
-                agentRuns={agentRuns}
-                agentMessages={agentMessages}
-                chainStepRuns={chainStepRuns}
-                currentUserID={currentUserID}
-                members={members}
-                bot={bot}
-                delegateFailures={delegateFailures}
-                onRequeue={handleRequeue}
-                onPickerClaim={handlePickerClaim}
-                onPickerUnclaim={handlePickerUnclaim}
-                onPickerDelegate={handlePickerDelegate}
-                onReview={(runID, kind) => setApprovalCtx({ runID, kind })}
-                onRetry={(task) => {
-                  pendingDelegateTask.current = task
-                  setShowPromptPicker(true)
-                }}
-              />
-            </BoardColumn>
-          ))}
+        {/* Per-page team filter. Renders nothing at ≤1 team. */}
+        {teams.length >= 2 && (
+          <div className="flex items-center justify-end px-1 pb-3">
+            <TeamScopeSelect value={teamFilter} onChange={setTeamFilter} />
+          </div>
+        )}
+
+        {/* SKY-330: horizontal-scroll container for 5 columns. The strip is
+            parked so the open-columns midpoint sits at the viewport center (see
+            `lane` above) via dynamic left/right padding + a scroll offset. The
+            dynamic mask dissolves columns into the page at whichever edge still
+            has more to scroll. */}
+        <div
+          ref={scrollRef}
+          onScroll={recomputeFade}
+          className="min-h-0 flex-1 overflow-x-auto pb-3 pt-1"
+          style={fadeMask}
+        >
+          <div
+            className="flex h-full gap-6"
+            style={{ paddingLeft: lane.padLeft, paddingRight: lane.padRight }}
+          >
+            {ALL_COLUMNS.map((colId, i) =>
+              collapsed[colId] ? (
+                <CollapsedColumn
+                  key={colId}
+                  index={i}
+                  title={COLUMN_TITLES[colId]}
+                  count={rawByColumn[colId].length}
+                  onExpand={() => toggleCollapse(colId)}
+                />
+              ) : (
+                <BoardColumn
+                  key={colId}
+                  id={colId}
+                  index={i}
+                  dragOver={activeDropCol === colId}
+                  title={COLUMN_TITLES[colId]}
+                  tasks={rawByColumn[colId]}
+                  filter={filters[colId]}
+                  onFilterChange={(next) => setFilters((prev) => ({ ...prev, [colId]: next }))}
+                  onCollapse={() => toggleCollapse(colId)}
+                  headerExtra={colId === 'done' ? doneHeader : undefined}
+                  snooze={
+                    colId === 'queued'
+                      ? { shown: showSnoozed, onToggle: () => setShowSnoozed((v) => !v) }
+                      : undefined
+                  }
+                >
+                  <ColumnContents
+                    colId={colId}
+                    tasks={filtered[colId]}
+                    agentRuns={agentRuns}
+                    agentMessages={agentMessages}
+                    chainStepRuns={chainStepRuns}
+                    currentUserID={currentUserID}
+                    members={members}
+                    bot={bot}
+                    delegateFailures={delegateFailures}
+                    onRequeue={handleRequeue}
+                    onPickerClaim={handlePickerClaim}
+                    onPickerUnclaim={handlePickerUnclaim}
+                    onPickerDelegate={handlePickerDelegate}
+                    onReview={(runID, kind) => setApprovalCtx({ runID, kind })}
+                    onRetry={(task) => {
+                      pendingDelegateTask.current = task
+                      setShowPromptPicker(true)
+                    }}
+                  />
+                </BoardColumn>
+              ),
+            )}
+          </div>
         </div>
       </div>
 
       <DragOverlay dropAnimation={null}>
         {activeTask && (
-          <div className="w-[280px]">
+          <div className="w-[400px]">
             <TaskCard task={activeTask} isDragging />
           </div>
         )}
@@ -1053,6 +1236,9 @@ function SortableTaskCard({
       ref={setNodeRef}
       task={task}
       style={style}
+      // Deliberately false: the lifted "ghost" is rendered by DragOverlay, and
+      // the in-place card fades via style.opacity (set in useSortable above).
+      // isDragging only drives a redundant z-50 here, so we never forward it.
       isDragging={false}
       onRequeue={onRequeue}
       delegateFailed={delegateFailed}
@@ -1140,9 +1326,3 @@ function SortableAgentCard({
 function EmptyColumn({ children }: { children: React.ReactNode }) {
   return <p className="text-[12px] text-text-tertiary text-center py-12">{children}</p>
 }
-
-// AnimatePresence import retained for future motion polish on column
-// transitions / card enter-exit animations. Currently unused in this
-// minimal redesign — the existing motion/react dep stays in the tree.
-void AnimatePresence
-void motion
