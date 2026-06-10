@@ -307,51 +307,64 @@ func (r *Router) closeCheckReviewRequestRemoved(orgID string, evt domain.Event, 
 	return closed
 }
 
-// closeCheckJiraReassigned: when a Jira issue is assigned to someone who is
-// NOT self, close any active jira:issue:assigned or jira:issue:available
-// tasks on this entity. "Self" here is the local user's jira_account_id;
-// in multi mode the inline close still over-closes acceptably (the next
-// poll reopens via discovery for any other user the assignment landed on).
+// closeCheckJiraReassigned: when a Jira issue is reassigned, retire the active
+// jira:issue:assigned / jira:issue:available tasks on the entity that no longer
+// reflect the assignment, so the new jira:issue:assigned can mint a fresh task
+// owned by the new assignee's team via the owning-team ladder.
+//
+// The two task types retire on different conditions:
+//
+//   - jira:issue:assigned is the per-assignee task. It is left open ONLY when
+//     the issue is still assigned to the team that owns it — a re-emit for the
+//     same member must not close-and-recreate that member's own task (it would
+//     lose the task's claim / in-flight run). Reassignment to ANOTHER TF member
+//     closes it (the new event mints the new owner's); reassignment to a
+//     non-member closes it and the ladder mints nothing.
+//   - jira:issue:available is the unassigned team-pool / pickup-queue task, and
+//     its owner is the TRACKING team, not the assignee — so an owner match
+//     against the new assignee's team is coincidental. Once the issue is
+//     assigned it is no longer unclaimed, so the pool task ALWAYS retires
+//     (otherwise it lingers alongside the new assigned task — two cards for one
+//     entity).
+//
+// Member-awareness comes from resolving the new assignee to its owning team(s)
+// via the same reverse identity lookup the router uses. A NULL-owned assigned
+// task (assignee bound to two TF users → ambiguous owner) is not skipped — it
+// closes on any reassignment, since there's no single owning team to match. The
+// "self" display-name fallback keeps the local Server/DC path (no Atlassian
+// accountId) from auto-closing a task still assigned to the local user.
 func (r *Router) closeCheckJiraReassigned(orgID string, evt domain.Event, entityID string) bool {
 	var meta events.JiraIssueAssignedMetadata
 	if err := json.Unmarshal([]byte(evt.MetadataJSON), &meta); err != nil {
 		return false
 	}
-	if r.users != nil {
-		// TODO(SKY-XXX-future): in multi-mode there is no single "the
-		// user" whose Jira identity counts for this inline close
-		// check — the router serves all org members. The current
-		// sentinel-keyed read keeps local-mode behavior intact and
-		// over-closes in multi-mode (acceptable: a still-assigned
-		// member's next poll reopens via discovery). Resolving this
-		// needs a product decision about team-membership-driven
-		// semantics, tracked separately from D9-core.
-		// Identity is host-scoped (SKY-397): resolve the org's Jira host
-		// (admin pool — this subscriber carries no claims), then read the
-		// local user's binding for (user, host). An unresolvable host or
-		// absent row leaves both empty, degrading to "don't treat as
-		// assigned-to-me" exactly as a NULL column did.
+
+	// Resolve the new assignee → owning team(s). The account-id reverse lookup
+	// is the member-aware core; on Server/DC issues that carry no accountId it
+	// resolves nobody, and the local-user display-name fallback below stands in
+	// to avoid closing a task still assigned to the local user.
+	newOwnerTeams := map[string]struct{}{}
+	for _, tid := range r.assigneeTeams(orgID, evt) {
+		newOwnerTeams[tid] = struct{}{}
+	}
+	if r.users != nil && meta.AssigneeAccountID == "" && meta.Assignee != "" {
+		// Identity is host-scoped: resolve the org's Jira host (admin pool —
+		// this subscriber carries no claims), then read the local user's
+		// binding. An unresolvable host or absent row leaves the name empty,
+		// degrading to "don't treat as assigned-to-me" exactly as before.
 		var jiraHost string
 		if r.orgs != nil {
 			if orgSet, serr := r.orgs.GetSettingsSystem(context.Background(), orgID); serr == nil {
 				jiraHost = orgSet.JiraBaseURL
 			}
 		}
-		localAccountID, localDisplayName, err := r.users.GetJiraIdentitySystem(context.Background(), runmode.LocalDefaultUserID, jiraHost)
-		if err == nil {
-			if meta.AssigneeAccountID != "" && localAccountID != "" && strings.EqualFold(meta.AssigneeAccountID, localAccountID) {
-				return false // assigned to me — not a reassignment-away
-			}
-			// Legacy snapshots (pre-fix) or Server/DC with no accountId: fall
-			// back to a case-insensitive display-name comparison so we don't
-			// auto-close tasks that are still assigned to the local user.
-			if meta.AssigneeAccountID == "" && meta.Assignee != "" && localDisplayName != "" && strings.EqualFold(meta.Assignee, localDisplayName) {
-				return false // display-name fallback — not a reassignment-away
+		if _, localDisplayName, err := r.users.GetJiraIdentitySystem(context.Background(), runmode.LocalDefaultUserID, jiraHost); err == nil {
+			if localDisplayName != "" && strings.EqualFold(meta.Assignee, localDisplayName) {
+				return false // display-name fallback — still assigned to the local user
 			}
 		}
 	}
 
-	// Close active assigned tasks.
 	closed := false
 	for _, eventType := range []string{domain.EventJiraIssueAssigned, domain.EventJiraIssueAvailable} {
 		tasks, err := r.tasks.FindActiveByEntityAndTypeSystem(context.Background(), orgID, entityID, eventType)
@@ -359,6 +372,16 @@ func (r *Router) closeCheckJiraReassigned(orgID string, evt domain.Event, entity
 			continue
 		}
 		for _, t := range tasks {
+			// Only the per-assignee assigned task gets the same-owner skip; the
+			// available pool task always retires once the issue is assigned (its
+			// owner is the tracking team, so an assignee-team match is coincidental).
+			if eventType == domain.EventJiraIssueAssigned {
+				if owner := teamIDValue(&t); owner != "" {
+					if _, ok := newOwnerTeams[owner]; ok {
+						continue // still assigned to its owning team — not a reassignment-away
+					}
+				}
+			}
 			if err := r.closeTaskWithAudit(orgID, t.ID, evt.ID, "auto_closed_by_event", domain.EventJiraIssueAssigned); err != nil {
 				log.Printf("[router] failed to close %s task %s: %v", eventType, t.ID, err)
 			} else {
