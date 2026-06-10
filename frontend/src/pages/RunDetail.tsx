@@ -20,13 +20,24 @@ export default function RunDetail() {
   const { runID } = useParams<{ runID: string }>()
   const navigate = useNavigate()
   const orgHref = useOrgHref()
-  const { run, task, messages, loading, notFound, error, refetch } = useRunDetail(runID)
+  const {
+    run,
+    task,
+    messages,
+    loading,
+    notFound,
+    error,
+    refetch,
+    pendingPermissions,
+    resolvePermission,
+  } = useRunDetail(runID)
 
   const [chainSteps, setChainSteps] = useState<AgentRun[] | null>(null)
   const [now, setNow] = useState(() => Date.now())
   const [takeoverInfo, setTakeoverInfo] = useState<TakeoverInfo | null>(null)
   const [takeoverPending, setTakeoverPending] = useState(false)
   const [releasePending, setReleasePending] = useState(false)
+  const [interruptPending, setInterruptPending] = useState(false)
   const [approval, setApproval] = useState<{ runID: string; kind: 'review' | 'pr' } | null>(null)
 
   // Tick while live so elapsed + the vent-heat flare stay current.
@@ -99,6 +110,44 @@ export default function RunDetail() {
       toast.error(`Failed to cancel run: ${(err as Error).message}`)
     }
   }, [run])
+
+  // Steer a run: a free-form message lands on the live process (or wakes an
+  // `open` run via resume). The backend records + broadcasts it as an
+  // agent_message, so useRunDetail's append renders it — no optimistic insert.
+  const handleMessage = useCallback(
+    async (text: string) => {
+      if (!run) return
+      try {
+        const res = await fetch(`/api/agent/runs/${run.ID}/message`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        })
+        if (!res.ok) toast.error(await readError(res, 'Failed to send message'))
+      } catch (err) {
+        toast.error(`Failed to send message: ${(err as Error).message}`)
+      }
+    },
+    [run],
+  )
+
+  // Interrupt pauses the current turn (run → open), leaving the process warm —
+  // distinct from Cancel, which abandons the run. The composer stays open.
+  // interruptPending mirrors takeoverPending/releasePending: it disables the
+  // Pause button while the POST is in flight so rapid clicks can't stack
+  // concurrent interrupts ahead of the WS status flip.
+  const handleInterrupt = useCallback(async () => {
+    if (!run || interruptPending) return
+    setInterruptPending(true)
+    try {
+      const res = await fetch(`/api/agent/runs/${run.ID}/interrupt`, { method: 'POST' })
+      if (!res.ok) toast.error(await readError(res, 'Failed to interrupt run'))
+    } catch (err) {
+      toast.error(`Failed to interrupt run: ${(err as Error).message}`)
+    } finally {
+      setInterruptPending(false)
+    }
+  }, [run, interruptPending])
 
   const handleRequeue = useCallback(async () => {
     if (!run?.TaskID) return
@@ -182,6 +231,10 @@ export default function RunDetail() {
     onRequeue: handleRequeue,
     onRelease: handleRelease,
     onReview: handleReview,
+    onMessage: handleMessage,
+    onInterrupt: handleInterrupt,
+    interruptPending,
+    onResolvePermission: resolvePermission,
     takeoverPending,
     releasePending,
   }
@@ -214,6 +267,7 @@ export default function RunDetail() {
         now={now}
         chainSteps={chainSteps}
         actions={actions}
+        pendingPermissions={pendingPermissions}
       />
     </div>
   )

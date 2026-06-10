@@ -319,11 +319,12 @@ func (s *Spawner) runAgent(ctx context.Context, runID string, task domain.Task, 
 				creatorUserID: creatorUserID,
 			},
 			opts: baseOpts,
-			// Autonomous run: a nil permission handler makes the wrapper omit
-			// canUseTool, so the allowlist is the sole gate (off-allowlist
-			// tools auto-deny, no prompt) — byte-identical to the headless
-			// one-shot path. P3 wires the browser pass-through handler.
-			perms:       nil,
+			// Interactive runs surface off-allowlist tools to the browser as a
+			// permission_request and park the turn until the user answers (Allow/Deny)
+			// or permTimeout() denies it — kept below idleTimeout so an unwatched run
+			// degrades to a bounded deny, never a hang. A generous allowlist keeps
+			// prompts rare.
+			perms:       s.BrowserPermissionHandler(orgID, runID),
 			sink:        sink,
 			idleTimeout: s.idleTimeout(),
 		})
@@ -546,20 +547,12 @@ func (s *Spawner) processCompletion(
 		// step's outcome was already coerced to finish above so the
 		// post-approval resume terminates the blueprint.
 		if hasPending {
-			// Snapshot the workspace to durable storage BEFORE parking in
-			// pending_approval: once the run is dormant a resume could land
-			// without the warm worktree, so the blob has to exist by the time
-			// the flip commits. Best-effort — the warm worktree (kept on disk
-			// below via the parked guard) is the primary path; the snapshot is
-			// the cold-path backstop. Keyed by namespace (blueprint_run_id for a
-			// step, else run_id).
-			if err := s.snapshotWorkspace(ctx, orgID, namespace, claudeCwd, sessionID); err != nil {
-				log.Printf("[delegate] warning: failed to snapshot workspace for run %s before pending_approval: %v", runID, err)
-			}
 			// Guarded transition: only flip to pending_approval if the
 			// row is still 'completed'. A racing cancel/takeover after
 			// agentRuns.Complete would otherwise be silently clobbered
-			// by an unconditional UPDATE.
+			// by an unconditional UPDATE. The flip comes FIRST — the
+			// review/PR approval card keys off this status, so nothing
+			// user-visible waits on workspace I/O.
 			var flippedToPending bool
 			var flipErr error
 			if triggerType == "manual" {
@@ -575,9 +568,26 @@ func (s *Spawner) processCompletion(
 				log.Printf("[delegate] warning: failed to set pending_approval for run %s: %v", runID, flipErr)
 			} else if flippedToPending {
 				status = "pending_approval"
-				// Dormant: keep the worktree as the warm cache. The snapshot is
-				// discarded by the approval/terminate path, not here.
+				// Dormant: keep the worktree as the warm cache.
 				parked = true
+				// No workspace snapshot on the finish path: approval finalizes
+				// the blueprint without re-invoking the agent
+				// (ResumeBlueprintAfterApproval), the approval UI renders from
+				// the pending_reviews/pending_prs rows, and terminateBlueprint
+				// deletes the blob unread — it was minutes of git-bundle cost
+				// for write-only data. An abort that queued an action is the
+				// one case that may carry resumable WIP (uncommitted/unpushed
+				// work a future follow-up could continue), so it keeps the
+				// durable backstop — written AFTER the flip: the snapshot only
+				// matters once the warm worktree is gone (host loss / sandbox
+				// reclaim, minutes away at best), never in the
+				// flip-to-visible window. Keyed by namespace (blueprint_run_id
+				// for a step, else run_id).
+				if domain.RunOutcome(outcome) == domain.RunOutcomeAbort {
+					if err := s.snapshotWorkspace(ctx, orgID, namespace, claudeCwd, sessionID); err != nil {
+						log.Printf("[delegate] warning: failed to snapshot workspace for aborted run %s after pending_approval: %v", runID, err)
+					}
+				}
 			}
 		}
 	}

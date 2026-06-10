@@ -46,6 +46,28 @@ func TestParseLine_CaptureSessionAndAccumulate(t *testing.T) {
 	}
 }
 
+// TestParseLine_ThinkingEmitsOwnMessage pins that a thinking block becomes
+// its own subtype:"thinking" message, emitted immediately — ahead of the
+// text sibling that accumulates on the shared assistant message and only
+// flushes on stop_reason.
+func TestParseLine_ThinkingEmitsOwnMessage(t *testing.T) {
+	s := NewStreamState()
+	msgs, _ := s.ParseLine([]byte(`{"type":"assistant","message":{"id":"m1","model":"sonnet","content":[{"type":"thinking","thinking":"let me reason"}]}}`), "t")
+	if len(msgs) != 1 {
+		t.Fatalf("expected immediate thinking message; got %d msgs", len(msgs))
+	}
+	th := msgs[0]
+	if th.Role != "assistant" || th.Subtype != "thinking" || th.Content != "let me reason" || th.Model != "sonnet" {
+		t.Errorf("thinking message wrong shape: %+v", th)
+	}
+
+	s.ParseLine([]byte(`{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"answer"}]}}`), "t")
+	flushed, _ := s.ParseLine([]byte(`{"type":"assistant","message":{"id":"m1","stop_reason":"end_turn","content":[]}}`), "t")
+	if len(flushed) != 1 || flushed[0].Subtype != "text" || flushed[0].Content != "answer" {
+		t.Fatalf("text sibling should flush separately after thinking; got %+v", flushed)
+	}
+}
+
 func TestParseLine_ToolUseAndToolResult(t *testing.T) {
 	s := NewStreamState()
 	// Tool use inside assistant turn.
@@ -127,5 +149,51 @@ func TestParseLine_IgnoresMalformedJSON(t *testing.T) {
 	s := NewStreamState()
 	if msgs, res := s.ParseLine([]byte(`not json`), "t"); msgs != nil || res != nil {
 		t.Errorf("malformed line should be silently dropped; got msgs=%v res=%v", msgs, res)
+	}
+}
+
+// TestParseLine_ToolResultBlockArrayContent pins the block-array form of
+// tool_result content ([{type:"text",...}]) observed from the SDK stream —
+// it must flatten to text rather than store an empty result.
+func TestParseLine_ToolResultBlockArrayContent(t *testing.T) {
+	s := NewStreamState()
+	out, _ := s.ParseLine([]byte(`{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"c1","content":[{"type":"text","text":"line one"},{"type":"text","text":"line two"}]}]}}`), "t")
+	if len(out) != 1 {
+		t.Fatalf("expected 1 tool message, got %d", len(out))
+	}
+	if out[0].Content != "line one\nline two" {
+		t.Errorf("content = %q, want flattened text blocks", out[0].Content)
+	}
+	if out[0].ToolCallID != "c1" {
+		t.Errorf("tool_call_id = %q, want c1", out[0].ToolCallID)
+	}
+}
+
+// TestParseLine_TerminalReasonMarksInterrupted pins the native interrupt
+// marker: the SDK reports an interrupted turn as an is_error /
+// error_during_execution result (deliberately shape-identical to a runtime
+// error) carrying terminal_reason aborted_streaming / aborted_tools — that
+// field, not the subtype, is what distinguishes a pause from a failure.
+func TestParseLine_TerminalReasonMarksInterrupted(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		want bool
+	}{
+		{"aborted_streaming", `{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"terminal_reason":"aborted_streaming"}`, true},
+		{"aborted_tools", `{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1,"terminal_reason":"aborted_tools"}`, true},
+		{"max_turns is not an interrupt", `{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":1,"terminal_reason":"max_turns"}`, false},
+		{"absent terminal_reason", `{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":1}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, res := NewStreamState().ParseLine([]byte(tc.line), "t")
+			if res == nil {
+				t.Fatal("expected Result")
+			}
+			if res.Interrupted != tc.want {
+				t.Errorf("Interrupted = %v, want %v", res.Interrupted, tc.want)
+			}
+		})
 	}
 }
