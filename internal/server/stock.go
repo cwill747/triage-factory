@@ -105,7 +105,9 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			return fmt.Errorf("list jira rules: %w", e)
 		}
-		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
+		// Jira identity is host-scoped (SKY-397): look it up for the org's
+		// Jira host (org_settings already loaded above).
+		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID, orgSet.JiraBaseURL)
 		return e
 	}); err != nil {
 		internalError(w, "stock", err)
@@ -113,10 +115,15 @@ func (s *Server) handleJiraStockGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Require full Jira configuration (PAT + URL + at least one project) plus
-	// a stored identity so we can match the assignee field. Partial config
-	// would silently stall on "polling" forever because the poller never has
-	// anything to do.
-	if creds.JiraPAT == "" || creds.JiraURL == "" || len(jiraRules) == 0 || localAccountID == "" || localDisplayName == "" {
+	// a stored identity so we can match the assignee field. Gate on the
+	// account ID alone, not the display name: StableID() is always populated
+	// when connected (it falls back to the Server/DC key), and assignee
+	// matching keys on account ID — display name is only the legacy
+	// no-accountID fallback and the post-claim snapshot label, both of which
+	// degrade gracefully when it's blank (valid on some Server/DC installs).
+	// Partial config would silently stall on "polling" forever because the
+	// poller never has anything to do.
+	if creds.JiraPAT == "" || creds.JiraURL == "" || len(jiraRules) == 0 || localAccountID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Jira not configured"})
 		return
 	}
@@ -371,7 +378,10 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			return fmt.Errorf("list jira rules: %w", e)
 		}
-		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID)
+		// Jira identity is host-scoped (SKY-397): creds.JiraURL mirrors
+		// org_settings.jira_base_url (both set from the same field), so it
+		// is the canonical host this identity was captured under.
+		localAccountID, localDisplayName, e = tx.Users.GetJiraIdentity(r.Context(), userID, creds.JiraURL)
 		return e
 	}); err != nil {
 		if teamscope.WriteIfSelectionError(w, err) {
@@ -380,7 +390,9 @@ func (s *Server) handleJiraStockPost(w http.ResponseWriter, r *http.Request) {
 		internalError(w, "stock", err)
 		return
 	}
-	if creds.JiraPAT == "" || creds.JiraURL == "" || len(jiraRules) == 0 || localAccountID == "" || localDisplayName == "" {
+	// Account ID alone gates the action (see handleJiraStockGet): display
+	// name is optional and degrades gracefully when blank.
+	if creds.JiraPAT == "" || creds.JiraURL == "" || len(jiraRules) == 0 || localAccountID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "Jira not configured"})
 		return
 	}

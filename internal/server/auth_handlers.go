@@ -572,17 +572,19 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		// rig still works while production calls (always wired)
 		// populate identity from the users row.
 		if s.users != nil {
-			// Identity is host-scoped (SKY-396): resolve the local org's
-			// GitHub host, then look up the login for (user, host). s.orgs
-			// is wired by New(); guard like s.users for the bare-rig test.
-			var ghHost string
+			// Identity is host-scoped (GitHub SKY-396, Jira SKY-397):
+			// resolve the local org's GitHub + Jira hosts, then look up
+			// each binding for (user, host). s.orgs is wired by New();
+			// guard like s.users for the bare-rig test.
+			var ghHost, jiraHost string
 			if s.orgs != nil {
 				if orgSet, err := s.orgs.GetSettings(r.Context(), runmode.LocalDefaultOrgID); err == nil {
 					ghHost = orgSet.GitHubBaseURL
+					jiraHost = orgSet.JiraBaseURL
 				}
 			}
 			resp.GitHubUsername, _ = s.users.GetGitHubLogin(r.Context(), runmode.LocalDefaultUserID, ghHost)
-			resp.JiraAccountID, resp.JiraDisplayName, _ = s.users.GetJiraIdentity(r.Context(), runmode.LocalDefaultUserID)
+			resp.JiraAccountID, resp.JiraDisplayName, _ = s.users.GetJiraIdentity(r.Context(), runmode.LocalDefaultUserID, jiraHost)
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -613,9 +615,12 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 	err := tfdb.WithTx(r.Context(), s.db,
 		tfdb.Claims{Sub: claims.Subject, OrgID: resp.ActiveOrgID},
 		func(tx *sql.Tx) error {
-			// Identity is host-scoped: prefer the login bound to the active
-			// org's GitHub host, else the most recently verified row. An
-			// absent row scans to "" exactly as the old NULL column did.
+			// Identity is host-scoped for both providers (GitHub SKY-396,
+			// Jira SKY-397): prefer the row bound to the active org's host
+			// (GitHub login via the correlated subquery; Jira account_id +
+			// display_name via the LATERAL, which keeps the pair on one row),
+			// else the most recently verified row. An absent row scans to ""
+			// exactly as the old NULL columns did.
 			if err := tx.QueryRowContext(r.Context(), `
 				SELECT u.id::text,
 				       COALESCE(u.display_name, ''),
@@ -631,9 +636,20 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 					                     i.verified_at DESC NULLS LAST
 				            LIMIT 1
 				       ), ''),
-				       COALESCE(u.jira_account_id, ''),
-				       COALESCE(u.jira_display_name, '')
+				       COALESCE(j.account_id, ''),
+				       COALESCE(j.display_name, '')
 				  FROM public.users u
+			  LEFT JOIN LATERAL (
+			           SELECT ji.account_id, ji.display_name
+			             FROM user_jira_identities ji
+			            WHERE ji.user_id = u.id
+			            ORDER BY (ji.jira_base_url = rtrim(trim((
+			                        SELECT os.jira_base_url FROM org_settings os
+			                         WHERE os.org_id = tf.current_org_id()
+			                      )), '/')) DESC NULLS LAST,
+			                     ji.verified_at DESC NULLS LAST
+			            LIMIT 1
+			       ) j ON true
 				 WHERE u.id = tf.current_user_id()
 			`).Scan(&resp.ID, &resp.DisplayName, &resp.AvatarURL, &resp.GitHubUsername, &resp.JiraAccountID, &resp.JiraDisplayName); err != nil {
 				return fmt.Errorf("user lookup: %w", err)
