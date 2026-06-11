@@ -13,7 +13,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/poller"
 	"github.com/sky-ai-eng/triage-factory/internal/repoprofile"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
-	"github.com/sky-ai-eng/triage-factory/internal/server"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
 )
 
@@ -32,7 +31,6 @@ type reloader struct {
 	stores     db.Stores
 	database   *sql.DB
 	pollerMgr  *poller.Manager
-	srv        *server.Server
 	scorer     *ai.Manager
 	ghResolver ghclient.Resolver
 	runSecrets agentproc.SecretsReader
@@ -45,7 +43,6 @@ func newReloader(a *App) *reloader {
 		stores:     a.stores,
 		database:   a.database,
 		pollerMgr:  a.pollerMgr,
-		srv:        a.srv,
 		scorer:     a.scorer,
 		ghResolver: a.ghResolver,
 		runSecrets: a.runSecrets,
@@ -82,15 +79,10 @@ func (r *reloader) onGitHubChanged(orgID string) {
 	creds, _ := integrations.Load(ctx, r.stores.Secrets, orgID)
 
 	if creds.GitHubPAT != "" && creds.GitHubURL != "" {
-		// Server request-handler path only (reviews / dashboard /
-		// pending-PRs). Separate from the run-credential seam by design —
-		// those handlers run with JWT claims.
-		r.srv.SetGitHubClient(ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT))
 		// invalidate=true (creds changed); pollSoon=true (apply now rather
 		// than wait out the interval).
 		r.reprofileRestartAndScore(orgID, true, true)
 	} else {
-		r.srv.SetGitHubClient(nil)
 		r.pollerMgr.RestartAll()
 		r.pollerMgr.PollSoon("github", orgID)
 		r.pollerMgr.PollSoon("jira", orgID)
@@ -116,10 +108,11 @@ func (r *reloader) onJiraChanged(orgID string) {
 	r.pollerMgr.PollSoon("jira", orgID) // apply now, don't wait out the interval
 }
 
-// initialPoll starts polling at boot. Local mode additionally wires the
-// process-global GitHub identity (server request-handler client) and kicks
-// the first profile+score; multi mode just starts the process-global loop,
-// which fans out over every active tenant and self-gates Jira off.
+// initialPoll starts polling at boot. Local mode additionally kicks the first
+// profile+score when GitHub is configured; multi mode just starts the
+// process-global loop, which fans out over every active tenant and self-gates
+// Jira off. Request handlers resolve GitHub clients per-request through the
+// credential resolver, so there's no process-global client to wire here.
 func (r *reloader) initialPoll(ctx context.Context) {
 	if runmode.Current() != runmode.ModeLocal {
 		// runGitHubCycle fans out over ListActiveSystem each wake; orgs and
@@ -135,7 +128,6 @@ func (r *reloader) initialPoll(ctx context.Context) {
 	repoCount, _ := r.stores.Repos.CountConfiguredSystem(ctx, orgID)
 
 	if creds.GitHubPAT != "" && creds.GitHubURL != "" && repoCount > 0 {
-		r.srv.SetGitHubClient(ghclient.NewClient(creds.GitHubURL, creds.GitHubPAT))
 		log.Printf("[delegate] spawner ready (%d repos configured)", repoCount)
 		// invalidate=false (fresh boot, profiles may still be warm);
 		// pollSoon=false (the restarted loop polls on its own schedule).
