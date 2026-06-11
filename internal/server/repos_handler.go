@@ -39,12 +39,25 @@ func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
 	// by middleware); a read error degrades to the PAT path rather than
 	// blanking the picker.
 	var (
-		app   *domain.OrgGitHubApp
-		insts []domain.OrgGitHubAppInstallation
+		app      *domain.OrgGitHubApp
+		insts    []domain.OrgGitHubAppInstallation
+		instsErr error
 	)
 	if s.githubApps != nil {
-		app, _ = s.githubApps.GetForOrgSystem(r.Context(), orgID)
-		insts, _ = s.githubApps.ListInstallationsForOrgSystem(r.Context(), orgID)
+		// Both reads degrade to the PAT path on error (per above) rather than
+		// blanking the picker, but log either failure — these silent points are
+		// what made the original dead-end untraceable (TFAC-324). instsErr is
+		// also load-bearing below: a failed installations read leaves insts nil,
+		// which must not masquerade as a positive "installed on zero accounts".
+		var appErr error
+		app, appErr = s.githubApps.GetForOrgSystem(r.Context(), orgID)
+		if appErr != nil {
+			log.Printf("[repos] org %s: read app registration failed, falling back to PAT path: %v", orgID, appErr)
+		}
+		insts, instsErr = s.githubApps.ListInstallationsForOrgSystem(r.Context(), orgID)
+		if instsErr != nil {
+			log.Printf("[repos] org %s: list installations failed, falling back to PAT path: %v", orgID, instsErr)
+		}
 	}
 
 	var repos []ghclient.UserRepo
@@ -53,6 +66,7 @@ func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
 		repos, err = s.installationReposUnion(r.Context(), orgID, insts)
 		if err != nil {
 			if errors.Is(err, ghclient.ErrNoGitHubCredentials) {
+				log.Printf("[repos] org %s: app installed but resolver produced no credentials for any installation: %v", orgID, err)
 				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GitHub not configured"})
 				return
 			}
@@ -79,6 +93,23 @@ func (s *Server) handleGitHubRepos(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if creds.GitHubPAT == "" || creds.GitHubURL == "" {
+			// An active App installed on zero accounts dead-ends here in the
+			// PAT fallback — no installation token to use, no PAT to borrow.
+			// Surface that as its own 400 the picker can key install guidance
+			// off, instead of the generic "not configured" that reads as
+			// "add a PAT". This is the first-run dead-end TFAC-324 unblocks.
+			//
+			// instsErr == nil is load-bearing: only a *successful* read of zero
+			// installations means "not installed". A failed read also leaves
+			// insts empty, and reporting that as "not installed" would mislead
+			// on a transient store error — so it falls through to the generic
+			// message instead.
+			if app != nil && app.Active && instsErr == nil && len(insts) == 0 {
+				log.Printf("[repos] org %s: app registered + active but installed on zero accounts, and no PAT configured", orgID)
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GitHub App is not installed on any account"})
+				return
+			}
+			log.Printf("[repos] org %s: GitHub not configured (no usable App installation and no PAT)", orgID)
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "GitHub not configured"})
 			return
 		}
