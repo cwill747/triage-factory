@@ -18,11 +18,13 @@ import (
 // Wires the app pool in Postgres for the curator goroutine's normal
 // dispatch path — each turn opens short-lived txs under the
 // requesting user's identity (read from curator_requests.creator_user_id
-// at dequeue time). System-service paths that lack a real user
-// (process shutdown, project-delete fan-out, handler cancels prior to
-// D9) still call the package-level helpers in internal/db/curator.go
-// against *sql.DB; those are out of scope for this ticket and tracked
-// by SKY-253.
+// at dequeue time). The curator's own system-service cancel paths
+// (process shutdown, project-delete drain, SendMessage shutdown /
+// queue-full fallbacks) route through the admin-pool …System methods
+// below (TFAC-64). The one raw-*sql.DB curator helper still live is the
+// handler-side user-cancel in internal/server/curator.go — that has a
+// real request context and is the D9 handler sweep's job (TFAC-168),
+// out of scope here.
 //
 // Read methods (Get/List) mostly live in the package-level helpers
 // for now — the goroutine's writes are the auth surface that matters
@@ -60,10 +62,41 @@ type CuratorStore interface {
 
 	// MarkRequestCancelledIfActive flips any non-terminal row to
 	// cancelled. Returns true if the flip happened. Used by the
-	// goroutine's own cancel-observation paths (markCancelled,
-	// session.shutdown) — handler-side cancellation still uses
-	// the package-level helper today.
+	// goroutine's own cancel-observation paths (markCancelled) under
+	// the requesting user's synthetic claims.
 	MarkRequestCancelledIfActive(ctx context.Context, orgID, id, errMsg string) (bool, error)
+
+	// MarkRequestCancelledIfActiveSystem is the admin-pool variant of
+	// MarkRequestCancelledIfActive for the curator's system-driven
+	// cancel paths — process shutdown, project-delete drain, and the
+	// SendMessage "curator is shut down" fallback. These fire outside
+	// any request/JWT context (no live user to attribute to), so the
+	// app-pool RLS UPDATE would match zero rows and silently leave the
+	// request dangling non-terminal. The row already records who
+	// created it (creator_user_id); a system cancel is not a user
+	// action, so it routes through the admin pool (BYPASSRLS) rather
+	// than reconstructing per-user claims. orgID still scopes the
+	// UPDATE for defense-in-depth even though the admin pool bypasses
+	// RLS. TFAC-64.
+	MarkRequestCancelledIfActiveSystem(ctx context.Context, orgID, id, errMsg string) (bool, error)
+
+	// CompleteRequestSystem is the admin-pool variant of CompleteRequest
+	// for the curator's queue-full fallback in SendMessage — it runs
+	// from the handler goroutine with no claims context, so the
+	// app-pool UPDATE would be rejected by RLS and leave the freshly
+	// created request stuck in `queued`. See
+	// MarkRequestCancelledIfActiveSystem for the pool-attribution
+	// rationale. TFAC-64.
+	CompleteRequestSystem(ctx context.Context, orgID, id, status, errMsg string, costUSD float64, durationMs, numTurns int) (bool, error)
+
+	// QueuedRequestsForProjectSystem lists the queued curator_request
+	// rows for a project via the admin pool (BYPASSRLS). The
+	// project-delete drain (Curator.CancelProject → cancelQueuedRows)
+	// has no live request context, so an app-pool SELECT under RLS
+	// would see zero rows and the drain would no-op, leaving queued
+	// rows to dangle past the project FK cascade. orgID scopes the
+	// list defensively. TFAC-64.
+	QueuedRequestsForProjectSystem(ctx context.Context, orgID, projectID string) ([]domain.CuratorRequest, error)
 
 	// InsertMessage writes one curator_messages row and returns
 	// its id. The struct's CreatedAt is set to now if zero.
