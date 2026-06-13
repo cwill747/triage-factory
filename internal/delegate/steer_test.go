@@ -9,6 +9,7 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/paths"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
@@ -63,16 +64,20 @@ func TestSendMessage_LiveRoutesToSteer(t *testing.T) {
 }
 
 // TestSendMessage_OpenRoutesToResume: a run with no live process but status
-// `open` is woken via ResumeOpenRun. Proven by the run leaving `open` — the
-// resume goroutine fails fast here for lack of a warm worktree, exactly as in
-// TestResumeOpenRun_InitiatesResume; what matters is that resume was entered.
+// `open` is woken via ResumeOpenRun. Proven by the run leaving `open` — a
+// durable snapshot satisfies the workspace pre-flight, then the resume goroutine
+// fails fast at the cold rehydrate of the stub blob (no subprocess), exactly as
+// in TestResumeOpenRun_InitiatesResume; what matters is that resume was entered.
 func TestSendMessage_OpenRoutesToResume(t *testing.T) {
+	paths.SetForTest(t, t.TempDir())
 	database := newDelegateTestDB(t)
 	seedRun(t, database, "r-open", "sess-open", "/tmp/does-not-exist-open")
 	if _, err := database.Exec(`UPDATE runs SET status='open' WHERE id='r-open'`); err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	s := NewSpawner(database, testSpawnerStores(database), nil, nil, "claude-sonnet-4-6")
+	wireBlobStore(t, s)
+	putTestSnapshot(t, s, blueprintRunIDForRun(t, database, "r-open"))
 
 	if err := s.SendMessage(context.Background(), runmode.LocalDefaultOrg, "r-open", runmode.LocalDefaultUserID, "go on"); err != nil {
 		t.Fatalf("SendMessage: %v", err)
@@ -100,9 +105,9 @@ func TestSendMessage_OpenRoutesToResume(t *testing.T) {
 	t.Logf("final run status after open-resume: %s", status)
 }
 
-// TestSendMessage_TerminalNotSteerable: a terminal run (no live process, not
-// open) can take no message — SendMessage returns ErrRunNotSteerable for the
-// handler to map to 409.
+// TestSendMessage_TerminalNotSteerable: a terminal finish run (no live process,
+// completed without an abort outcome) can take no message — SendMessage returns
+// ErrRunNotSteerable for the handler to map to 409.
 func TestSendMessage_TerminalNotSteerable(t *testing.T) {
 	database := newDelegateTestDB(t)
 	seedRun(t, database, "r-done", "sess", "/tmp/wt")
@@ -115,6 +120,104 @@ func TestSendMessage_TerminalNotSteerable(t *testing.T) {
 	if !errors.Is(err, ErrRunNotSteerable) {
 		t.Errorf("err = %v, want ErrRunNotSteerable", err)
 	}
+}
+
+// TestResumableState pins the (status, outcome) wake gate the routing and the
+// MarkResuming CAS both key on: every non-finish parked/terminal state is
+// resumable, a finish run is not.
+func TestResumableState(t *testing.T) {
+	cases := []struct {
+		status, outcome string
+		want            bool
+	}{
+		{"open", "", true},
+		{"pending_approval", "", true},
+		{"pending_approval", "finish", true}, // pending is resumable whatever the coerced outcome
+		{"completed", "abort", true},
+		{"completed", "finish", false}, // finish is the one terminal excluded
+		{"completed", "", false},
+		{"running", "", false},
+		{"queued", "", false},
+		{"failed", "", false},
+		{"cancelled", "abort", false}, // status gates first — only completed pairs with abort
+	}
+	for _, tc := range cases {
+		if got := resumableState(tc.status, tc.outcome); got != tc.want {
+			t.Errorf("resumableState(%q, %q) = %v, want %v", tc.status, tc.outcome, got, tc.want)
+		}
+	}
+}
+
+// TestSendMessage_PendingApprovalIsResumable: a pending_approval run (no live
+// process) passes the steerable gate and routes to a resume rather than
+// returning ErrRunNotSteerable — the conversation is independent of the queued
+// artifact's approval.
+func TestSendMessage_PendingApprovalIsResumable(t *testing.T) {
+	database := newDelegateTestDB(t)
+	seedRun(t, database, "r-pa", "sess-pa", "/tmp/does-not-exist-pa")
+	if _, err := database.Exec(`UPDATE runs SET status='pending_approval' WHERE id='r-pa'`); err != nil {
+		t.Fatalf("pending_approval: %v", err)
+	}
+	s := NewSpawner(database, testSpawnerStores(database), nil, nil, "claude-sonnet-4-6")
+
+	err := s.SendMessage(context.Background(), runmode.LocalDefaultOrg, "r-pa", runmode.LocalDefaultUserID, "carry on")
+	if errors.Is(err, ErrRunNotSteerable) {
+		t.Errorf("pending_approval run rejected at the steerable gate: %v", err)
+	}
+	awaitResumeGoroutine(t, s, "r-pa")
+}
+
+// TestSendMessage_CompletedAbortIsResumable: a completed+abort run passes the
+// steerable gate and routes to a resume (the agent's voluntary stop can be
+// picked back up).
+func TestSendMessage_CompletedAbortIsResumable(t *testing.T) {
+	database := newDelegateTestDB(t)
+	seedRun(t, database, "r-ab", "sess-ab", "/tmp/does-not-exist-ab")
+	if _, err := database.Exec(`UPDATE runs SET status='completed', outcome='abort' WHERE id='r-ab'`); err != nil {
+		t.Fatalf("completed+abort: %v", err)
+	}
+	s := NewSpawner(database, testSpawnerStores(database), nil, nil, "claude-sonnet-4-6")
+
+	err := s.SendMessage(context.Background(), runmode.LocalDefaultOrg, "r-ab", runmode.LocalDefaultUserID, "pick it back up")
+	if errors.Is(err, ErrRunNotSteerable) {
+		t.Errorf("completed+abort run rejected at the steerable gate: %v", err)
+	}
+	awaitResumeGoroutine(t, s, "r-ab")
+}
+
+// TestSendMessage_CompletedFinishNotSteerable: a completed+finish run is NOT
+// resumable (finish is the one non-finish-state exclusion) → ErrRunNotSteerable.
+func TestSendMessage_CompletedFinishNotSteerable(t *testing.T) {
+	database := newDelegateTestDB(t)
+	seedRun(t, database, "r-fin", "sess", "/tmp/wt")
+	if _, err := database.Exec(`UPDATE runs SET status='completed', outcome='finish' WHERE id='r-fin'`); err != nil {
+		t.Fatalf("completed+finish: %v", err)
+	}
+	s := NewSpawner(database, testSpawnerStores(database), nil, nil, "m")
+
+	err := s.SendMessage(context.Background(), runmode.LocalDefaultOrg, "r-fin", runmode.LocalDefaultUserID, "more please")
+	if !errors.Is(err, ErrRunNotSteerable) {
+		t.Errorf("err = %v, want ErrRunNotSteerable (finish runs are excluded from resume)", err)
+	}
+}
+
+// awaitResumeGoroutine joins a resume goroutine deterministically: ResumeOpenRun
+// registers s.cancels[runID] before spawning and clears it in the terminal defer
+// (after all DB writes), so waiting for that entry to clear avoids racing the
+// in-memory DB close on cleanup. A no-op when no goroutine was spawned.
+func awaitResumeGoroutine(t *testing.T, s *Spawner, runID string) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		s.mu.Lock()
+		_, active := s.cancels[runID]
+		s.mu.Unlock()
+		if !active {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("resume goroutine for %s did not finish in time", runID)
 }
 
 // TestSendMessage_MissingRunNotSteerable: an unknown run id (no process, no

@@ -242,7 +242,7 @@ func (s *agentRunStore) MarkOpenSystem(ctx context.Context, orgID, runID string)
 func markOpen(ctx context.Context, q queryer, orgID, runID string) (bool, error) {
 	res, err := q.ExecContext(ctx, `
 		UPDATE runs
-		SET status = 'open'
+		SET status = 'open', parked_at = now()
 		WHERE org_id = $1 AND id = $2
 		  AND status NOT IN ('completed', 'failed', 'cancelled', 'task_unsolvable',
 		                     'pending_approval', 'open')
@@ -262,10 +262,48 @@ func (s *agentRunStore) MarkResumingSystem(ctx context.Context, orgID, runID str
 	return markResuming(ctx, s.admin, orgID, runID)
 }
 
+func (s *agentRunStore) ListReapableSnapshotKeysSystem(ctx context.Context, cutoff time.Time) ([]domain.SnapshotReapKey, error) {
+	// Resumable-state runs (open / pending_approval / completed+abort) grouped by
+	// their shared snapshot key (org, blueprint_run_id); a key is reapable once
+	// its newest resumable run last parked before the cutoff. The park timestamp
+	// is COALESCE(parked_at, completed_at, started_at): parked_at for an open run
+	// (re-stamped each park, so resumes don't age it), completed_at for the
+	// pending_approval / completed+abort terminals, started_at a legacy fallback.
+	// Admin pool — the retention sweep is a tenant-spanning system job with no
+	// JWT claims.
+	rows, err := s.admin.QueryContext(ctx, `
+		SELECT org_id, blueprint_run_id
+		FROM runs
+		WHERE status IN ('open', 'pending_approval')
+		   OR (status = 'completed' AND outcome = 'abort')
+		GROUP BY org_id, blueprint_run_id
+		HAVING MAX(COALESCE(parked_at, completed_at, started_at)) < $1
+	`, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var keys []domain.SnapshotReapKey
+	for rows.Next() {
+		var k domain.SnapshotReapKey
+		if err := rows.Scan(&k.OrgID, &k.BlueprintRunID); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
 func markResuming(ctx context.Context, q queryer, orgID, runID string) (bool, error) {
+	// Wake any non-finish parked/terminal state: open, pending_approval, or an
+	// aborted run (completed + outcome='abort'). Keyed on (status, outcome) so a
+	// finish run (completed + outcome='finish') is excluded and a racing
+	// approval/resume that already moved the row loses this compare-and-swap.
 	res, err := q.ExecContext(ctx, `
-		UPDATE runs SET status = 'running'
-		WHERE org_id = $1 AND id = $2 AND status = 'open'
+		UPDATE runs SET status = 'running', parked_at = NULL
+		WHERE org_id = $1 AND id = $2
+		  AND (status IN ('open', 'pending_approval')
+		       OR (status = 'completed' AND outcome = 'abort'))
 	`, orgID, runID)
 	if err != nil {
 		return false, err

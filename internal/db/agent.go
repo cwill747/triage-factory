@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
@@ -88,13 +89,22 @@ type AgentRunStore interface {
 	AddPartialTotals(ctx context.Context, orgID, runID string, costUSD float64, durationMs, numTurns int) error
 
 	// MarkOpen flips a running run to `open` — a turn ended without a
-	// conclusion (or the live process idle-closed). Returns ok=false (no
-	// error) if the row already reached a terminal state.
+	// conclusion (or the live process idle-closed). Stamps parked_at to the
+	// current time so the snapshot-retention sweep keys this open run off its
+	// last park rather than started_at. Returns ok=false (no error) if the row
+	// already reached a terminal state.
 	MarkOpen(ctx context.Context, orgID, runID string) (bool, error)
 
-	// MarkResuming flips an `open` run back to running when it is woken
-	// (a resume goroutine is about to spawn). ok=false means the run is no
-	// longer `open` — caller must not spawn the resume.
+	// MarkResuming flips a resumable run back to running when it is woken by a
+	// follow-up message (a resume goroutine is about to spawn). The resumable
+	// set is every non-finish parked/terminal state: `open`, `pending_approval`,
+	// and an aborted run (completed + outcome='abort'). The (status, outcome)
+	// compare-and-swap is the wake race gate — ok=false means the run is no
+	// longer resumable (a concurrent resume already flipped it running, or an
+	// approval/finish finalized it), so the caller must not spawn the resume and
+	// maps the miss to 409. A finish run (completed + outcome='finish') is
+	// deliberately excluded. Clears parked_at on the wake (the run is no longer
+	// parked) so an open run's next park stamps a fresh timestamp.
 	MarkResuming(ctx context.Context, orgID, runID string) (bool, error)
 
 	// SetSession stores the Claude Code session_id captured from
@@ -299,6 +309,21 @@ type AgentRunStore interface {
 	MarkPendingApprovalIfCompletedSystem(ctx context.Context, orgID, runID string) (bool, error)
 	HasOtherActiveRunForTaskSystem(ctx context.Context, orgID, taskID, excludeRunID string) (bool, error)
 	InsertMessageSystem(ctx context.Context, orgID string, msg *domain.AgentMessage) (int64, error)
+
+	// ListReapableSnapshotKeysSystem returns the (org, blueprint_run_id) of
+	// every blueprint_run all of whose resumable-state runs (open /
+	// pending_approval / completed+abort) last parked before cutoff — the
+	// workspace snapshot keys the retention reaper may safely drop. A
+	// blueprint_run with any resumable run still within the TTL is omitted (its
+	// shared blob is still wanted). The park timestamp is COALESCE(parked_at,
+	// completed_at, started_at): parked_at tracks an open run's last park (stamped
+	// by MarkOpen, cleared by MarkResuming, so a repeatedly-resumed long-lived
+	// run is keyed off its most recent park rather than its initial start),
+	// completed_at covers the pending_approval / completed+abort terminals, and
+	// started_at is a legacy fallback. System-wide / no org scoping — the
+	// retention sweep is a maintenance job that spans tenants; the admin pool is
+	// the right door (BYPASSRLS) since the reaper holds no JWT claims.
+	ListReapableSnapshotKeysSystem(ctx context.Context, cutoff time.Time) ([]domain.SnapshotReapKey, error)
 
 	// TokenTotalsSystem mirrors TokenTotals but routes through the
 	// admin pool in Postgres. Consumed by agentmeta.Build, which
