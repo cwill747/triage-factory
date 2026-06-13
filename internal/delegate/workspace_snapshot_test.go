@@ -1,7 +1,10 @@
 package delegate
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -131,6 +134,130 @@ func TestEnsureWorkspace_ColdPath_RehydratesFromSnapshot(t *testing.T) {
 		t.Fatalf("ClaudeSessionPath: %v", err)
 	}
 	assertFileContains(t, sessPath2, `"sid":"cold"`)
+}
+
+// TestSnapshotWorkspace_StoresGzip: the stored blob is gzip-compressed — the
+// two fat members (session transcript, ci-logs) make uncompressed storage
+// pathological, so the staged tar is wrapped in gzip before Put. Asserts on
+// the raw stored bytes: the storage seam must carry the compressed form, not
+// just hand back something the reader can parse.
+func TestSnapshotWorkspace_StoresGzip(t *testing.T) {
+	paths.SetForTest(t, t.TempDir())
+	setupGitTestEnv(t)
+	s := newStorageSpawner(t)
+
+	// A non-git run-root is enough: format is decided by the writer wrapper,
+	// not by which members ride in the tar.
+	wtPath := t.TempDir()
+	writeFile(t, filepath.Join(wtPath, "_scratch", "notes.txt"), "scratch note")
+
+	const runID = "wt-gzip"
+	if err := s.snapshotWorkspace(context.Background(), runmode.LocalDefaultOrg, runID, wtPath, ""); err != nil {
+		t.Fatalf("snapshotWorkspace: %v", err)
+	}
+
+	rc, err := s.Storage().Get(context.Background(), snapshotKey(runmode.LocalDefaultOrg, runID))
+	if err != nil {
+		t.Fatalf("get snapshot blob: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	magic := make([]byte, 2)
+	if _, err := io.ReadFull(rc, magic); err != nil {
+		t.Fatalf("read blob magic: %v", err)
+	}
+	if magic[0] != 0x1f || magic[1] != 0x8b {
+		t.Errorf("stored blob starts with %#02x %#02x, want the gzip magic 0x1f 0x8b", magic[0], magic[1])
+	}
+}
+
+// TestEnsureWorkspace_ColdPath_CorruptGzipChecksumErrors: a stored blob whose
+// gzip CRC-32 trailer no longer matches its contents must fail the rehydrate
+// rather than silently rebuild onto corrupt state. The tar reader stops at the
+// archive's end-of-archive marker before the gzip footer, so the integrity
+// check only fires because rehydrate drains the reader to EOF; this guards that
+// drain. A non-git run-root keeps the focus on the integrity gate, which runs
+// before any worktree mutation.
+func TestEnsureWorkspace_ColdPath_CorruptGzipChecksumErrors(t *testing.T) {
+	paths.SetForTest(t, t.TempDir())
+	setupGitTestEnv(t)
+	s := newStorageSpawner(t)
+
+	const runID = "wt-corrupt"
+	src := t.TempDir()
+	writeFile(t, filepath.Join(src, "_scratch", "ci-logs", "x.log"), "log bytes the gzip trailer checksums over")
+	if err := s.snapshotWorkspace(context.Background(), runmode.LocalDefaultOrg, runID, src, ""); err != nil {
+		t.Fatalf("snapshotWorkspace: %v", err)
+	}
+
+	// Flip a byte in the gzip footer's CRC-32 (the last 8 bytes are CRC-32 +
+	// ISIZE) so the decompressed bytes no longer match the stored checksum.
+	key := snapshotKey(runmode.LocalDefaultOrg, runID)
+	rc, err := s.Storage().Get(context.Background(), key)
+	if err != nil {
+		t.Fatalf("get snapshot blob: %v", err)
+	}
+	blob, err := io.ReadAll(rc)
+	_ = rc.Close()
+	if err != nil {
+		t.Fatalf("read snapshot blob: %v", err)
+	}
+	if len(blob) < 8 {
+		t.Fatalf("snapshot blob too small to corrupt: %d bytes", len(blob))
+	}
+	blob[len(blob)-8] ^= 0xff
+	if err := s.Storage().Put(context.Background(), key, bytes.NewReader(blob)); err != nil {
+		t.Fatalf("put corrupted blob: %v", err)
+	}
+
+	// Cold path: the warm worktree is absent, so the resume can only come from
+	// the (now corrupt) blob — which must surface as an error.
+	run := &domain.AgentRun{ID: runID, WorktreePath: filepath.Join(t.TempDir(), "gone"), BlueprintRunID: runID}
+	if _, err := s.ensureWorkspace(context.Background(), runmode.LocalDefaultOrg, run, "", "", ""); err == nil {
+		t.Fatal("ensureWorkspace accepted a snapshot with a corrupted gzip checksum; want an integrity error")
+	}
+}
+
+// TestSnapshotWorkspace_CompressionShrinksTranscriptHeavyBlob: a JSONL-heavy
+// workspace — the dominant real-world shape, where the transcript carries
+// every tool call and result verbatim — must store measurably smaller than
+// its plain-tar equivalent. Loose bound only (half), not a pinned ratio.
+func TestSnapshotWorkspace_CompressionShrinksTranscriptHeavyBlob(t *testing.T) {
+	paths.SetForTest(t, t.TempDir())
+	setupGitTestEnv(t)
+	s := newStorageSpawner(t)
+
+	wtPath := t.TempDir()
+	const sessionID = "sess-fat"
+	var jsonl strings.Builder
+	for i := 0; i < 4000; i++ {
+		fmt.Fprintf(&jsonl, `{"type":"tool_result","seq":%d,"content":"$ go test ./...\nok  \tgithub.com/sky-ai-eng/triage-factory/internal/delegate\t1.2s\n"}%s`, i, "\n")
+	}
+	writeSession(t, wtPath, sessionID, jsonl.String())
+	writeFile(t, filepath.Join(wtPath, "_scratch", "ci-logs", "test.log"),
+		strings.Repeat("=== RUN   TestSomething\n--- PASS: TestSomething (0.01s)\n", 2000))
+
+	const runID = "wt-fat"
+	if err := s.snapshotWorkspace(context.Background(), runmode.LocalDefaultOrg, runID, wtPath, sessionID); err != nil {
+		t.Fatalf("snapshotWorkspace: %v", err)
+	}
+	rc, err := s.Storage().Get(context.Background(), snapshotKey(runmode.LocalDefaultOrg, runID))
+	if err != nil {
+		t.Fatalf("get snapshot blob: %v", err)
+	}
+	defer func() { _ = rc.Close() }()
+	gzSize, err := io.Copy(io.Discard, rc)
+	if err != nil {
+		t.Fatalf("size snapshot blob: %v", err)
+	}
+
+	// The same workspace through the tar writer alone = the plain equivalent.
+	var plain bytes.Buffer
+	if err := writeSnapshotTar(&plain, nil, wtPath, sessionID); err != nil {
+		t.Fatalf("writeSnapshotTar (plain): %v", err)
+	}
+	if gzSize >= int64(plain.Len())/2 {
+		t.Errorf("gzip blob = %d bytes vs plain tar = %d bytes; compression had no real effect", gzSize, plain.Len())
+	}
 }
 
 // TestEnsureWorkspace_ColdPath_DetachedHead: a worktree snapshotted while HEAD
