@@ -1,18 +1,53 @@
 -- +goose Up
--- Consolidated Postgres baseline for v1.11.0 (2026-05-13).
+-- Consolidated Postgres baseline (2026-05-13).
 --
 -- This file is mechanically regenerated from `pg_dump --schema-only -n public
 -- -n tf` of all 14 prior Postgres migrations applied to a fresh supabase
 -- testcontainer. It collapses the SKY-247 D3 + SKY-246 D2 + SKY-249 D6/D7/D9
 -- migration history into a single fresh-install baseline.
 --
--- Brick policy: pre-v1.11.0 Postgres installs are refused at boot. (No such
+-- Brick policy: pre-baseline Postgres installs are refused at boot. (No such
 -- installs exist in the wild today — multi-mode hasn't shipped — but the
 -- contract is kept consistent with the SQLite baseline so this stays the
 -- canonical Postgres entry point.)
 --
 -- Future Postgres schema changes go in NEW NNN-numbered migration files in
 -- this directory. NEVER edit this baseline. Down is a no-op.
+--
+-- === Deliberate cross-dialect divergence (do NOT "fix" in a later migration) ======
+-- This baseline and its SQLite twin
+-- (internal/db/migrations-sqlite/202605130001_baseline.sql) differ in the
+-- following ways ON PURPOSE. A mechanical (table,col,target,on_delete) or
+-- CHECK diff will flag each as a "gap" — it is not. Later migration
+-- authors must not converge these:
+--
+--   1. Type representation. Postgres uses native enum TYPES
+--      (public.membership_role, public.org_role) plus uuid / timestamptz /
+--      jsonb / interval / array column types; SQLite uses TEXT / INTEGER plus
+--      CHECKs. A CHECK-only diff falsely reports PG "missing" the role CHECKs
+--      on memberships.role / org_memberships.role — same domain, enum type.
+--   2. RLS keys. Postgres carries composite (id, org_id) FKs and (id, org_id)
+--      uniques so row-level security can pin tenant scope; SQLite uses
+--      single-column FKs (one connection, no RLS). Every *_org_id composite FK
+--      / unique here is this category, not a divergence.
+--   3. Attribution refs (creator_user_id and the like — the "who authored
+--      this" columns). Postgres FK-constrains these with ON DELETE CASCADE;
+--      SQLite leaves them bare TEXT (or NO-ACTION on runs). Deliberate: local
+--      mode is N=1 and the sentinel user is never deleted. NARROW scope — this
+--      does NOT cover identity/ownership user_id PKs (preferences,
+--      user_settings, user_github/jira_identities, memberships, org_memberships),
+--      which carry the users(id) FK in BOTH dialects.
+--   4. Tables that exist in one dialect only. instance_config is SQLite-only
+--      (host port lives in container env under multi mode). sessions and
+--      project_knowledge are Postgres-only (multi-mode auth + shared KB).
+--   5. PG-only RLS apparatus. Row-level-security policies, the tf.* helper
+--      functions, the auth.users FK, and admin-only columns
+--      (orgs.owner_user_id, teams.created_by_user_id, users.default_org_id,
+--      sessions.active_org_id) have no SQLite analog.
+--   6. blueprint_runs.status. Postgres enforces the value set with a CHECK
+--      (cheap to ALTER pre-tenant); SQLite leaves it app-validated (widening a
+--      SQLite CHECK means a full-table rebuild, so the absence of the CHECK is
+--      the headroom). Both accept the same values; the app is source of truth.
 --
 -- Target image: supabase/postgres:15.1.0.147 — pre-loads supabase_vault,
 -- pgsodium, pgcrypto, pgjwt, uuid-ossp, pg_graphql via
@@ -718,8 +753,11 @@ CREATE TABLE public.event_handlers (
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT event_handlers_kind_check CHECK ((kind = ANY (ARRAY['rule'::text, 'trigger'::text]))),
     CONSTRAINT event_handlers_rule_shape CHECK (((kind <> 'rule'::text) OR ((blueprint_id IS NULL) AND (breaker_threshold IS NULL) AND (min_autonomy_suitability IS NULL) AND (name IS NOT NULL) AND (default_priority IS NOT NULL) AND (sort_order IS NOT NULL)))),
-    CONSTRAINT event_handlers_source_check CHECK ((source = ANY (ARRAY['system'::text, 'user'::text]))),
-    CONSTRAINT event_handlers_system_has_no_creator CHECK ((((source = 'system'::text) AND (creator_user_id IS NULL)) OR ((source = 'user'::text) AND (creator_user_id IS NOT NULL)))),
+    -- source is app-validated, not CHECK-constrained (the source_check was
+    -- dropped in this baseline, both dialects) so new provenance values
+    -- are addable without DDL. The creator pairing below was harmonized from
+    -- source='user' to source<>'system' to tolerate any non-system source.
+    CONSTRAINT event_handlers_system_has_no_creator CHECK ((((source = 'system'::text) AND (creator_user_id IS NULL)) OR ((source <> 'system'::text) AND (creator_user_id IS NOT NULL)))),
     CONSTRAINT event_handlers_trigger_shape CHECK (((kind <> 'trigger'::text) OR ((blueprint_id IS NOT NULL) AND (breaker_threshold IS NOT NULL) AND (min_autonomy_suitability IS NOT NULL) AND (default_priority IS NULL) AND (sort_order IS NULL) AND (name IS NULL))))
 );
 
@@ -879,13 +917,16 @@ CREATE TABLE public.org_settings (
     -- without touching this row.
     anthropic_api_key_ref text,
     bedrock_credentials_ref text,
-    -- Max Claude tier the org permits teams/users to pick. NULL means no
-    -- cap (any tier allowed). The inheritance helper (sibling ticket) reads
-    -- this to clamp team_settings.default_model and per-prompt overrides.
+    -- Max model tier the org permits teams/users to pick. NULL means no cap.
+    -- App-validated, not CHECK-constrained (the max_llm_model_tier_check was
+    -- dropped in this baseline, both dialects): an opaque, provider-agnostic
+    -- model/capability identifier. The app knows 'haiku'|'sonnet'|'opus' today
+    -- (validated in the settings handler), but dropping the CHECK lets OpenAI /
+    -- future families be added with zero DDL; a richer provider/model split stays
+    -- additive (new columns). Column not renamed; app layer unchanged.
     max_llm_model_tier text,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT org_settings_github_clone_protocol_check CHECK ((github_clone_protocol = ANY (ARRAY['https'::text, 'ssh'::text]))),
-    CONSTRAINT org_settings_max_llm_model_tier_check CHECK ((max_llm_model_tier IS NULL OR max_llm_model_tier = ANY (ARRAY['haiku'::text, 'sonnet'::text, 'opus'::text])))
+    CONSTRAINT org_settings_github_clone_protocol_check CHECK ((github_clone_protocol = ANY (ARRAY['https'::text, 'ssh'::text])))
 );
 
 
@@ -1104,7 +1145,9 @@ CREATE TABLE public.prompts (
     -- every new prompt is auto-wrapped as a 1-step blueprint (the step FK is
     -- RESTRICT), so hard-delete is impossible.
     deleted_at timestamp with time zone,
-    CONSTRAINT prompts_source_check CHECK ((source = ANY (ARRAY['system'::text, 'user'::text, 'imported'::text]))),
+    -- source is app-validated, not CHECK-constrained (source_check dropped in
+    -- this baseline, both dialects). The system_has_no_creator pairing is
+    -- the only source invariant the DB still enforces.
     CONSTRAINT prompts_system_has_no_creator CHECK ((((source = 'system'::text) AND (creator_user_id IS NULL)) OR ((source <> 'system'::text) AND (creator_user_id IS NOT NULL))))
 );
 
@@ -1236,10 +1279,19 @@ CREATE TABLE public.runs (
     creator_user_id uuid,
     team_id uuid NOT NULL,
     visibility text DEFAULT 'team'::text NOT NULL,
-    task_id uuid NOT NULL,
-    prompt_id text NOT NULL,
+    -- task_id / prompt_id are NULLABLE (relaxed from NOT NULL in this
+    -- baseline) so a run need not descend from a task or a saved prompt — headroom
+    -- for a future user-initiated interactive run (no event, no task, no saved
+    -- prompt). runs_origin_requires_parents pins them for origin 'blueprint'
+    -- (every run today). The interactive parent (agent_sessions + a
+    -- runs.agent_session_id FK) is deferred — additive in a later migration.
+    task_id uuid,
+    prompt_id text,
     trigger_id uuid,
     trigger_type text DEFAULT 'manual'::text NOT NULL,
+    -- origin discriminates blueprint-step runs from a future interactive kind;
+    -- app-validated (no value CHECK, mirrors source). See the SQLite twin.
+    origin text DEFAULT 'blueprint'::text NOT NULL,
     status text DEFAULT 'cloning'::text NOT NULL,
     model text,
     session_id text,
@@ -1260,7 +1312,10 @@ CREATE TABLE public.runs (
     num_turns integer,
     total_cost_usd real,
     actor_agent_id uuid,
-    blueprint_run_id uuid NOT NULL,
+    -- blueprint_run_id is NULLABLE (relaxed from NOT NULL at this baseline);
+    -- pinned for origin 'blueprint' by runs_origin_requires_parents, so every
+    -- run today still has it. See the SQLite twin + task_id above.
+    blueprint_run_id uuid,
     blueprint_step_index integer,
     triggering_event_id uuid,
     -- Run-queue claim columns (mirror event_queue). A blueprint step is
@@ -1278,7 +1333,12 @@ CREATE TABLE public.runs (
     executor_id text,
     CONSTRAINT runs_creator_matches_trigger_type CHECK ((((trigger_type = 'manual'::text) AND (creator_user_id IS NOT NULL)) OR ((trigger_type = 'event'::text) AND (creator_user_id IS NULL)))),
     CONSTRAINT runs_team_visibility_requires_team CHECK (((visibility <> 'team'::text) OR (team_id IS NOT NULL))),
-    CONSTRAINT runs_visibility_check CHECK ((visibility = ANY (ARRAY['private'::text, 'team'::text, 'org'::text])))
+    CONSTRAINT runs_visibility_check CHECK ((visibility = ANY (ARRAY['private'::text, 'team'::text, 'org'::text]))),
+    -- A 'blueprint'-origin run carries its full parentage (blueprint_run + task
+    -- + prompt), preserving the previous NOT-NULL invariant for every run
+    -- today; origin <> 'blueprint' (a future interactive/ad-hoc run) is left
+    -- unconstrained here. See the SQLite twin.
+    CONSTRAINT runs_origin_requires_parents CHECK (((origin = 'blueprint'::text AND blueprint_run_id IS NOT NULL AND task_id IS NOT NULL AND prompt_id IS NOT NULL) OR (origin <> 'blueprint'::text)))
 );
 
 
@@ -1820,13 +1880,12 @@ ALTER TABLE ONLY public.pending_prs
     ADD CONSTRAINT pending_prs_pkey PRIMARY KEY (id);
 
 
---
--- Name: pending_prs pending_prs_run_id_key; Type: CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.pending_prs
-    ADD CONSTRAINT pending_prs_run_id_key UNIQUE (run_id);
-
+-- NOTE: the pending_prs_run_id_key UNIQUE (run_id) constraint was dropped at
+-- this baseline — one run may open PRs across several repos, so one-PR-
+-- per-run is no longer a DB invariant (validated app-side where it still
+-- holds). The non-unique idx_pending_prs_run index keeps the by-run lookup
+-- fast. pending_reviews.run_id is likewise non-unique (symmetric for the
+-- two-PRs-reviewed-in-one-run case).
 
 --
 -- Name: pending_review_comments pending_review_comments_pkey; Type: CONSTRAINT; Schema: public; Owner: -
@@ -5386,7 +5445,9 @@ CREATE TABLE public.blueprints (
     deleted_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT blueprints_source_check CHECK ((source = ANY (ARRAY['system'::text, 'user'::text, 'imported'::text]))),
+    -- source is app-validated, not CHECK-constrained (source_check dropped in
+    -- this baseline, both dialects). The system_has_no_creator pairing is
+    -- the only source invariant the DB still enforces.
     CONSTRAINT blueprints_system_has_no_creator CHECK ((((source = 'system'::text) AND (creator_user_id IS NULL)) OR ((source <> 'system'::text) AND (creator_user_id IS NOT NULL))))
 );
 
@@ -5793,8 +5854,9 @@ CREATE TABLE public.org_template_prompts (
     allowed_tools text DEFAULT ''::text NOT NULL,
     model text DEFAULT ''::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT org_template_prompts_source_check CHECK ((source = ANY (ARRAY['system'::text, 'user'::text])))
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    -- source app-validated, not CHECK-constrained (source_check dropped in the
+    -- this baseline, both dialects; mirrors prompts).
 );
 
 -- Template blueprints + their ordered steps. Org-scoped (no team_id) like the
@@ -5809,8 +5871,9 @@ CREATE TABLE public.org_template_blueprints (
     name text NOT NULL,
     source text DEFAULT 'user'::text NOT NULL,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT org_template_blueprints_source_check CHECK ((source = ANY (ARRAY['system'::text, 'user'::text])))
+    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    -- source app-validated, not CHECK-constrained (source_check dropped in the
+    -- this baseline, both dialects; mirrors blueprints).
 );
 
 CREATE TABLE public.org_template_blueprint_steps (
@@ -5840,7 +5903,8 @@ CREATE TABLE public.org_template_handlers (
     created_at timestamp with time zone DEFAULT now() NOT NULL,
     updated_at timestamp with time zone DEFAULT now() NOT NULL,
     CONSTRAINT org_template_handlers_kind_check CHECK ((kind = ANY (ARRAY['rule'::text, 'trigger'::text]))),
-    CONSTRAINT org_template_handlers_source_check CHECK ((source = ANY (ARRAY['system'::text, 'user'::text]))),
+    -- source app-validated, not CHECK-constrained (source_check dropped in the
+    -- this baseline, both dialects; mirrors event_handlers).
     CONSTRAINT org_template_handlers_rule_shape CHECK (((kind <> 'rule'::text) OR ((blueprint_id IS NULL) AND (breaker_threshold IS NULL) AND (min_autonomy_suitability IS NULL) AND (name IS NOT NULL) AND (default_priority IS NOT NULL) AND (sort_order IS NOT NULL)))),
     CONSTRAINT org_template_handlers_trigger_shape CHECK (((kind <> 'trigger'::text) OR ((blueprint_id IS NOT NULL) AND (breaker_threshold IS NOT NULL) AND (min_autonomy_suitability IS NOT NULL) AND (default_priority IS NULL) AND (sort_order IS NULL) AND (name IS NULL))))
 );
