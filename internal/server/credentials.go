@@ -298,11 +298,20 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 		setupStep = "team"
 	}
 
+	// Jira is "connected" when a usable service credential exists for the org's
+	// stored auth-method marker — Data Center PAT or Cloud email + API token.
+	// JiraSystemConfig reads the marker (not key presence), so this matches the
+	// client the resolver would build and a Cloud org (which has no PAT) reports
+	// connected. cfg.Deployment is the authoritative Cloud-vs-DC answer (from the
+	// marker), surfaced below so the frontend seeds its deployment picker without
+	// re-guessing from the host shape (which is wrong for Cloud custom domains).
+	jiraCfg, jiraConnected := integrations.JiraSystemConfig(creds)
+
 	result := map[string]any{
 		"configured":     tenantExists,
 		"github":         creds.GitHubPAT != "",
 		"github_ready":   githubReady,
-		"jira":           creds.JiraPAT != "",
+		"jira":           jiraConnected,
 		"github_repos":   repoCount,
 		"env_provided":   auth.EnvProvided(),
 		"setup_complete": setupComplete,
@@ -314,6 +323,9 @@ func (s *Server) handleIntegrationsStatus(w http.ResponseWriter, r *http.Request
 	}
 	if creds.JiraURL != "" {
 		result["jira_url"] = creds.JiraURL
+	}
+	if jiraConnected {
+		result["jira_deployment"] = string(jiraCfg.Deployment)
 	}
 
 	writeJSON(w, http.StatusOK, result)

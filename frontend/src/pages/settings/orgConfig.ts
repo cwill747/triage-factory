@@ -19,6 +19,12 @@ export interface OrgConfigForm {
   github_poll_interval: string
   jira_url: string
   jira_pat: string
+  // Jira Cloud service credential (Basic auth): the Atlassian account email +
+  // API token. Data Center uses jira_pat (Bearer) instead; the onboarding
+  // deployment picker decides which pair the connect sends. Both stay blank on
+  // load (secrets never leave the vault) like jira_pat.
+  jira_email: string
+  jira_api_token: string
   jira_poll_interval: string
   max_llm_model_tier: string
 }
@@ -33,7 +39,10 @@ export interface OrgSettingsData {
   has_github_pat: boolean
   jira_base_url: string
   jira_poll_interval: string
-  has_jira_pat: boolean
+  // True when a Jira service credential is stored for the org's auth-method
+  // marker (DC PAT or Cloud email + API token) — not the presence of a PAT
+  // specifically, so a Cloud org reports true despite having no PAT.
+  has_jira_credential: boolean
   max_llm_model_tier?: string
   has_anthropic_api_key: boolean
   has_bedrock_credentials: boolean
@@ -47,13 +56,15 @@ export const emptyOrgConfig = (): OrgConfigForm => ({
   github_poll_interval: '5m0s',
   jira_url: '',
   jira_pat: '',
+  jira_email: '',
+  jira_api_token: '',
   jira_poll_interval: '5m0s',
   max_llm_model_tier: '',
 })
 
 // orgConfigFromSettings seeds the editable form from a GET response.
 // Token fields stay blank (presence is carried separately via
-// has_github_pat / has_jira_pat) so a save without a re-typed token
+// has_github_pat / has_jira_credential) so a save without a re-typed token
 // leaves the stored secret untouched.
 export function orgConfigFromSettings(org: OrgSettingsData): OrgConfigForm {
   return {
@@ -63,6 +74,8 @@ export function orgConfigFromSettings(org: OrgSettingsData): OrgConfigForm {
     github_poll_interval: org.github_poll_interval,
     jira_url: org.jira_base_url || '',
     jira_pat: '',
+    jira_email: '',
+    jira_api_token: '',
     jira_poll_interval: org.jira_poll_interval,
     max_llm_model_tier: org.max_llm_model_tier || '',
   }

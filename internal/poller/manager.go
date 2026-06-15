@@ -726,10 +726,14 @@ func (m *Manager) runJiraCycle() {
 			continue
 		}
 		rules := m.loadJiraRules(ctx, orgID)
-		if creds.JiraPAT == "" || creds.JiraURL == "" || len(rules) == 0 {
-			// Not configured for Jira (or rules missing). Skip
-			// silently — adding/removing a tenant's Jira config
-			// doesn't need a poller restart this way.
+		// "Configured" is decided by the auth-method marker (via JiraSystemConfig),
+		// not key presence: a configured org has a URL plus the scheme's secret
+		// matching its jira_auth_method (DC PAT, or Cloud email + token). Reading
+		// the marker keeps this gate in lockstep with the client ForSystem builds
+		// below, so the two can't disagree. Skip silently when unconfigured or
+		// rules are missing — adding/removing a tenant's Jira config doesn't need
+		// a poller restart this way.
+		if _, ok := integrations.JiraSystemConfig(creds); !ok || len(rules) == 0 {
 			continue
 		}
 		baseURL := orgSet.JiraBaseURL
@@ -737,9 +741,10 @@ func (m *Manager) runJiraCycle() {
 			baseURL = creds.JiraURL
 		}
 		// creds load above gates configuration + supplies the baseURL fallback;
-		// ForSystem (reading the same jira_url/jira_pat secrets) builds the
-		// authenticated client. The gate guarantees presence, so ForSystem
-		// won't report ErrNoJiraSystemCredential here — handle errors defensively.
+		// ForSystem (reading the same secrets, routed Cloud-vs-DC by the stored
+		// auth-method marker) builds the authenticated client. The gate
+		// guarantees a credential is present, so ForSystem won't report
+		// ErrNoJiraSystemCredential here — handle errors defensively.
 		client, cerr := sysResolver.ForSystem(ctx, orgID)
 		if cerr != nil {
 			log.Printf("[jira] org %s: resolve system client: %v", orgID, cerr)

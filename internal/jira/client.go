@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -25,6 +26,42 @@ const (
 	DeploymentDataCenter Deployment = "data_center"
 )
 
+// DeploymentForHost classifies a Jira base URL (or bare host) as Cloud or
+// Data Center from its hostname shape: every Atlassian Cloud site is served
+// from "<site>.atlassian.net", so a host under that domain is Cloud and any
+// other origin is a self-hosted Server / Data Center instance. This is the
+// shared deployment-detection primitive the onboarding handler, the per-user
+// bind flows, and the system resolver branch on, so the Cloud-vs-DC decision
+// is made exactly one way across the codebase.
+//
+// The input may be a full base URL ("https://acme.atlassian.net/") or a bare
+// host ("acme.atlassian.net"); the hostname is extracted (dropping any
+// scheme, port, or path) and lowercased before matching, so none of those
+// affect the result. The suffix is matched with a leading dot so a look-alike
+// like "atlassian.net.evil.example" is correctly Data Center, not Cloud.
+func DeploymentForHost(host string) Deployment {
+	h := strings.ToLower(strings.TrimSpace(host))
+	if u, err := url.Parse(h); err == nil && u.Hostname() != "" {
+		// Full URL (has a scheme): Hostname() already drops the port.
+		h = u.Hostname()
+	} else {
+		// Bare host (no scheme): url.Parse won't populate Hostname(), so strip
+		// any path then a trailing :port by hand — mirroring the frontend
+		// helper, so "acme.atlassian.net:443" classifies as Cloud and the two
+		// sides can't drift.
+		if i := strings.IndexByte(h, '/'); i >= 0 {
+			h = h[:i]
+		}
+		if i := strings.LastIndexByte(h, ':'); i >= 0 {
+			h = h[:i]
+		}
+	}
+	if h == "atlassian.net" || strings.HasSuffix(h, ".atlassian.net") {
+		return DeploymentCloud
+	}
+	return DeploymentDataCenter
+}
+
 // APIVersion is the Jira REST API major-version segment that goes into
 // "/rest/api/{version}/".
 type APIVersion string
@@ -33,6 +70,44 @@ const (
 	APIv2 APIVersion = "2"
 	APIv3 APIVersion = "3"
 )
+
+// AuthMethod records which credential scheme an org's stored Jira service
+// credential uses. It is persisted alongside the credential (under the
+// jira_auth_method secret key) so the resolver can rebuild the right client
+// — Basic/v3 for Cloud, Bearer/v2 for Data Center — without re-sniffing the
+// host on every read.
+type AuthMethod string
+
+const (
+	// AuthMethodDCPAT is a Data Center / Server personal access token
+	// (Bearer auth, REST v2) — the historical default, and the method an org
+	// onboarded before Cloud support carries implicitly (no stored marker).
+	AuthMethodDCPAT AuthMethod = "dc_pat"
+	// AuthMethodCloudAPIToken is an Atlassian Cloud API token: Basic auth over
+	// email + token, REST v3.
+	AuthMethodCloudAPIToken AuthMethod = "cloud_api_token"
+)
+
+// DeploymentForMarker resolves the effective deployment from a stored
+// auth-method marker and the canonical host. The marker is authoritative when
+// set; an empty marker (a pre-Cloud org, which predates the marker) falls back
+// to host-shape detection via DeploymentForHost — so a *.atlassian.net host
+// still resolves Cloud and any other origin Data Center. In practice every
+// genuine pre-Cloud org is non-*.atlassian.net (Cloud onboarding always writes
+// a marker), so the fallback preserves the historical Data Center behavior
+// without hard-coding it. Shared by the system resolver and the request-path
+// config builders (internal/integrations) so the Cloud-vs-DC decision is made
+// one way.
+func DeploymentForMarker(method AuthMethod, host string) Deployment {
+	switch method {
+	case AuthMethodCloudAPIToken:
+		return DeploymentCloud
+	case AuthMethodDCPAT:
+		return DeploymentDataCenter
+	default:
+		return DeploymentForHost(host)
+	}
+}
 
 // authScheme renders the Authorization header onto a request. It is
 // unexported by design: callers pick a named constructor (DataCenterPAT,
@@ -89,9 +164,9 @@ func DataCenterPAT(baseURL, pat string) Config {
 }
 
 // CloudAPIToken builds a Config for an Atlassian Cloud API token: Basic auth
-// (base64(email:token)), REST v3. No caller constructs this yet — Cloud
-// onboarding (capturing the email + Cloud marker + storage) is a separate
-// SKY-347 sub-ticket; this constructor just makes Cloud expressible in code.
+// (base64(email:token)), REST v3. Built by the system resolver (ForSystem) and
+// the request-path config builder (integrations.JiraSystemConfig) once an org
+// has onboarded a Cloud credential, and by validation at connect time.
 func CloudAPIToken(baseURL, email, token string) Config {
 	return Config{
 		BaseURL:    baseURL,

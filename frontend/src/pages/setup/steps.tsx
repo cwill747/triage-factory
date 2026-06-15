@@ -41,7 +41,7 @@ import {
   DEFAULT_GITHUB_URL,
 } from './GitHubStep'
 import TrackersStep from './TrackersStep'
-import { JiraUrlStep, JiraAccessStep } from './JiraStep'
+import { JiraUrlStep, JiraModeStep, JiraAccessStep } from './JiraStep'
 import {
   hostOf,
   isHttpUrl,
@@ -75,7 +75,7 @@ import {
   orgConfigFromSettings,
   saveOrgConfig,
 } from '../settings/orgConfig'
-import { connectJira } from '../settings/jiraConnect'
+import { connectJira, type JiraDeployment } from '../settings/jiraConnect'
 import {
   emptyTeamConfig,
   fetchTeamRepos,
@@ -108,6 +108,7 @@ export const initialWizardState = (): WizardState => ({
   isLocal: false,
   jiraConnected: false,
   jiraUrlConfirmed: false,
+  jiraDeployment: null,
   tracker: 'none',
   team: emptyTeamConfig(),
   teamLoaded: false,
@@ -144,17 +145,35 @@ function intervalLabel(d: string): string {
 // endpoint. Best-effort: a failure leaves both false, and the org GET still
 // seeds the URL/PAT-presence fields, so the step degrades to "not connected"
 // rather than blocking the load.
-async function fetchIntegrationsState(): Promise<{ githubReady: boolean; jiraConnected: boolean }> {
+async function fetchIntegrationsState(): Promise<{
+  githubReady: boolean
+  jiraConnected: boolean
+  jiraDeployment: JiraDeployment | null
+}> {
+  const empty = { githubReady: false, jiraConnected: false, jiraDeployment: null }
   try {
     const res = await fetch('/api/integrations/status')
-    if (!res.ok) return { githubReady: false, jiraConnected: false }
-    const data = (await res.json()) as { github_ready?: boolean; jira?: boolean; jira_url?: string }
+    if (!res.ok) return empty
+    const data = (await res.json()) as {
+      github_ready?: boolean
+      jira?: boolean
+      jira_url?: string
+      jira_deployment?: string
+    }
     return {
       githubReady: !!data.github_ready,
       jiraConnected: !!data.jira && !!data.jira_url,
+      // The backend's authoritative deployment (from the auth-method marker);
+      // null when not connected or an unexpected value.
+      jiraDeployment:
+        data.jira_deployment === 'cloud'
+          ? 'cloud'
+          : data.jira_deployment === 'data_center'
+            ? 'data_center'
+            : null,
     }
   } catch {
-    return { githubReady: false, jiraConnected: false }
+    return empty
   }
 }
 
@@ -203,6 +222,14 @@ export async function loadOrg(ctx: LoadContext): Promise<Partial<WizardState>> {
     githubAccessTab: org.has_github_pat ? 'pat' : integrations.githubReady ? 'app' : null,
     jiraConnected: integrations.jiraConnected,
     jiraUrlConfirmed: integrations.jiraConnected,
+    // A returning connected org resumes past the deployment picker with its
+    // backend taken from the authoritative auth-method marker (surfaced by the
+    // status endpoint), NOT re-guessed from the host shape — so a Cloud org on a
+    // custom domain still labels as Cloud. A fresh/unconnected org starts
+    // unselected so the picker opens and the choice is made explicitly. This
+    // only labels the picker; the credential the org authenticates with is the
+    // stored one.
+    jiraDeployment: integrations.jiraConnected ? integrations.jiraDeployment : null,
     tracker: integrations.jiraConnected ? 'jira' : 'none',
   }
 }
@@ -773,14 +800,39 @@ const jiraUrlStep: WizardStep = {
   render: (ctx) => <JiraUrlStep {...ctx} />,
 }
 
+// Step · Jira deployment (visible only when Jira is the chosen tracker). The
+// Jira mirror of the GitHub mode picker: a self-advancing Cloud-vs-Data-Center
+// choice that gates which credential the access step asks for. Made explicit
+// (not sniffed from the URL) so the fields the user fills always match the
+// scheme the connect sends. Complete once chosen — OR once connected, so a
+// returning org (whose deployment loadOrg pre-resolves from the host) resumes
+// past it.
+const jiraModeStep: WizardStep = {
+  id: 'org-jira-mode',
+  section: 'org',
+  title: 'Jira deployment',
+  selfAdvancing: true,
+  visible: (s) => s.tracker === 'jira',
+  isComplete: (s) => s.jiraDeployment !== null || s.jiraConnected,
+  persist: async () => {},
+  collapsedSummary: (s) =>
+    s.jiraDeployment === 'cloud'
+      ? 'Atlassian Cloud'
+      : s.jiraDeployment === 'data_center'
+        ? 'Data Center / Server'
+        : 'Not chosen',
+  render: (ctx) => <JiraModeStep {...ctx} />,
+}
+
 // Step · Jira access (visible only when Jira is the chosen tracker). The Jira
 // mirror of the GitHub PAT step: no separate Connect button — Continue performs
 // the connect via the shared connectJira helper (POST /api/jira/connect, which
-// validates url+PAT server-side and 4xxs on a bad token). On success the step
-// marks connected and advances; the disconnect half stays inside
-// JiraAccessGroup. Mandatory while Jira is selected — its isComplete blocks
-// finishing a half-connected Jira — but invisible (and so non-blocking) once
-// the tracker is None.
+// validates the credential server-side and 4xxs on a bad one). The credential
+// shape follows the deployment chosen in the prior step: Cloud sends an email +
+// API token, Data Center a PAT. On success the step marks connected and
+// advances; the disconnect half stays inside JiraAccessGroup. Mandatory while
+// Jira is selected — its isComplete blocks finishing a half-connected Jira —
+// but invisible (and so non-blocking) once the tracker is None.
 const jiraAccessStep: WizardStep = {
   id: 'org-jira-access',
   section: 'org',
@@ -794,14 +846,22 @@ const jiraAccessStep: WizardStep = {
     // (now-incomplete) URL bar above rather than connecting against an
     // unconfirmed host.
     if (!s.jiraUrlConfirmed) return 'Re-confirm your Jira URL above to reconnect.'
+    if (s.jiraDeployment === null) return 'Choose your Jira deployment above to continue.'
+    if (s.jiraDeployment === 'cloud') {
+      if (s.org.jira_email.trim() === '') return 'Enter your Atlassian account email to connect.'
+      return s.org.jira_api_token.trim() === '' ? 'Enter an API token to connect.' : null
+    }
     return s.org.jira_pat.trim() === '' ? 'Enter a personal access token to connect.' : null
   },
   persist: async ({ state, orgId, patch }) => {
     if (state.jiraConnected) return
+    // jiraDeployment is non-null here (the mode step gates this one), but fall
+    // back defensively so the connect never sends an undefined scheme.
+    const deployment = state.jiraDeployment ?? 'data_center'
+    // typedPat is the trimmed DC PAT for the local-mode reuse branch below (DC
+    // only); connectJira trims the credential it actually sends.
     const typedPat = state.org.jira_pat.trim()
-    // Connect with the TRIMMED token, normalizing whitespace consistently with
-    // the GitHub path and the other capture paths.
-    const result = await connectJira(state.org.jira_url, typedPat)
+    const result = await connectJira(state.org.jira_url, deployment, state.org)
     if (!result.ok) throw new Error(result.error)
     // Local-mode convenience — the Jira sibling of the GitHub PAT step's reuse
     // (see there for the rationale + the navigation-safety note). Reuse the
@@ -809,7 +869,15 @@ const jiraAccessStep: WizardStep = {
     // so they don't paste it again on the User step. Marks only the User step;
     // org/team flow is untouched. Best-effort: a capture failure never fails the
     // org connect.
-    if (state.isLocal && state.duplicateJiraToUser && typedPat !== '' && orgId) {
+    // DC only — captureJiraIdentityPat binds a PAT; per-user Cloud (email + API
+    // token) is a separate ticket, so a Cloud org has nothing to reuse here.
+    if (
+      state.isLocal &&
+      state.duplicateJiraToUser &&
+      deployment === 'data_center' &&
+      typedPat !== '' &&
+      orgId
+    ) {
       try {
         const id = await captureJiraIdentityPat(orgId, typedPat)
         patch({
@@ -819,7 +887,7 @@ const jiraAccessStep: WizardStep = {
           jiraUserAccount: id.account,
           jiraUserHost: id.host,
           jiraUserPat: '',
-          org: { ...state.org, jira_pat: '' },
+          org: { ...state.org, jira_pat: '', jira_email: '', jira_api_token: '' },
         })
         return
       } catch {
@@ -828,7 +896,7 @@ const jiraAccessStep: WizardStep = {
           jiraConnected: true,
           jiraUrlConfirmed: true,
           jiraUserPat: typedPat,
-          org: { ...state.org, jira_pat: '' },
+          org: { ...state.org, jira_pat: '', jira_email: '', jira_api_token: '' },
         })
         return
       }
@@ -836,7 +904,7 @@ const jiraAccessStep: WizardStep = {
     patch({
       jiraConnected: true,
       jiraUrlConfirmed: true,
-      org: { ...state.org, jira_pat: '' },
+      org: { ...state.org, jira_pat: '', jira_email: '', jira_api_token: '' },
     })
   },
   collapsedSummary: (s) =>
@@ -1171,6 +1239,7 @@ export const WIZARD_STEPS: WizardStep[] = [
   githubPollerStep,
   trackersStep,
   jiraUrlStep,
+  jiraModeStep,
   jiraAccessStep,
   jiraPollerStep,
   orgModelStep,
