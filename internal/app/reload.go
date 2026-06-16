@@ -24,11 +24,12 @@ import (
 // the same local-mode profile→restart→score sequence (reprofileRestartAndScore),
 // which is why they live together.
 //
-// Everything here is gated to local mode: the callbacks wire process-global
-// state shaped for a single-tenant binary, and the integrations.Load reads
-// would fail under Postgres RLS from a claims-free goroutine. Multi mode
-// does the equivalent work per tenant inside the request handlers and per
-// cycle inside the poller; these methods early-return for it.
+// The heavy profile→restart→score sequence is gated to local mode: it wires
+// process-global state shaped for a single-tenant binary, and its
+// integrations.Load reads would fail under Postgres RLS from a claims-free
+// goroutine. In multi the cred-change callbacks do only a lightweight PollSoon
+// to re-due the changed org — the poller does the equivalent profiling/scoring
+// per cycle — and initialPoll just starts the process-global loop.
 type reloader struct {
 	stores     db.Stores
 	database   *sql.DB
@@ -57,19 +58,24 @@ func newReloader(a *App) *reloader {
 // profiles → stop pollers → re-profile → restart. Multi mode can't
 // selectively restart a process-global loop without re-polling every tenant
 // against shared API budgets, so it just re-dues the changed org.
+//
+// The announce-pending flags are armed only on the local path: the announcer
+// is keyed by source (not org), so arming "github" before the multi early
+// return would let the next GitHub completion for ANY org consume it and ship
+// the "first poll complete" toast to the wrong tenant (poll-tracker routes by
+// evt.OrgID). The one-shot toast stays a local-mode (N=1) affordance.
 func (r *reloader) onGitHubChanged(orgID string) {
-	log.Println("[server] GitHub config changed, full restart...")
-	r.announce.setPending("github")
-
 	if runmode.Current() != runmode.ModeLocal {
-		log.Printf("[server] GitHub changed for org %s: multi-mode re-dues that org only (no fleet restart)", orgID)
+		log.Printf("[server] GitHub config changed for org %s: multi-mode re-dues that org only (no fleet restart)", orgID)
 		r.pollerMgr.PollSoon("github", orgID)
 		return
 	}
 
-	// Local mode also restarts the Jira poller below, so announce its next
-	// completion too. Multi mode took the early return above without touching
-	// Jira, so it must not arm a spurious "first Jira poll" toast.
+	log.Println("[server] GitHub config changed, full restart...")
+	// Local mode restarts both pollers below (N=1, no fleet to stampede), so arm
+	// the one-shot "config took effect" toast for each; the first post-restart
+	// completion of each source clears its flag.
+	r.announce.setPending("github")
 	r.announce.setPending("jira")
 
 	// Local mode: N=1, so there's no fleet to stampede. The spawner +
@@ -99,18 +105,29 @@ func (r *reloader) onGitHubChanged(orgID string) {
 	}
 }
 
-// onJiraChanged restarts only the Jira poller and refreshes the server's
-// Jira client. Local-only: multi-mode Jira polling needs per-org system
-// creds and the process-global Jira client is itself a local-mode construct.
+// onJiraChanged reacts to a Jira credential/config change. Local mode restarts
+// the in-process Jira poller, arms the one-shot "config took effect" toast, and
+// re-dues the changed org so the new config applies now rather than after the
+// interval. Multi mode can't selectively restart a process-global loop without
+// re-polling every tenant against shared API budgets, so — mirroring
+// onGitHubChanged — it just re-dues the changed org; the poller (running in
+// multi via the claims-free system-creds reads) picks the change up on that
+// org's next cycle.
+//
+// The announce-pending flag is left unset in multi on purpose: the announcer is
+// keyed by source only (not org), so arming it would let the next Jira poll
+// completion for ANY org consume it and ship the toast to the wrong tenant
+// (poll-tracker routes by evt.OrgID). The one-shot toast stays a local-mode
+// (N=1) affordance.
 func (r *reloader) onJiraChanged(orgID string) {
-	log.Println("[server] Jira config changed, restarting Jira poller...")
-	r.announce.setPending("jira")
-
 	if runmode.Current() != runmode.ModeLocal {
-		log.Println("[server] Jira changed: multi-mode skips process-global refresh")
+		log.Printf("[server] Jira config changed for org %s: multi-mode re-dues that org only (no fleet restart)", orgID)
+		r.pollerMgr.PollSoon("jira", orgID)
 		return
 	}
 
+	log.Println("[server] Jira config changed, restarting Jira poller...")
+	r.announce.setPending("jira")
 	// SKY-463: the server no longer holds a process-global Jira write client —
 	// user writes resolve per-user via jira.Resolver, system reads via the
 	// poller's ForSystem. Restarting the poller is all this callback needs to do.
@@ -120,9 +137,11 @@ func (r *reloader) onJiraChanged(orgID string) {
 
 // initialPoll starts polling at boot. Local mode additionally kicks the first
 // profile+score when GitHub is configured; multi mode just starts the
-// process-global loop, which fans out over every active tenant and self-gates
-// Jira off. Request handlers resolve GitHub clients per-request through the
-// credential resolver, so there's no process-global client to wire here.
+// process-global loop, which fans out over every active tenant — GitHub and
+// Jira alike, since Jira now reads service creds through the claims-free system
+// door and so polls in multi too. Request handlers resolve GitHub clients
+// per-request through the credential resolver, so there's no process-global
+// client to wire here.
 func (r *reloader) initialPoll(ctx context.Context) {
 	if runmode.Current() != runmode.ModeLocal {
 		// runGitHubCycle fans out over ListActiveSystem each wake; orgs and
