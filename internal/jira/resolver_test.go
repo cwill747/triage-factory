@@ -242,6 +242,206 @@ func TestForUser_UsesUserToken(t *testing.T) {
 	}
 }
 
+// TestForUser_CloudEnvelope pins the Cloud per-user path: a stored
+// cloud_api_token envelope resolves to a Basic / REST v3 client built from the
+// user's own email + API token — never the org service cred.
+func TestForUser_CloudEnvelope(t *testing.T) {
+	srv, rec := captureServer(t, `{"key":"PROJ-1"}`)
+	env, err := MarshalUserCredential(UserCredential{
+		Method: AuthMethodCloudAPIToken, Email: "u@acme.com", Token: "user-cloud-tok",
+	})
+	if err != nil {
+		t.Fatalf("MarshalUserCredential: %v", err)
+	}
+	secrets := &fakeSecrets{
+		// Org service cred present — ForUser must still use the user envelope.
+		// The cloud marker makes the org's deployment Cloud (the httptest host is
+		// 127.0.0.1, which host-shape-classifies as DC) so the cloud user cred is
+		// usable for it.
+		sys: map[string]string{
+			keyJiraURL:        srv.URL,
+			keyJiraPAT:        "org-pat",
+			keyJiraAuthMethod: string(AuthMethodCloudAPIToken),
+		},
+		user: map[string]string{UserTokenKey(srv.URL): env},
+	}
+	r := NewResolver(secrets, &fakeOrgs{jiraBase: srv.URL})
+
+	c, err := r.ForUser(context.Background(), testOrgID, testUserID)
+	if err != nil {
+		t.Fatalf("ForUser: %v", err)
+	}
+	if _, err := c.GetIssue(context.Background(), "PROJ-1"); err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	auth, path := rec.read()
+	wantAuth := "Basic " + base64.StdEncoding.EncodeToString([]byte("u@acme.com:user-cloud-tok"))
+	if auth != wantAuth {
+		t.Errorf("Authorization = %q, want %q (cloud user uses Basic email:token)", auth, wantAuth)
+	}
+	if path != "/rest/api/3/issue/PROJ-1" {
+		t.Errorf("path = %q, want /rest/api/3/issue/PROJ-1 (cloud uses REST v3)", path)
+	}
+}
+
+// TestForUser_DCEnvelope pins that an explicit dc_pat envelope resolves to a
+// Bearer / REST v2 client (the same outcome as the back-compat bare token in
+// TestForUser_UsesUserToken).
+func TestForUser_DCEnvelope(t *testing.T) {
+	srv, rec := captureServer(t, `{"key":"PROJ-1"}`)
+	env, err := MarshalUserCredential(UserCredential{Method: AuthMethodDCPAT, Token: "user-pat"})
+	if err != nil {
+		t.Fatalf("MarshalUserCredential: %v", err)
+	}
+	secrets := &fakeSecrets{user: map[string]string{UserTokenKey(srv.URL): env}}
+	r := NewResolver(secrets, &fakeOrgs{jiraBase: srv.URL})
+
+	c, err := r.ForUser(context.Background(), testOrgID, testUserID)
+	if err != nil {
+		t.Fatalf("ForUser: %v", err)
+	}
+	if _, err := c.GetIssue(context.Background(), "PROJ-1"); err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if auth, path := rec.read(); auth != "Bearer user-pat" || path != "/rest/api/2/issue/PROJ-1" {
+		t.Errorf("got (%q, %q), want (Bearer user-pat, /rest/api/2/issue/PROJ-1)", auth, path)
+	}
+}
+
+// TestForUser_CloudEnvelopeIncomplete treats a cloud_api_token envelope missing
+// the email half as absent — ErrNoJiraUserCredential, never an org fallback.
+func TestForUser_CloudEnvelopeIncomplete(t *testing.T) {
+	env, err := MarshalUserCredential(UserCredential{Method: AuthMethodCloudAPIToken, Token: "tok"})
+	if err != nil {
+		t.Fatalf("MarshalUserCredential: %v", err)
+	}
+	const base = "https://acme.atlassian.net"
+	secrets := &fakeSecrets{
+		sys:  map[string]string{keyJiraURL: base, keyJiraPAT: "org-pat"},
+		user: map[string]string{UserTokenKey(base): env},
+	}
+	r := NewResolver(secrets, &fakeOrgs{jiraBase: base})
+	if _, err := r.ForUser(context.Background(), testOrgID, testUserID); !errors.Is(err, ErrNoJiraUserCredential) {
+		t.Fatalf("ForUser err = %v, want ErrNoJiraUserCredential", err)
+	}
+}
+
+// TestForUser_StaleCrossScheme_NoClient pins the deployment gate in both cutover
+// directions: a credential whose scheme no longer matches the org's marker
+// (Cloud token after a Cloud→DC cutover, or a DC PAT after a DC→Cloud cutover)
+// resolves to ErrNoJiraUserCredential — never a wrong-scheme client — matching
+// the status reader's connected=false. Each credential is complete; only the
+// scheme-vs-deployment mismatch makes it unusable.
+func TestForUser_StaleCrossScheme_NoClient(t *testing.T) {
+	cases := map[string]struct {
+		host   string
+		marker AuthMethod
+		cred   UserCredential
+	}{
+		"cloud cred on dc-marked org": {
+			host:   "https://jira.dc.example", // non-cloud host
+			marker: AuthMethodDCPAT,
+			cred:   UserCredential{Method: AuthMethodCloudAPIToken, Email: "u@acme.com", Token: "cloud-tok"},
+		},
+		"dc cred on cloud-marked org": {
+			host:   "https://acme.atlassian.net",
+			marker: AuthMethodCloudAPIToken,
+			cred:   UserCredential{Method: AuthMethodDCPAT, Token: "dc-pat"},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			env, err := MarshalUserCredential(tc.cred)
+			if err != nil {
+				t.Fatalf("MarshalUserCredential: %v", err)
+			}
+			secrets := &fakeSecrets{
+				sys:  map[string]string{keyJiraURL: tc.host, keyJiraAuthMethod: string(tc.marker)},
+				user: map[string]string{UserTokenKey(tc.host): env},
+			}
+			r := NewResolver(secrets, &fakeOrgs{jiraBase: tc.host})
+			if _, err := r.ForUser(context.Background(), testOrgID, testUserID); !errors.Is(err, ErrNoJiraUserCredential) {
+				t.Fatalf("ForUser err = %v, want ErrNoJiraUserCredential (stale cross-scheme cred)", err)
+			}
+		})
+	}
+}
+
+// TestForUser_UnknownMethod_Errors pins that an envelope with an unrecognized
+// method (corruption, or a forward-version credential this build predates) is
+// surfaced as a hard error rather than misrouted to a DC client — and is NOT
+// ErrNoJiraUserCredential (the credential exists; re-binding isn't the fix).
+func TestForUser_UnknownMethod_Errors(t *testing.T) {
+	const base = "https://acme.atlassian.net"
+	env, err := MarshalUserCredential(UserCredential{Method: "cloud_oauth", Token: "tok"})
+	if err != nil {
+		t.Fatalf("MarshalUserCredential: %v", err)
+	}
+	secrets := &fakeSecrets{
+		sys:  map[string]string{keyJiraURL: base, keyJiraPAT: "org-pat"},
+		user: map[string]string{UserTokenKey(base): env},
+	}
+	r := NewResolver(secrets, &fakeOrgs{jiraBase: base})
+	_, err = r.ForUser(context.Background(), testOrgID, testUserID)
+	if err == nil {
+		t.Fatal("ForUser err = nil, want an unknown-method error")
+	}
+	if errors.Is(err, ErrNoJiraUserCredential) {
+		t.Errorf("an unknown method must not collapse to ErrNoJiraUserCredential: %v", err)
+	}
+}
+
+// TestUserCredential_UsableFor pins the network-free precondition the status
+// reader and ForUser share: a credential is usable only when its method matches
+// the deployment and the required fields are present.
+func TestUserCredential_UsableFor(t *testing.T) {
+	cases := []struct {
+		name string
+		cred UserCredential
+		dep  Deployment
+		want bool
+	}{
+		{"cloud ok", UserCredential{Method: AuthMethodCloudAPIToken, Email: "e", Token: "t"}, DeploymentCloud, true},
+		{"cloud no email", UserCredential{Method: AuthMethodCloudAPIToken, Token: "t"}, DeploymentCloud, false},
+		{"cloud on dc host", UserCredential{Method: AuthMethodCloudAPIToken, Email: "e", Token: "t"}, DeploymentDataCenter, false},
+		{"dc ok", UserCredential{Method: AuthMethodDCPAT, Token: "t"}, DeploymentDataCenter, true},
+		{"dc no token", UserCredential{Method: AuthMethodDCPAT}, DeploymentDataCenter, false},
+		{"dc on cloud host", UserCredential{Method: AuthMethodDCPAT, Token: "t"}, DeploymentCloud, false},
+		{"unknown method", UserCredential{Method: "cloud_oauth", Token: "t"}, DeploymentCloud, false},
+	}
+	for _, tc := range cases {
+		if got := tc.cred.UsableFor(tc.dep); got != tc.want {
+			t.Errorf("%s: UsableFor(%q) = %v, want %v", tc.name, tc.dep, got, tc.want)
+		}
+	}
+}
+
+// TestParseUserCredential pins the envelope decode + the bare-token back-compat
+// the resolver leans on: a JSON envelope round-trips, a bare token reads back as
+// a dc_pat, and empty/malformed inputs error rather than silently passing.
+func TestParseUserCredential(t *testing.T) {
+	// Bare token (pre-envelope DC bind) → dc_pat.
+	if c, err := ParseUserCredential("bare-tok"); err != nil || c.Method != AuthMethodDCPAT || c.Token != "bare-tok" {
+		t.Errorf("ParseUserCredential(bare) = (%+v, %v), want a dc_pat envelope", c, err)
+	}
+	// Envelope round-trip.
+	want := UserCredential{Method: AuthMethodCloudAPIToken, Email: "e@x.com", Token: "t"}
+	env, err := MarshalUserCredential(want)
+	if err != nil {
+		t.Fatalf("MarshalUserCredential: %v", err)
+	}
+	if got, err := ParseUserCredential(env); err != nil || got != want {
+		t.Errorf("ParseUserCredential(%q) = (%+v, %v), want %+v", env, got, err, want)
+	}
+	// Empty + malformed envelope error.
+	if _, err := ParseUserCredential("   "); err == nil {
+		t.Error("ParseUserCredential(empty) = nil err, want an error")
+	}
+	if _, err := ParseUserCredential("{not json"); err == nil {
+		t.Error("ParseUserCredential(malformed) = nil err, want an error")
+	}
+}
+
 // TestForUser_AbsentCredential_NoOrgFallback pins the load-bearing rule: an
 // absent user credential is ErrNoJiraUserCredential even when the org service
 // cred is present — the resolver must never silently act as the bot.
