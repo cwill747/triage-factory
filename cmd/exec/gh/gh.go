@@ -17,7 +17,11 @@ const HelpText = `GitHub PR Commands:
                                                           manifest JSON. Use Read/Grep on full.diff.
                                                           --file <path>: print one file's diff inline.
                                                           --stdout: print the whole diff inline.
-  gh pr files <number> [--repo o/r]                       List changed files
+  gh pr files <number> [--repo o/r]                       Slim per-file summary (path, status,
+                                                          +/-, binary). No patch (use pr diff for
+                                                          content); PR-level totals come from
+                                                          pr view. "truncated":true means the list
+                                                          hit the 1000-file cap.
   gh pr thread-view <number> <comment_id> [--page N]      Comment thread with replies
   gh pr review-view <review_id> --pr <N> [--repo o/r] [-v]  Expand a review + inline comments
 

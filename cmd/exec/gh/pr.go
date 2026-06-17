@@ -154,21 +154,25 @@ func prView(client ghAPI, args []string) {
 // HTTP-406 fallback path where full.diff was reassembled from per-file
 // patches rather than fetched verbatim.
 type diffManifest struct {
-	Owner        string             `json:"owner"`
-	Repo         string             `json:"repo"`
-	Number       int                `json:"number"`
-	HeadSHA      string             `json:"head_sha"`
-	BaseRef      string             `json:"base_ref"`
-	ChangedFiles int                `json:"changed_files"`
-	Additions    int                `json:"additions"`
-	Deletions    int                `json:"deletions"`
-	Dir          string             `json:"dir"`
-	FullDiffPath string             `json:"full_diff_path"`
-	Truncated    bool               `json:"truncated"`
-	Files        []diffManifestFile `json:"files"`
+	Owner        string        `json:"owner"`
+	Repo         string        `json:"repo"`
+	Number       int           `json:"number"`
+	HeadSHA      string        `json:"head_sha"`
+	BaseRef      string        `json:"base_ref"`
+	ChangedFiles int           `json:"changed_files"`
+	Additions    int           `json:"additions"`
+	Deletions    int           `json:"deletions"`
+	Dir          string        `json:"dir"`
+	FullDiffPath string        `json:"full_diff_path"`
+	Truncated    bool          `json:"truncated"`
+	Files        []fileSummary `json:"files"`
 }
 
-type diffManifestFile struct {
+// fileSummary is the per-file overview shared by `pr diff`'s manifest and
+// `pr files`: path, change status, line counts, a binary hint, and the
+// pre-rename path. Deliberately omits the patch — diff content is served by
+// `pr diff`'s full.diff, never inlined into these listings.
+type fileSummary struct {
 	Path             string `json:"path"`
 	Status           string `json:"status"`
 	Additions        int    `json:"additions"`
@@ -297,7 +301,7 @@ func persistPRDiff(client ghAPI, cwd, owner, repo string, number int) (diffManif
 		Dir:          destDir,
 		FullDiffPath: fullDiffPath,
 		Truncated:    truncated,
-		Files:        make([]diffManifestFile, 0, len(files)),
+		Files:        make([]fileSummary, 0, len(files)),
 	}
 	// Some hosts don't populate the PR-level counts; fall back to the file
 	// list length so changed_files is never a misleading zero.
@@ -305,7 +309,7 @@ func persistPRDiff(client ghAPI, cwd, owner, repo string, number int) (diffManif
 		manifest.ChangedFiles = len(files)
 	}
 	for _, f := range files {
-		manifest.Files = append(manifest.Files, diffManifestFile{
+		manifest.Files = append(manifest.Files, fileSummary{
 			Path:             f.Filename,
 			Status:           f.Status,
 			Additions:        f.Additions,
@@ -421,11 +425,48 @@ func singleFileDiff(files []ghclient.PRFile, path string) string {
 	return ""
 }
 
+// prFilesResult is the slim overview `pr files` prints: one summary row per
+// changed file, no patch content. PR-level sizing (changed_files / additions /
+// deletions) is deliberately NOT here — those live on the PR object and are
+// served accurately by `pr view`. Summing them from this list would silently
+// undercount any PR past the GetPRFiles cap, exactly the huge PRs where sizing
+// matters most. Truncated flags that the listing itself hit that cap, so the
+// agent knows to fall back to `pr diff` for the files beyond it. The diff
+// content is served by `pr diff`; `pr files` is the cheapest "what changed"
+// look (one API call, no full-diff fetch, no disk write).
+type prFilesResult struct {
+	Truncated bool          `json:"truncated"`
+	Files     []fileSummary `json:"files"`
+}
+
+// buildPRFilesResult assembles the slim envelope from the raw file list,
+// dropping the patch. Truncated is set when the list reached the GetPRFiles
+// cap (and so may be missing files); it's intentionally conservative — a PR
+// with exactly MaxPRFiles complete files reads as truncated, which is the safe
+// direction (worst case the agent double-checks with `pr diff`).
+func buildPRFilesResult(files []ghclient.PRFile) prFilesResult {
+	result := prFilesResult{
+		Truncated: len(files) >= ghclient.MaxPRFiles,
+		Files:     make([]fileSummary, 0, len(files)),
+	}
+	for _, f := range files {
+		result.Files = append(result.Files, fileSummary{
+			Path:             f.Filename,
+			Status:           f.Status,
+			Additions:        f.Additions,
+			Deletions:        f.Deletions,
+			Binary:           isBinaryFile(f),
+			PreviousFilename: f.PreviousFilename,
+		})
+	}
+	return result
+}
+
 func prFiles(client ghAPI, args []string) {
 	owner, repo, number := parseRepoAndNumber(args)
 	files, err := client.GetPRFiles(owner, repo, number)
 	exitOnErr(err)
-	printJSON(files)
+	printJSON(buildPRFilesResult(files))
 }
 
 func prThreadView(client ghAPI, args []string) {
