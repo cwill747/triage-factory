@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -253,6 +255,352 @@ func TestGetDiffShapes_406BinaryFile(t *testing.T) {
 	// text file should have correct commentable lines
 	if !result["main.go"][1] || !result["main.go"][2] {
 		t.Errorf("expected lines 1,2 commentable for main.go, got %v", result["main.go"])
+	}
+}
+
+// prDiffBackend configures the fake GitHub responses newPRDiffServer serves
+// for the three endpoints persistPRDiff touches: the PR JSON object
+// (GET /pulls/N), the raw diff (same path, diff Accept header), and the file
+// list (/pulls/N/files). Reviews/comments sub-fetches GetPR makes are stubbed
+// with empty arrays so they don't error.
+type prDiffBackend struct {
+	prJSON      []byte
+	diffBody    string
+	diffStatus  int // 0 → 200
+	filesBody   []byte
+	filesStatus int // 0 → 200
+}
+
+func newPRDiffServer(t *testing.T, b prDiffBackend) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/files"):
+			if b.filesStatus != 0 {
+				w.WriteHeader(b.filesStatus)
+			}
+			_, _ = w.Write(b.filesBody)
+		case strings.Contains(r.Header.Get("Accept"), "diff"):
+			if b.diffStatus != 0 {
+				w.WriteHeader(b.diffStatus)
+			}
+			_, _ = w.Write([]byte(b.diffBody))
+		case strings.HasSuffix(r.URL.Path, "/reviews"), strings.HasSuffix(r.URL.Path, "/comments"):
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			_, _ = w.Write(b.prJSON)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// prJSON builds the GET /pulls/N body with the fields persistPRDiff reads.
+func prJSON(t *testing.T, sha, baseRef string, additions, deletions, changedFiles int) []byte {
+	t.Helper()
+	data, err := json.Marshal(map[string]any{
+		"number":        42,
+		"additions":     additions,
+		"deletions":     deletions,
+		"changed_files": changedFiles,
+		"head":          map[string]any{"sha": sha, "ref": "feature"},
+		"base":          map[string]any{"ref": baseRef},
+	})
+	if err != nil {
+		t.Fatalf("marshal PR json: %v", err)
+	}
+	return data
+}
+
+func readManifestFromDisk(t *testing.T, dir string) diffManifest {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
+	if err != nil {
+		t.Fatalf("read manifest.json: %v", err)
+	}
+	var m diffManifest
+	if err := json.Unmarshal(data, &m); err != nil {
+		t.Fatalf("unmarshal manifest.json: %v", err)
+	}
+	return m
+}
+
+// TestPersistPRDiff_WritesFullDiffAndManifest is the happy path: the diff is
+// fetched verbatim, written to a per-PR dir, and the manifest reflects the
+// PR metadata + per-file rows.
+func TestPersistPRDiff_WritesFullDiffAndManifest(t *testing.T) {
+	const sha = "abcdef0123456789abcdef"
+	diff := "diff --git a/foo.go b/foo.go\n@@ -1,2 +1,2 @@\n context\n-old\n+new\n"
+	files := jsonPRFiles(t, []map[string]any{
+		{"filename": "foo.go", "status": "modified", "additions": 1, "deletions": 1, "patch": "@@ -1,2 +1,2 @@\n context\n-old\n+new\n"},
+	})
+	srv := newPRDiffServer(t, prDiffBackend{
+		prJSON:    prJSON(t, sha, "main", 1, 1, 1),
+		diffBody:  diff,
+		filesBody: files,
+	})
+
+	cwd := t.TempDir()
+	client := ghclient.NewClient(srv.URL, "test-token")
+	m, err := persistPRDiff(client, cwd, "owner", "repo", 42)
+	if err != nil {
+		t.Fatalf("persistPRDiff: %v", err)
+	}
+
+	wantDir := filepath.Join(cwd, "_scratch", "pr-diffs", "owner__repo__42")
+	if m.Dir != wantDir {
+		t.Errorf("Dir = %q, want %q", m.Dir, wantDir)
+	}
+	if m.HeadSHA != sha || m.BaseRef != "main" || m.ChangedFiles != 1 || m.Additions != 1 || m.Deletions != 1 {
+		t.Errorf("manifest metadata mismatch: %+v", m)
+	}
+	if m.Truncated {
+		t.Error("Truncated should be false on the verbatim path")
+	}
+	got, err := os.ReadFile(m.FullDiffPath)
+	if err != nil {
+		t.Fatalf("read full.diff: %v", err)
+	}
+	if string(got) != diff {
+		t.Errorf("full.diff = %q, want %q", got, diff)
+	}
+	if len(m.Files) != 1 || m.Files[0].Path != "foo.go" || m.Files[0].Binary {
+		t.Errorf("manifest files mismatch: %+v", m.Files)
+	}
+	// manifest.json on disk round-trips to the returned value.
+	if disk := readManifestFromDisk(t, m.Dir); disk.HeadSHA != m.HeadSHA || len(disk.Files) != len(m.Files) {
+		t.Errorf("on-disk manifest mismatch: %+v", disk)
+	}
+}
+
+// TestPersistPRDiff_406Reassembles verifies the HTTP-406 fallback: the diff is
+// reconstructed from per-file patches and flagged truncated.
+func TestPersistPRDiff_406Reassembles(t *testing.T) {
+	const sha = "feedface00112233"
+	files := jsonPRFiles(t, []map[string]any{
+		{"filename": "foo.go", "status": "added", "additions": 2, "deletions": 0, "patch": "@@ -0,0 +1,2 @@\n+line1\n+line2"},
+	})
+	srv := newPRDiffServer(t, prDiffBackend{
+		prJSON:     prJSON(t, sha, "main", 2, 0, 1),
+		diffBody:   `{"message":"diff too large"}`,
+		diffStatus: http.StatusNotAcceptable,
+		filesBody:  files,
+	})
+
+	cwd := t.TempDir()
+	client := ghclient.NewClient(srv.URL, "test-token")
+	m, err := persistPRDiff(client, cwd, "owner", "repo", 42)
+	if err != nil {
+		t.Fatalf("persistPRDiff: %v", err)
+	}
+	if !m.Truncated {
+		t.Error("Truncated should be true on the 406 fallback path")
+	}
+	got, err := os.ReadFile(m.FullDiffPath)
+	if err != nil {
+		t.Fatalf("read full.diff: %v", err)
+	}
+	for _, want := range []string{"diff --git a/foo.go b/foo.go", "--- /dev/null", "+++ b/foo.go", "+line1"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("reassembled diff missing %q; got:\n%s", want, got)
+		}
+	}
+}
+
+// TestPersistPRDiff_BinaryAndRename verifies binary detection and that a
+// rename carries previous_filename without being flagged binary.
+func TestPersistPRDiff_BinaryAndRename(t *testing.T) {
+	const sha = "0011223344556677"
+	files := jsonPRFiles(t, []map[string]any{
+		{"filename": "image.png", "status": "added", "additions": 0, "deletions": 0},                               // no patch + zero counts → binary
+		{"filename": "new.go", "status": "renamed", "previous_filename": "old.go", "additions": 0, "deletions": 0}, // no patch but a rename
+		{"filename": "huge.go", "status": "modified", "additions": 5000, "deletions": 10},                          // no patch but real counts → oversized text, NOT binary
+		{"filename": "main.go", "status": "modified", "additions": 1, "deletions": 0, "patch": "@@ -1 +1,2 @@\n a\n+b"},
+	})
+	srv := newPRDiffServer(t, prDiffBackend{
+		prJSON:    prJSON(t, sha, "main", 1, 0, 4),
+		diffBody:  "diff --git a/main.go b/main.go\n@@ -1 +1,2 @@\n a\n+b\n",
+		filesBody: files,
+	})
+
+	cwd := t.TempDir()
+	client := ghclient.NewClient(srv.URL, "test-token")
+	m, err := persistPRDiff(client, cwd, "owner", "repo", 42)
+	if err != nil {
+		t.Fatalf("persistPRDiff: %v", err)
+	}
+	byPath := map[string]diffManifestFile{}
+	for _, f := range m.Files {
+		byPath[f.Path] = f
+	}
+	if !byPath["image.png"].Binary {
+		t.Error("image.png should be flagged binary")
+	}
+	if byPath["new.go"].Binary {
+		t.Error("renamed file should NOT be flagged binary")
+	}
+	if byPath["new.go"].PreviousFilename != "old.go" {
+		t.Errorf("rename previous_filename = %q, want old.go", byPath["new.go"].PreviousFilename)
+	}
+	if byPath["main.go"].Binary {
+		t.Error("text file should not be binary")
+	}
+	if byPath["huge.go"].Binary {
+		t.Error("oversized text file (empty patch but non-zero counts) should NOT be flagged binary")
+	}
+}
+
+// TestReassembleDiff_OversizedVsBinary verifies the 406-reassembly path
+// distinguishes a genuine binary file ("Binary files differ") from an
+// oversized text file whose patch GitHub omitted (a note, never a fabricated
+// hunk or a wrong "binary" label).
+func TestReassembleDiff_OversizedVsBinary(t *testing.T) {
+	out := reassembleDiff([]ghclient.PRFile{
+		{Filename: "image.png", Status: "added", Additions: 0, Deletions: 0},
+		{Filename: "huge.go", Status: "modified", Additions: 5000, Deletions: 10},
+	})
+	if !strings.Contains(out, "Binary files a/image.png and b/image.png differ") {
+		t.Errorf("expected binary marker for image.png; got:\n%s", out)
+	}
+	if !strings.Contains(out, "patch unavailable") || !strings.Contains(out, "+5000 -10") {
+		t.Errorf("expected oversized-text note for huge.go; got:\n%s", out)
+	}
+	if strings.Contains(out, "Binary files a/huge.go") {
+		t.Errorf("oversized text file must NOT be labeled binary; got:\n%s", out)
+	}
+}
+
+// TestReassembleDiff_RenameNoPatch covers the empty-patch rename case: it must
+// emit rename headers, not the misleading "patch unavailable (too large)" note
+// (a rename with no content change isn't truncated), and never a binary line.
+func TestReassembleDiff_RenameNoPatch(t *testing.T) {
+	out := reassembleDiff([]ghclient.PRFile{
+		{Filename: "new.png", PreviousFilename: "old.png", Status: "renamed", Additions: 0, Deletions: 0},
+	})
+	if !strings.Contains(out, "diff --git a/old.png b/new.png") {
+		t.Errorf("expected rename diff header; got:\n%s", out)
+	}
+	if !strings.Contains(out, "rename from old.png") || !strings.Contains(out, "rename to new.png") {
+		t.Errorf("expected rename from/to headers; got:\n%s", out)
+	}
+	if strings.Contains(out, "patch unavailable") {
+		t.Errorf("rename must not be labeled patch-unavailable/too-large; got:\n%s", out)
+	}
+}
+
+// TestSingleFileDiff covers the --file inline 406 fallback: a synthesized
+// single-file diff for a present path, and "" for an absent one.
+func TestSingleFileDiff(t *testing.T) {
+	files := []ghclient.PRFile{
+		{Filename: "a.go", Status: "modified", Additions: 1, Deletions: 0, Patch: "@@ -1 +1,2 @@\n x\n+y"},
+		{Filename: "b.go", Status: "added", Additions: 1, Deletions: 0, Patch: "@@ -0,0 +1 @@\n+z"},
+	}
+	got := singleFileDiff(files, "a.go")
+	if !strings.Contains(got, "diff --git a/a.go b/a.go") || !strings.Contains(got, "+y") {
+		t.Errorf("expected a.go diff; got:\n%s", got)
+	}
+	if strings.Contains(got, "b.go") {
+		t.Errorf("single-file diff for a.go must not include b.go; got:\n%s", got)
+	}
+	if singleFileDiff(files, "missing.go") != "" {
+		t.Error("expected empty string for a path not in the file list")
+	}
+}
+
+// TestPersistPRDiff_MissingHeadSHATolerated confirms a PR with no head SHA no
+// longer hard-fails (the dir is keyed by PR number, not SHA): the capture is
+// written and head_sha is simply empty in the manifest.
+func TestPersistPRDiff_MissingHeadSHATolerated(t *testing.T) {
+	srv := newPRDiffServer(t, prDiffBackend{
+		prJSON:    prJSON(t, "", "main", 0, 0, 0),
+		diffBody:  "diff --git a/foo.go b/foo.go\n@@ -1 +1,2 @@\n a\n+b\n",
+		filesBody: jsonPRFiles(t, []map[string]any{{"filename": "foo.go", "status": "modified", "additions": 1, "deletions": 0, "patch": "@@ -1 +1,2 @@\n a\n+b"}}),
+	})
+	cwd := t.TempDir()
+	client := ghclient.NewClient(srv.URL, "test-token")
+	m, err := persistPRDiff(client, cwd, "owner", "repo", 42)
+	if err != nil {
+		t.Fatalf("persistPRDiff with empty head SHA: %v", err)
+	}
+	if m.HeadSHA != "" {
+		t.Errorf("HeadSHA = %q, want empty", m.HeadSHA)
+	}
+	if _, err := os.Stat(m.FullDiffPath); err != nil {
+		t.Errorf("expected full.diff written: %v", err)
+	}
+}
+
+// TestPersistPRDiff_ReDiff verifies the number-keying contract: re-diffing the
+// same PR overwrites the capture in place (same dir, stale files gone,
+// content/head_sha refreshed) — there is no per-SHA proliferation.
+func TestPersistPRDiff_ReDiff(t *testing.T) {
+	cwd := t.TempDir()
+	files := jsonPRFiles(t, []map[string]any{
+		{"filename": "foo.go", "status": "modified", "additions": 1, "deletions": 0, "patch": "@@ -1 +1,2 @@\n a\n+b"},
+	})
+	srv1 := newPRDiffServer(t, prDiffBackend{
+		prJSON:    prJSON(t, "aaaaaaaaaaaa1111", "main", 1, 0, 1),
+		diffBody:  "diff --git a/foo.go b/foo.go\n@@ -1 +1,2 @@\n a\n+b\n",
+		filesBody: files,
+	})
+	m1, err := persistPRDiff(ghclient.NewClient(srv1.URL, "test-token"), cwd, "owner", "repo", 42)
+	if err != nil {
+		t.Fatalf("first persistPRDiff: %v", err)
+	}
+	// Drop a stale file into the dir; the re-diff must clobber it.
+	stale := filepath.Join(m1.Dir, "stale.txt")
+	if err := os.WriteFile(stale, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write stale file: %v", err)
+	}
+
+	// Branch moved (new head SHA + new content). Same PR → same dir, overwritten.
+	srv2 := newPRDiffServer(t, prDiffBackend{
+		prJSON:    prJSON(t, "bbbbbbbbbbbb2222", "main", 1, 0, 1),
+		diffBody:  "diff --git a/foo.go b/foo.go\n@@ -1 +1,2 @@\n a\n+c\n",
+		filesBody: files,
+	})
+	m2, err := persistPRDiff(ghclient.NewClient(srv2.URL, "test-token"), cwd, "owner", "repo", 42)
+	if err != nil {
+		t.Fatalf("re-diff: %v", err)
+	}
+	if m1.Dir != m2.Dir {
+		t.Fatalf("same PR should map to the same dir; got %q then %q", m1.Dir, m2.Dir)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale file should have been clobbered on re-diff (stat err: %v)", err)
+	}
+	if m2.HeadSHA != "bbbbbbbbbbbb2222" {
+		t.Errorf("manifest head_sha = %q, want the refreshed SHA", m2.HeadSHA)
+	}
+	got, err := os.ReadFile(m2.FullDiffPath)
+	if err != nil {
+		t.Fatalf("read full.diff: %v", err)
+	}
+	if !strings.Contains(string(got), "+c") {
+		t.Errorf("full.diff should hold the refreshed content; got:\n%s", got)
+	}
+}
+
+// TestPersistPRDiff_RejectsSymlinkedScratch confirms the shared symlink guard
+// fires for the pr-diffs path too: a symlinked _scratch component is refused.
+func TestPersistPRDiff_RejectsSymlinkedScratch(t *testing.T) {
+	cwd := t.TempDir()
+	outside := t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(cwd, "_scratch")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+	srv := newPRDiffServer(t, prDiffBackend{
+		prJSON:    prJSON(t, "abcdef0123456789", "main", 1, 0, 1),
+		diffBody:  "diff --git a/foo.go b/foo.go\n@@ -1 +1,2 @@\n a\n+b\n",
+		filesBody: jsonPRFiles(t, []map[string]any{{"filename": "foo.go", "status": "modified", "patch": "@@ -1 +1,2 @@\n a\n+b"}}),
+	})
+	client := ghclient.NewClient(srv.URL, "test-token")
+	_, err := persistPRDiff(client, cwd, "owner", "repo", 42)
+	if err == nil {
+		t.Fatal("expected symlink rejection, got nil")
+	}
+	if !strings.Contains(err.Error(), "symlinked path component") {
+		t.Errorf("error should mention symlink, got: %v", err)
 	}
 }
 

@@ -182,11 +182,18 @@ func (c *Client) GetPR(owner, repo string, number int, verbose bool) (*PRView, e
 
 // PRFile is a file changed in a PR.
 type PRFile struct {
-	Filename  string `json:"filename"`
-	Status    string `json:"status"` // added, modified, removed, renamed
-	Additions int    `json:"additions"`
-	Deletions int    `json:"deletions"`
-	Patch     string `json:"patch,omitempty"` // unified diff hunks; absent for binary files
+	Filename string `json:"filename"`
+	Status   string `json:"status"` // added, modified, removed, renamed
+	// PreviousFilename is the pre-rename path; GitHub sets it only when
+	// Status is "renamed". Empty for every other status.
+	PreviousFilename string `json:"previous_filename,omitempty"`
+	Additions        int    `json:"additions"`
+	Deletions        int    `json:"deletions"`
+	// Patch is the unified diff hunks for the file. GitHub omits it for
+	// binary files and also for oversized/truncated diffs — so an empty Patch
+	// does not by itself mean the file is binary (see isBinaryFile, which also
+	// checks the line counts).
+	Patch string `json:"patch,omitempty"`
 }
 
 // maxPRFiles caps the total number of files fetched by GetPRFiles across all pages.
@@ -209,11 +216,12 @@ func (c *Client) GetPRFiles(owner, repo string, number int) ([]PRFile, error) {
 
 		for _, f := range rawFiles {
 			files = append(files, PRFile{
-				Filename:  strVal(f, "filename"),
-				Status:    strVal(f, "status"),
-				Additions: intVal(f, "additions"),
-				Deletions: intVal(f, "deletions"),
-				Patch:     strVal(f, "patch"),
+				Filename:         strVal(f, "filename"),
+				Status:           strVal(f, "status"),
+				PreviousFilename: strVal(f, "previous_filename"),
+				Additions:        intVal(f, "additions"),
+				Deletions:        intVal(f, "deletions"),
+				Patch:            strVal(f, "patch"),
 			})
 		}
 
@@ -831,6 +839,13 @@ func firstLine(s string) string {
 }
 
 // filterDiffByFile extracts the diff section for a single file.
+//
+// Matches the new-side path exactly (the token after " b/" on the
+// "diff --git a/… b/…" header) rather than a substring of the whole header.
+// A substring check would misfire on paths that merely contain the requested
+// name (e.g. asking for "foo.go" capturing "lib/b/foo.go"), and would be
+// asymmetric with the 406 fallback's exact match. Renamed files are keyed on
+// their new (b-side) path, which is what callers reference.
 func filterDiffByFile(diff, file string) string {
 	lines := strings.Split(diff, "\n")
 	var result []string
@@ -840,7 +855,7 @@ func filterDiffByFile(diff, file string) string {
 			if capturing {
 				break
 			}
-			if strings.Contains(line, "b/"+file) {
+			if parts := strings.SplitN(line, " b/", 2); len(parts) == 2 && parts[1] == file {
 				capturing = true
 			}
 		}

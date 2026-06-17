@@ -147,12 +147,278 @@ func prView(client ghAPI, args []string) {
 	printJSON(pr)
 }
 
+// diffManifest is the JSON envelope `pr diff` prints to stdout (and writes
+// to manifest.json) instead of dumping the whole diff into the agent's
+// context. Dir / FullDiffPath are absolute so the agent can Read/Grep the
+// persisted diff directly without reasoning about cwd. Truncated flags the
+// HTTP-406 fallback path where full.diff was reassembled from per-file
+// patches rather than fetched verbatim.
+type diffManifest struct {
+	Owner        string             `json:"owner"`
+	Repo         string             `json:"repo"`
+	Number       int                `json:"number"`
+	HeadSHA      string             `json:"head_sha"`
+	BaseRef      string             `json:"base_ref"`
+	ChangedFiles int                `json:"changed_files"`
+	Additions    int                `json:"additions"`
+	Deletions    int                `json:"deletions"`
+	Dir          string             `json:"dir"`
+	FullDiffPath string             `json:"full_diff_path"`
+	Truncated    bool               `json:"truncated"`
+	Files        []diffManifestFile `json:"files"`
+}
+
+type diffManifestFile struct {
+	Path             string `json:"path"`
+	Status           string `json:"status"`
+	Additions        int    `json:"additions"`
+	Deletions        int    `json:"deletions"`
+	Binary           bool   `json:"binary"`
+	PreviousFilename string `json:"previous_filename,omitempty"`
+}
+
+const (
+	fullDiffFilename = "full.diff"
+	manifestFilename = "manifest.json"
+)
+
+// prDiff persists the PR diff under _scratch/ and prints a manifest, rather
+// than dumping the whole diff to stdout (which lands the entire thing in the
+// delegated agent's context in one shot — unbounded and not navigable with
+// Read/Grep/Glob).
+//
+// Two escape hatches keep the old inline behavior available:
+//   - --file <path>: targeted single-file diff stays inline (bounded). No
+//     file written.
+//   - --stdout: whole-diff-to-stdout, for scripts/pipelines. No file written.
+//
+// Both inline paths share persistPRDiff's HTTP-406 ("diff too large")
+// fallback: GitHub refuses the diff media type, so we reassemble from
+// per-file patches — the whole diff for --stdout, or just the requested
+// file for --file — instead of erroring.
 func prDiff(client ghAPI, args []string) {
 	owner, repo, number := parseRepoAndNumber(args)
 	file := flagVal(args, "--file")
-	diff, err := client.GetPRDiff(owner, repo, number, file)
+	stdout := hasFlag(args, "--stdout")
+
+	if file != "" || stdout {
+		diff, err := client.GetPRDiff(owner, repo, number, file)
+		if err != nil {
+			if !ghclient.IsHTTP406(err) {
+				exitOnErr(err)
+			}
+			files, ferr := client.GetPRFiles(owner, repo, number)
+			exitOnErr(ferr)
+			if file != "" {
+				diff = singleFileDiff(files, file)
+				if diff == "" {
+					exitErr(fmt.Sprintf("file %q is not part of PR #%d's diff", file, number))
+				}
+			} else {
+				diff = reassembleDiff(files)
+			}
+		}
+		fmt.Print(diff)
+		return
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		exitErr(fmt.Sprintf("resolve cwd: %v", err))
+	}
+	manifest, err := persistPRDiff(client, cwd, owner, repo, number)
 	exitOnErr(err)
-	fmt.Print(diff)
+	printJSON(manifest)
+}
+
+// persistPRDiff fetches the PR's diff + metadata, writes full.diff and
+// manifest.json into a per-PR directory under _scratch/, and returns the
+// manifest. The directory is keyed by (owner, repo, number) — the task's
+// identity, which the agent always knows — so a later blueprint step can
+// locate an earlier capture without first looking up the head SHA. Each
+// `pr diff` overwrites the capture in place; the manifest records head_sha so
+// a reader that cares about freshness can compare it to the live head.
+func persistPRDiff(client ghAPI, cwd, owner, repo string, number int) (diffManifest, error) {
+	// Three separate REST calls follow (GetPR → GetPRFiles → GetPRDiff): the
+	// API has no transactional snapshot, so a force-push mid-sequence could
+	// leave manifest.head_sha (from GetPR) describing a different commit than
+	// full.diff. We accept that race — head_sha is recorded precisely so a
+	// reader can detect the drift — rather than adding fragile re-fetch loops.
+	pr, err := client.GetPR(owner, repo, number, false)
+	if err != nil {
+		return diffManifest{}, fmt.Errorf("fetch PR #%d: %w", number, err)
+	}
+
+	// GetPRFiles is needed for the per-file manifest rows and doubles as the
+	// reassembly source if the full diff is too large (HTTP 406).
+	files, err := client.GetPRFiles(owner, repo, number)
+	if err != nil {
+		return diffManifest{}, fmt.Errorf("list PR files: %w", err)
+	}
+
+	fullDiff, truncated, err := fetchFullDiff(client, owner, repo, number, files)
+	if err != nil {
+		return diffManifest{}, err
+	}
+
+	// Key on the task identity (owner, repo, number) the agent always knows,
+	// so it can locate an earlier capture without first resolving the head
+	// SHA. head_sha goes in the manifest for freshness comparison.
+	dirKey := owner + "__" + repo + "__" + strconv.Itoa(number)
+	destDir, err := safeScratchSubdir(cwd, "_scratch", "pr-diffs", dirKey)
+	if err != nil {
+		return diffManifest{}, err
+	}
+
+	// Overwrite any prior capture for this PR so a re-diff is deterministic —
+	// stale files from an older fetch (a renamed-away file, a now-current
+	// hunk) would otherwise sit alongside the fresh ones and mislead a reader.
+	if err := os.RemoveAll(destDir); err != nil {
+		return diffManifest{}, fmt.Errorf("clear stale diff directory: %w", err)
+	}
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return diffManifest{}, fmt.Errorf("create diff directory: %w", err)
+	}
+
+	fullDiffPath := filepath.Join(destDir, fullDiffFilename)
+	if err := os.WriteFile(fullDiffPath, []byte(fullDiff), 0o644); err != nil {
+		return diffManifest{}, fmt.Errorf("write %s: %w", fullDiffFilename, err)
+	}
+
+	manifest := diffManifest{
+		Owner:        owner,
+		Repo:         repo,
+		Number:       number,
+		HeadSHA:      pr.HeadSHA,
+		BaseRef:      pr.BaseRef,
+		ChangedFiles: pr.ChangedFiles,
+		Additions:    pr.Additions,
+		Deletions:    pr.Deletions,
+		Dir:          destDir,
+		FullDiffPath: fullDiffPath,
+		Truncated:    truncated,
+		Files:        make([]diffManifestFile, 0, len(files)),
+	}
+	// Some hosts don't populate the PR-level counts; fall back to the file
+	// list length so changed_files is never a misleading zero.
+	if manifest.ChangedFiles == 0 {
+		manifest.ChangedFiles = len(files)
+	}
+	for _, f := range files {
+		manifest.Files = append(manifest.Files, diffManifestFile{
+			Path:             f.Filename,
+			Status:           f.Status,
+			Additions:        f.Additions,
+			Deletions:        f.Deletions,
+			Binary:           isBinaryFile(f),
+			PreviousFilename: f.PreviousFilename,
+		})
+	}
+
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return diffManifest{}, fmt.Errorf("marshal manifest: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(destDir, manifestFilename), manifestBytes, 0o644); err != nil {
+		return diffManifest{}, fmt.Errorf("write %s: %w", manifestFilename, err)
+	}
+
+	return manifest, nil
+}
+
+// fetchFullDiff returns the PR's unified diff and whether it was reassembled
+// from per-file patches. The happy path is the verbatim diff media type; on
+// HTTP 406 ("diff too large") GitHub refuses it, so we reconstruct an
+// approximate unified diff from the already-fetched per-file patches and flag
+// the result truncated. Any other error propagates.
+func fetchFullDiff(client ghAPI, owner, repo string, number int, files []ghclient.PRFile) (string, bool, error) {
+	diff, err := client.GetPRDiff(owner, repo, number, "")
+	if err == nil {
+		return diff, false, nil
+	}
+	if !ghclient.IsHTTP406(err) {
+		return "", false, fmt.Errorf("fetch PR diff: %w", err)
+	}
+	return reassembleDiff(files), true, nil
+}
+
+// isBinaryFile heuristically classifies a changed file as binary. GitHub
+// omits the patch field for both binary files and oversized/truncated text
+// diffs, so an empty patch alone isn't decisive — but a binary file also
+// reports zero line additions/deletions, whereas an oversized text file still
+// reports its real counts. A rename with no content change likewise has an
+// empty patch and zero counts but isn't binary, so it's excluded.
+//
+// Known limitation: a binary file that is *also* renamed is indistinguishable
+// from a pure (content-unchanged) rename via the files API — both have an
+// empty patch and zero counts — so a binary rename is reported Binary=false.
+// Binary renames are rare and reassembleDiff still emits sensible rename
+// headers for them; the API exposes no flag that would let us do better.
+func isBinaryFile(f ghclient.PRFile) bool {
+	return f.Patch == "" && f.Additions == 0 && f.Deletions == 0 && f.Status != "renamed"
+}
+
+// reassembleDiff synthesizes a unified diff from per-file patches (the HTTP
+// 406 fallback). GitHub's per-file patch field carries only the @@ hunks, not
+// the diff --git / --- / +++ headers, so we prepend minimal headers to keep
+// the output a recognizable unified diff. It's approximate — that's what the
+// manifest's truncated flag signals — but greppable and good enough for
+// review. Patch-less files get a "Binary files differ" line when they look
+// binary, "rename from/to" headers when they're a rename, or a note that the
+// patch was omitted (too large) otherwise — never a fabricated hunk.
+func reassembleDiff(files []ghclient.PRFile) string {
+	var b strings.Builder
+	for _, f := range files {
+		prev := f.PreviousFilename
+		if prev == "" {
+			prev = f.Filename
+		}
+		fmt.Fprintf(&b, "diff --git a/%s b/%s\n", prev, f.Filename)
+		if f.Patch == "" {
+			switch {
+			case isBinaryFile(f):
+				fmt.Fprintf(&b, "Binary files a/%s and b/%s differ\n", prev, f.Filename)
+			case f.Status == "renamed":
+				// A rename with no textual patch is either a pure rename or a
+				// binary rename — the files API doesn't distinguish them. Emit
+				// rename headers, correct for the pure case and not misleading
+				// for the binary one, rather than a bogus "diff too large" note.
+				fmt.Fprintf(&b, "rename from %s\nrename to %s\n", prev, f.Filename)
+			default:
+				fmt.Fprintf(&b, "# patch unavailable (diff too large to fetch); +%d -%d\n", f.Additions, f.Deletions)
+			}
+			continue
+		}
+		switch f.Status {
+		case "added":
+			b.WriteString("--- /dev/null\n")
+			fmt.Fprintf(&b, "+++ b/%s\n", f.Filename)
+		case "removed":
+			fmt.Fprintf(&b, "--- a/%s\n", prev)
+			b.WriteString("+++ /dev/null\n")
+		default:
+			fmt.Fprintf(&b, "--- a/%s\n", prev)
+			fmt.Fprintf(&b, "+++ b/%s\n", f.Filename)
+		}
+		b.WriteString(f.Patch)
+		if !strings.HasSuffix(f.Patch, "\n") {
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// singleFileDiff returns the synthesized diff for one file from a per-file
+// patch listing, or "" if the path isn't in the listing. It's the --file
+// inline path's HTTP-406 fallback — same reassembly as the full diff, scoped
+// to a single file.
+func singleFileDiff(files []ghclient.PRFile, path string) string {
+	for _, f := range files {
+		if f.Filename == path {
+			return reassembleDiff([]ghclient.PRFile{f})
+		}
+	}
+	return ""
 }
 
 func prFiles(client ghAPI, args []string) {
