@@ -60,12 +60,16 @@ func EnsureSDK() (string, error) {
 
 func doInstall() (string, error) {
 	// Surface a missing $HOME as an error (the pre-paths behavior) rather
-	// than letting the error-free SDKDir panic underneath.
-	if _, err := paths.StateRootErr(); err != nil {
+	// than letting the error-free SDKDir panic underneath. Pre-flight the
+	// toolchain root specifically: with TF_TOOLCHAIN_ROOT set the SDK dir
+	// resolves to a literal path with no home dependency, so this only
+	// trips in the local-mode $HOME-missing case it is meant to catch.
+	if _, err := paths.ToolchainRootErr(); err != nil {
 		return "", fmt.Errorf("resolve sdk dir: %w", err)
 	}
 	// Host-global install: the SDK toolchain is identical for every
-	// tenant, so it lives under the state root with no org segment.
+	// tenant, so it lives under the toolchain root (TF_TOOLCHAIN_ROOT,
+	// else the state root) with no org segment.
 	sdkDir := paths.SDKDir()
 	if err := os.MkdirAll(sdkDir, 0o755); err != nil {
 		return "", fmt.Errorf("create %s: %w", sdkDir, err)

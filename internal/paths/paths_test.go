@@ -173,6 +173,7 @@ func TestOrgRoot_MultiDefaultSentinelStripped(t *testing.T) {
 func TestResolvers_LocalLayout(t *testing.T) {
 	runmode.SetForTest(t, runmode.ModeLocal)
 	SetForTest(t, "/s")
+	t.Setenv(envToolchainRoot, "") // hermetic: ignore any ambient TF_TOOLCHAIN_ROOT
 	cases := []struct{ name, got, want string }{
 		{"StateRoot", StateRoot(), "/s"},
 		{"OrgRoot", OrgRoot(realOrg), "/s"},
@@ -198,6 +199,7 @@ func TestResolvers_LocalLayout(t *testing.T) {
 func TestResolvers_MultiLayout(t *testing.T) {
 	runmode.SetForTest(t, runmode.ModeMulti)
 	SetForTest(t, "/s")
+	t.Setenv(envToolchainRoot, "") // hermetic: ignore any ambient TF_TOOLCHAIN_ROOT
 	orgBase := filepath.Join("/s", "orgs", realOrg)
 	cases := []struct{ name, got, want string }{
 		// Class 1 — org-scoped.
@@ -220,12 +222,75 @@ func TestResolvers_MultiLayout(t *testing.T) {
 	}
 }
 
+// TestToolchainRoot_EnvOverrideDecouplesFromStateRoot pins the fix for
+// the multi-mode container state-root mismatch: when TF_TOOLCHAIN_ROOT is
+// set (the runtime image does this), the Class-2 toolchain resolvers land
+// on that fixed path regardless of StateRoot — so an image-baked SDK is
+// never shadowed by wherever TF_STATE_ROOT points tenant data.
+func TestToolchainRoot_EnvOverrideDecouplesFromStateRoot(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	SetForTest(t, "/data")
+	t.Setenv(envToolchainRoot, "/opt/triagefactory")
+
+	if got := ToolchainRoot(); got != "/opt/triagefactory" {
+		t.Errorf("ToolchainRoot() = %q, want the TF_TOOLCHAIN_ROOT override", got)
+	}
+	if got, want := SDKDir(), filepath.Join("/opt/triagefactory", "sdk"); got != want {
+		t.Errorf("SDKDir() = %q, want %q (decoupled from StateRoot)", got, want)
+	}
+	if got, want := SandboxRootfsDir("abc"), filepath.Join("/opt/triagefactory", "sandbox", "rootfs-abc"); got != want {
+		t.Errorf("SandboxRootfsDir() = %q, want %q", got, want)
+	}
+	// StateRoot (tenant data) is untouched by the toolchain override.
+	if got := StateRoot(); got != "/data" {
+		t.Errorf("StateRoot() = %q, want /data (unaffected by TF_TOOLCHAIN_ROOT)", got)
+	}
+}
+
+// TestToolchainRoot_UnsetFollowsStateRoot is the back-compat guarantee:
+// with no override the toolchain lives under the state root exactly as it
+// did before the split (every laptop, and host-binary multi-mode dev runs),
+// so existing on-disk layouts are unchanged.
+func TestToolchainRoot_UnsetFollowsStateRoot(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	SetForTest(t, "/s")
+	t.Setenv(envToolchainRoot, "")
+
+	if got := ToolchainRoot(); got != "/s" {
+		t.Errorf("ToolchainRoot() = %q, want StateRoot when env unset", got)
+	}
+	if got, want := SDKDir(), filepath.Join("/s", "sdk"); got != want {
+		t.Errorf("SDKDir() = %q, want %q", got, want)
+	}
+}
+
+// TestToolchainRootErr_MatchesToolchainRoot confirms the error-returning
+// form agrees with the error-free form, and that an explicit
+// TF_TOOLCHAIN_ROOT resolves with no error (no $HOME dependency) — which
+// is what lets EnsureSDK / the rootfs extractor pre-flight it safely in
+// the container regardless of $HOME.
+func TestToolchainRootErr_MatchesToolchainRoot(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	SetForTest(t, "/s")
+
+	t.Setenv(envToolchainRoot, "/opt/triagefactory")
+	if got, err := ToolchainRootErr(); err != nil || got != "/opt/triagefactory" {
+		t.Errorf("ToolchainRootErr() = (%q, %v), want (/opt/triagefactory, nil)", got, err)
+	}
+
+	t.Setenv(envToolchainRoot, "")
+	if got, err := ToolchainRootErr(); err != nil || got != "/s" {
+		t.Errorf("ToolchainRootErr() = (%q, %v), want (/s, nil)", got, err)
+	}
+}
+
 // TestMultiOrg_Isolation is the core multi-tenant guarantee: two orgs
 // running simultaneously get non-overlapping org-scoped paths, while the
 // host-global caches stay identical regardless of org.
 func TestMultiOrg_Isolation(t *testing.T) {
 	runmode.SetForTest(t, runmode.ModeMulti)
 	SetForTest(t, "/s")
+	t.Setenv(envToolchainRoot, "") // hermetic: the host-global asserts below go through ToolchainRoot
 
 	if a, b := BareCacheDir(realOrg, "o", "r"), BareCacheDir(otherOrg, "o", "r"); a == b {
 		t.Errorf("BareCacheDir must differ across orgs, both = %q", a)
