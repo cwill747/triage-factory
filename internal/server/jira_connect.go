@@ -135,7 +135,7 @@ func (s *Server) handleJiraIdentityStatus(w http.ResponseWriter, r *http.Request
 		// integrations.Load uses on the request path).
 		method, lerr := tx.Secrets.Get(r.Context(), orgID, integrations.KeyJiraAuthMethod)
 		if lerr != nil {
-			if !(runmode.Current() == runmode.ModeLocal && envProvides("jira")) {
+			if runmode.Current() != runmode.ModeLocal || !envProvides("jira") {
 				return lerr
 			}
 			method = creds.JiraAuthMethod
