@@ -20,7 +20,6 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
 	"github.com/sky-ai-eng/triage-factory/internal/integrations"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // Connect GitHub — the user-to-server OAuth handler that binds a
@@ -349,8 +348,8 @@ func (s *Server) handleGitHubIdentityStatus(w http.ResponseWriter, r *http.Reque
 			if lerr != nil {
 				return lerr
 			}
-			if login == "" && runmode.Current() == runmode.ModeLocal && envProvides("github") {
-				envGitHubPAT = creds.GitHubPAT
+			if login == "" {
+				envGitHubPAT = localEnvGitHubPATForHost(ghWeb, creds)
 			}
 		} else {
 			// Malformed host config — surface the raw value for display but

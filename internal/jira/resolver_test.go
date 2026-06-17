@@ -242,6 +242,33 @@ func TestForUser_UsesUserToken(t *testing.T) {
 	}
 }
 
+// TestForUser_UsesSecretURLWhenOrgSettingsEmpty pins the local/env fallback:
+// older installs may have jira_url in SecretStore while org_settings is still
+// blank, and the per-user resolver must key the acting credential under that
+// effective host.
+func TestForUser_UsesSecretURLWhenOrgSettingsEmpty(t *testing.T) {
+	srv, rec := captureServer(t, `{"key":"PROJ-1"}`)
+	secrets := &fakeSecrets{
+		sys:  map[string]string{keyJiraURL: srv.URL},
+		user: map[string]string{UserTokenKey(srv.URL): "user-pat"},
+	}
+	r := NewResolver(secrets, &fakeOrgs{jiraBase: ""})
+
+	c, err := r.ForUser(context.Background(), testOrgID, testUserID)
+	if err != nil {
+		t.Fatalf("ForUser: %v", err)
+	}
+	if _, err := c.GetIssue(context.Background(), "PROJ-1"); err != nil {
+		t.Fatalf("GetIssue: %v", err)
+	}
+	if auth, _ := rec.read(); auth != "Bearer user-pat" {
+		t.Errorf("Authorization = %q, want user PAT resolved via SecretStore host", auth)
+	}
+	if want := UserTokenKey(srv.URL); secrets.gotUserKey != want {
+		t.Errorf("GetUserSystem key = %q, want %q", secrets.gotUserKey, want)
+	}
+}
+
 // TestForUser_CloudEnvelope pins the Cloud per-user path: a stored
 // cloud_api_token envelope resolves to a Basic / REST v3 client built from the
 // user's own email + API token — never the org service cred.

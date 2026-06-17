@@ -145,6 +145,9 @@ func getUserSecretWithEnvFallback(userID, key string) (string, error) {
 	if got != "" {
 		return got, nil
 	}
+	if err != nil && auth.KeychainAvailable() {
+		return "", err
+	}
 	if envGot, envErr := auth.EnvUserSecret(key); envErr != nil {
 		return "", envErr
 	} else if envGot != "" {

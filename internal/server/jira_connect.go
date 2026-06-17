@@ -142,8 +142,8 @@ func (s *Server) handleJiraIdentityStatus(w http.ResponseWriter, r *http.Request
 		}
 		deploymentEnum := jira.DeploymentForMarker(jira.AuthMethod(method), jiraHost)
 		deployment = string(deploymentEnum)
-		if runmode.Current() == runmode.ModeLocal && deploymentEnum == jira.DeploymentDataCenter && envProvides("jira") {
-			envJiraPAT = creds.JiraPAT
+		if deploymentEnum == jira.DeploymentDataCenter {
+			envJiraPAT = localEnvJiraPATForHost(jiraHost, creds)
 		}
 
 		// Claims-checked GetUser (NOT GetUserSystem): this is a request
@@ -197,8 +197,21 @@ func (s *Server) handleJiraIdentityStatus(w http.ResponseWriter, r *http.Request
 		jiraUser, err := auth.ValidateJira(r.Context(), jira.DataCenterPAT(host, envJiraPAT))
 		if err != nil {
 			log.Printf("[jira-identity] local env Jira access auto-bind skipped for user=%s host=%s org=%s: %v", userID, host, orgID, err)
+			connected = false
+			account = ""
 		} else if jiraUser.StableID() != "" {
+			envCredential, err := jira.MarshalUserCredential(jira.UserCredential{
+				Method: jira.AuthMethodDCPAT,
+				Token:  envJiraPAT,
+			})
+			if err != nil {
+				internalError(w, "jira-identity", err)
+				return
+			}
 			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				if err := tx.Secrets.PutUser(r.Context(), orgID, userID, jiraTokenKey(host), envCredential, "local env Jira PAT"); err != nil {
+					return err
+				}
 				return tx.Users.UpsertJiraIdentity(r.Context(), userID, host, jiraUser.StableID(), jiraUser.DisplayName, "pat")
 			}); err != nil {
 				internalError(w, "jira-identity", err)
@@ -210,6 +223,9 @@ func (s *Server) handleJiraIdentityStatus(w http.ResponseWriter, r *http.Request
 				account = jiraUser.StableID()
 			}
 			log.Printf("[jira-identity] bound user=%s account=%s host=%s org=%s source=pat env=true", userID, jiraUser.StableID(), host, orgID)
+		} else {
+			connected = false
+			account = ""
 		}
 	}
 

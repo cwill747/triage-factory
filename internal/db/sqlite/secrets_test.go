@@ -2,9 +2,11 @@ package sqlite_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/zalando/go-keyring"
 	_ "modernc.org/sqlite"
 
@@ -338,6 +340,30 @@ func TestSecretStore_SQLite_PerUserJiraFallsBackToEnv(t *testing.T) {
 	}
 	if sysGot != got {
 		t.Errorf("GetUserSystem env fallback = %q, want %q", sysGot, got)
+	}
+}
+
+// TestSecretStore_SQLite_PerUserKeychainReadErrorSurfaces pins that the
+// per-user env fallback only masks a keychain failure in the intended headless
+// case. If the keychain is considered available, a read error is a real fault.
+func TestSecretStore_SQLite_PerUserKeychainReadErrorSurfaces(t *testing.T) {
+	keychainErr := errors.New("keychain read failed")
+	keyring.MockInitWithError(keychainErr)
+	t.Cleanup(keyring.MockInit)
+	auth.SetKeychainAvailableForTest(t, true)
+
+	conn := openSQLiteForTest(t)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+	org := runmode.LocalDefaultOrg
+	const userID = "11111111-1111-1111-1111-111111111111"
+
+	t.Setenv("TRIAGE_FACTORY_JIRA_URL", "https://jira.example.com")
+	t.Setenv("TRIAGE_FACTORY_JIRA_PAT", "jira-env-pat")
+
+	_, err := stores.Secrets.GetUser(ctx, org, userID, "jira_token/https://jira.example.com")
+	if !errors.Is(err, keychainErr) {
+		t.Fatalf("GetUser err = %v, want keychain read error surfaced", err)
 	}
 }
 

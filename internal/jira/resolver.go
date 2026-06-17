@@ -294,7 +294,15 @@ func (r *resolver) ForUser(ctx context.Context, orgID, userID string) (*Client, 
 	if err != nil {
 		return nil, fmt.Errorf("resolve jira host for org %s: %w", orgID, err)
 	}
-	host, ok := CanonicalHost(orgSet.JiraBaseURL)
+	baseURL := orgSet.JiraBaseURL
+	if baseURL == "" {
+		secretURL, err := r.secrets.GetSystem(ctx, orgID, keyJiraURL)
+		if err != nil {
+			return nil, fmt.Errorf("resolve jira host for org %s: read %s secret: %w", orgID, keyJiraURL, err)
+		}
+		baseURL = db.EffectiveJiraBaseURL(orgSet.JiraBaseURL, secretURL)
+	}
+	host, ok := CanonicalHost(baseURL)
 	if !ok {
 		// No usable org Jira host → no host to key a user credential under, so
 		// there cannot be one. This is the absent-credential boundary, not a

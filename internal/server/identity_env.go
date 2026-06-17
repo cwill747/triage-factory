@@ -2,7 +2,9 @@ package server
 
 import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
+	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 func envProvides(group string) bool {
@@ -10,15 +12,31 @@ func envProvides(group string) bool {
 }
 
 func effectiveGitHubIdentityBaseURL(orgSet domain.OrgSettings, creds auth.Credentials) string {
-	if orgSet.GitHubBaseURL != "" {
-		return orgSet.GitHubBaseURL
-	}
-	return creds.GitHubURL
+	return db.EffectiveGitHubBaseURL(orgSet.GitHubBaseURL, creds.GitHubURL)
 }
 
 func effectiveJiraIdentityBaseURL(orgSet domain.OrgSettings, creds auth.Credentials) string {
-	if orgSet.JiraBaseURL != "" {
-		return orgSet.JiraBaseURL
+	return db.EffectiveJiraBaseURL(orgSet.JiraBaseURL, creds.JiraURL)
+}
+
+func localEnvGitHubPATForHost(host string, creds auth.Credentials) string {
+	if runmode.Current() != runmode.ModeLocal || !envProvides("github") {
+		return ""
 	}
-	return creds.JiraURL
+	envHost, ok := resolveGitHubHost(creds.GitHubURL)
+	if !ok || envHost != host {
+		return ""
+	}
+	return creds.GitHubPAT
+}
+
+func localEnvJiraPATForHost(host string, creds auth.Credentials) string {
+	if runmode.Current() != runmode.ModeLocal || !envProvides("jira") {
+		return ""
+	}
+	envHost, ok := resolveJiraHost(creds.JiraURL)
+	if !ok || envHost != host {
+		return ""
+	}
+	return creds.JiraPAT
 }

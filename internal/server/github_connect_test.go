@@ -596,6 +596,45 @@ func TestGitHubIdentityStatus_LocalEnvAutoBinds(t *testing.T) {
 	}
 }
 
+func TestGitHubIdentityStatus_LocalEnvAutoBindRequiresEnvHost(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeLocal)
+	keyring.MockInit()
+	s := newTestServer(t)
+
+	var orgHits int
+	orgStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/user" {
+			http.NotFound(w, r)
+			return
+		}
+		orgHits++
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"login":"wrong-host"}`)
+	}))
+	t.Cleanup(orgStub.Close)
+	envStub := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(envStub.Close)
+
+	seedLocalOrgGitHubHost(t, s, orgStub.URL)
+	t.Setenv("TRIAGE_FACTORY_GITHUB_URL", envStub.URL)
+	t.Setenv("TRIAGE_FACTORY_GITHUB_PAT", "ghp_env_token")
+
+	rec := doJSON(t, s, "GET", "/api/orgs/"+runmode.LocalDefaultOrgID+"/identity/github", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var out githubIdentityStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Connected || out.Login != "" || out.Host != orgStub.URL {
+		t.Fatalf("status = %+v, want disconnected on configured org host %s", out, orgStub.URL)
+	}
+	if orgHits != 0 {
+		t.Fatalf("env PAT was validated against configured host %d time(s), want 0", orgHits)
+	}
+}
+
 // TestGitHubConnect_IdentityPersistsAcrossLoginProvider closes the SKY-266
 // regression by construction: a connect_oauth binding must survive a
 // subsequent login under a non-GitHub provider (no user_name claim), where

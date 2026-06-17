@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"sync"
@@ -97,17 +98,31 @@ func (m *Manager) reviewerResolver(ctx context.Context, orgID, username string, 
 		return tracker.NewLocalReviewerResolver(username, userTeams)
 	}
 	host := ""
-	if m.orgs != nil {
-		if orgSet, err := m.orgs.GetSettingsSystem(ctx, orgID); err != nil {
-			log.Printf("[github] org %s: read settings for reviewer resolver: %v", orgID, err)
-		} else {
-			// Resolve to the effective host (empty → github.com) so the
-			// reverse identity lookup matches rows captured under the
-			// canonical host (e.g. the OAuth login-claim's literal github.com).
-			host = db.EffectiveGitHubHost(orgSet.GitHubBaseURL)
-		}
+	if h, err := m.githubIdentityHost(ctx, orgID); err != nil {
+		log.Printf("[github] org %s: resolve identity host for reviewer resolver: %v", orgID, err)
+	} else {
+		host = h
 	}
 	return tracker.NewStoreReviewerResolver(ctx, orgID, host, m.users, m.githubGroups)
+}
+
+func (m *Manager) githubIdentityHost(ctx context.Context, orgID string) (string, error) {
+	if m.orgs == nil {
+		return "", nil
+	}
+	orgSet, err := m.orgs.GetSettingsSystem(ctx, orgID)
+	if err != nil {
+		return "", fmt.Errorf("read settings: %w", err)
+	}
+	baseURL := orgSet.GitHubBaseURL
+	if baseURL == "" && m.secrets != nil {
+		secretURL, err := m.secrets.GetSystem(ctx, orgID, integrations.KeyGitHubURL)
+		if err != nil {
+			return "", fmt.Errorf("read %s secret: %w", integrations.KeyGitHubURL, err)
+		}
+		baseURL = db.EffectiveGitHubBaseURL(orgSet.GitHubBaseURL, secretURL)
+	}
+	return db.EffectiveGitHubHost(baseURL), nil
 }
 
 // reportError invokes the OnError callback if set. Centralized so adding
@@ -572,15 +587,15 @@ func (m *Manager) pollGitHubPAT(ctx context.Context, orgID string, repos []strin
 	var userTeams []string
 	if isLocal {
 		// Identity is host-scoped (SKY-396): resolve the org's GitHub host
-		// from org_settings, then read the local user's login for that
-		// (user, host) pair. Boot-time goroutine with no JWT claims → the
-		// `...System` admin-pool variants.
-		orgSet, serr := m.orgs.GetSettingsSystem(ctx, orgID)
+		// from org_settings or the SecretStore/env fallback, then read the
+		// local user's login for that (user, host) pair. Boot-time goroutine
+		// with no JWT claims → the `...System` admin-pool variants.
+		host, serr := m.githubIdentityHost(ctx, orgID)
 		if serr != nil {
-			log.Printf("[github] org %s: read org settings: %v", orgID, serr)
+			log.Printf("[github] org %s: resolve github identity host: %v", orgID, serr)
 			return
 		}
-		username, err = m.users.GetGitHubLoginSystem(ctx, runmode.LocalDefaultUserID, orgSet.GitHubBaseURL)
+		username, err = m.users.GetGitHubLoginSystem(ctx, runmode.LocalDefaultUserID, host)
 		if err != nil {
 			log.Printf("[github] org %s: read github identity: %v", orgID, err)
 			return

@@ -394,6 +394,114 @@ func TestJiraIdentityStatus_LocalEnvAutoBinds(t *testing.T) {
 	}
 }
 
+func TestJiraIdentityStatus_InvalidLocalEnvPATReportsDisconnected(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeLocal)
+	keyring.MockInit()
+	s := newTestServer(t)
+
+	var gotAuth string
+	jiraStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/rest/api/2/myself" {
+			http.NotFound(w, r)
+			return
+		}
+		gotAuth = r.Header.Get("Authorization")
+		http.Error(w, `{"message":"Unauthorized"}`, http.StatusUnauthorized)
+	}))
+	t.Cleanup(jiraStub.Close)
+	t.Setenv("TRIAGE_FACTORY_JIRA_URL", jiraStub.URL)
+	t.Setenv("TRIAGE_FACTORY_JIRA_PAT", "bad_env_token")
+
+	rec := doJSON(t, s, "GET", "/api/orgs/"+runmode.LocalDefaultOrgID+"/identity/jira", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var out jiraIdentityStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Connected || out.Account != "" || out.Host != jiraStub.URL {
+		t.Fatalf("status = %+v, want disconnected on %s", out, jiraStub.URL)
+	}
+	if gotAuth != "Bearer bad_env_token" {
+		t.Errorf("myself Authorization = %q, want env PAT validation attempt", gotAuth)
+	}
+}
+
+func TestJiraIdentityStatus_LocalEnvAutoBindRequiresEnvHost(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeLocal)
+	keyring.MockInit()
+	s := newTestServer(t)
+
+	var orgHits int
+	orgStub := jiraMyselfStub(t, `{"accountId":"wrong","displayName":"Wrong Host"}`, nil)
+	envStub := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(envStub.Close)
+	seedLocalOrgJiraHost(t, s, orgStub.URL)
+	t.Setenv("TRIAGE_FACTORY_JIRA_URL", envStub.URL)
+	t.Setenv("TRIAGE_FACTORY_JIRA_PAT", "jira_env_token")
+
+	wrappedOrg := orgStub.Config.Handler
+	orgStub.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		orgHits++
+		wrappedOrg.ServeHTTP(w, r)
+	})
+
+	rec := doJSON(t, s, "GET", "/api/orgs/"+runmode.LocalDefaultOrgID+"/identity/jira", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var out jiraIdentityStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Connected || out.Account != "" || out.Host != orgStub.URL {
+		t.Fatalf("status = %+v, want disconnected on configured org host %s", out, orgStub.URL)
+	}
+	if orgHits != 0 {
+		t.Fatalf("env PAT was validated against configured host %d time(s), want 0", orgHits)
+	}
+}
+
+func TestJiraIdentityStatus_LocalEnvAutoBindReplacesStaleUserSecret(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeLocal)
+	keyring.MockInit()
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	jiraStub := jiraMyselfStub(t, `{"accountId":"env-acc","displayName":"Env Jira"}`, nil)
+	t.Setenv("TRIAGE_FACTORY_JIRA_URL", jiraStub.URL)
+	t.Setenv("TRIAGE_FACTORY_JIRA_PAT", "jira_env_token")
+
+	if err := s.secrets.PutUser(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultUserID, jiraTokenKey(jiraStub.URL), "stale-pat", ""); err != nil {
+		t.Fatalf("seed stale user secret: %v", err)
+	}
+
+	rec := doJSON(t, s, "GET", "/api/orgs/"+runmode.LocalDefaultOrgID+"/identity/jira", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var out jiraIdentityStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !out.Connected || out.Account != "Env Jira" {
+		t.Fatalf("status = %+v, want env identity connected", out)
+	}
+
+	raw, err := s.secrets.GetUser(ctx, runmode.LocalDefaultOrgID, runmode.LocalDefaultUserID, jiraTokenKey(jiraStub.URL))
+	if err != nil {
+		t.Fatalf("read user secret: %v", err)
+	}
+	cred, err := jira.ParseUserCredential(raw)
+	if err != nil {
+		t.Fatalf("ParseUserCredential: %v", err)
+	}
+	if cred.Token != "jira_env_token" {
+		t.Fatalf("stored user token = %q, want env token replacing stale secret", cred.Token)
+	}
+}
+
 // TestJiraIdentityStatus_StaleCrossSchemeCredential_NotConnected pins the
 // status reader's deployment-match guard: a user with a stored Data Center PAT
 // whose org later flips to Cloud (a DC→Cloud cutover) reports connected=false —
