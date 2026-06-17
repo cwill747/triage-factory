@@ -298,6 +298,10 @@ func (s *Server) handleGitHubConnectCallback(w http.ResponseWriter, r *http.Requ
 
 	githubConnectLog.Info("bound user",
 		"user", userID, "login", ghUser.Login, "host", ghWeb, "org", orgID, "source", "connect_oauth")
+	// Seed this login's trailing-window PR history so the personal dashboard
+	// isn't blank for activity that predates tracking (TFAC-396). Fire-and-
+	// forget + marker-guarded; multi-mode only.
+	s.kickDashboardBackfill(orgID, userID, ghUser.Login, ghWeb)
 	http.Redirect(w, r, returnTo, http.StatusFound)
 }
 
@@ -469,6 +473,8 @@ func (s *Server) handleGitHubIdentityPAT(w http.ResponseWriter, r *http.Request)
 	// The token is intentionally not persisted anywhere — it existed only for
 	// the whoami above. Identity captured; org access untouched.
 	githubIdentityLog.Info("bound user", "user", userID, "login", ghUser.Login, "host", ghWeb, "org", orgID, "source", "pat")
+	// Seed this login's trailing-window PR history for the dashboard (TFAC-396).
+	s.kickDashboardBackfill(orgID, userID, ghUser.Login, ghWeb)
 
 	writeJSON(w, http.StatusOK, githubIdentityCaptureResponse{Login: ghUser.Login, Host: ghWeb})
 }
