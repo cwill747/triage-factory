@@ -119,7 +119,7 @@ func (*secretStore) GetUser(_ context.Context, orgID, userID, key string) (strin
 	if err := assertLocalOrg(orgID); err != nil {
 		return "", err
 	}
-	return auth.GetSecret(userKeychainKey(userID, key))
+	return getUserSecretWithEnvFallback(userID, key)
 }
 
 // GetUserSystem == GetUser in local mode. There's a single user and a
@@ -131,7 +131,26 @@ func (*secretStore) GetUserSystem(_ context.Context, orgID, userID, key string) 
 	if err := assertLocalOrg(orgID); err != nil {
 		return "", err
 	}
-	return auth.GetSecret(userKeychainKey(userID, key))
+	return getUserSecretWithEnvFallback(userID, key)
+}
+
+// getUserSecretWithEnvFallback is the shared read body for GetUser and
+// GetUserSystem (identical in local mode): the namespaced keychain entry wins
+// when present, otherwise the TRIAGE_FACTORY_* env overlay supplies the
+// credential (auth.EnvUserSecret owns the per-user overlay logic). Keeping a
+// single body ensures the request door and the system door can't drift on
+// whether the env credential is visible.
+func getUserSecretWithEnvFallback(userID, key string) (string, error) {
+	got, err := auth.GetSecret(userKeychainKey(userID, key))
+	if got != "" {
+		return got, nil
+	}
+	if envGot, envErr := auth.EnvUserSecret(key); envErr != nil {
+		return "", envErr
+	} else if envGot != "" {
+		return envGot, nil
+	}
+	return got, err
 }
 
 func (*secretStore) DeleteUser(_ context.Context, orgID, userID, key string) (bool, error) {

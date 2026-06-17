@@ -3,6 +3,7 @@ package integrations_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"slices"
 	"testing"
 
@@ -33,6 +34,81 @@ func openStores(t *testing.T) db.Stores {
 		t.Fatalf("bootstrap schema: %v", err)
 	}
 	return sqlitestore.New(conn)
+}
+
+type failingSecretStore struct {
+	db.SecretStore
+	values map[string]string
+}
+
+func (s failingSecretStore) Get(_ context.Context, _ string, key string) (string, error) {
+	if v, ok := s.values[key]; ok {
+		return v, nil
+	}
+	return "", errors.New("keychain unavailable")
+}
+
+func (s failingSecretStore) GetSystem(ctx context.Context, orgID string, key string) (string, error) {
+	return s.Get(ctx, orgID, key)
+}
+
+// TestLoad_LocalEnvOverlayIgnoresKeychainErrorsForUnsetKeys pins the headless
+// deploy: the keychain backend is unavailable, env supplies GitHub, and the
+// keychain read errors for every other key are swallowed as "unconfigured"
+// rather than surfaced — otherwise a GitHub-only headless install couldn't boot.
+func TestLoad_LocalEnvOverlayIgnoresKeychainErrorsForUnsetKeys(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeLocal)
+	auth.SetKeychainAvailableForTest(t, false) // headless: no keychain backend
+	t.Setenv("TRIAGE_FACTORY_GITHUB_URL", "https://ghe.example.com")
+	t.Setenv("TRIAGE_FACTORY_GITHUB_PAT", "env-gh")
+
+	store := failingSecretStore{values: map[string]string{
+		integrations.KeyGitHubURL: "https://ghe.example.com",
+		integrations.KeyGitHubPAT: "env-gh",
+	}}
+	got, err := integrations.Load(context.Background(), store, runmode.LocalDefaultOrgID)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.GitHubURL != "https://ghe.example.com" || got.GitHubPAT != "env-gh" {
+		t.Errorf("Load got GitHub (%q, %q), want env values", got.GitHubURL, got.GitHubPAT)
+	}
+	if got.JiraURL != "" || got.JiraPAT != "" || got.JiraAuthMethod != "" {
+		t.Errorf("unset keys should stay empty under env overlay, got %+v", got)
+	}
+
+	got, err = integrations.LoadSystem(context.Background(), store, runmode.LocalDefaultOrgID)
+	if err != nil {
+		t.Fatalf("LoadSystem: %v", err)
+	}
+	if got.GitHubURL != "https://ghe.example.com" || got.GitHubPAT != "env-gh" {
+		t.Errorf("LoadSystem got GitHub (%q, %q), want env values", got.GitHubURL, got.GitHubPAT)
+	}
+}
+
+// TestLoad_KeychainAvailableSurfacesReadErrors is the mirror: when the keychain
+// backend IS reachable, a read error is a genuine fault (a transient blip on an
+// actually-configured integration) and must NOT be masked by the env overlay —
+// even though env supplies a different group. Pins the fix for the blanket
+// swallow that reported a configured integration as "not configured".
+func TestLoad_KeychainAvailableSurfacesReadErrors(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeLocal)
+	auth.SetKeychainAvailableForTest(t, true) // keychain up: errors are real
+	t.Setenv("TRIAGE_FACTORY_GITHUB_URL", "https://ghe.example.com")
+	t.Setenv("TRIAGE_FACTORY_GITHUB_PAT", "env-gh")
+
+	// GitHub keys resolve; the Jira keys error (simulating a transient
+	// keychain blip on a Jira credential the user actually configured).
+	store := failingSecretStore{values: map[string]string{
+		integrations.KeyGitHubURL: "https://ghe.example.com",
+		integrations.KeyGitHubPAT: "env-gh",
+	}}
+	if _, err := integrations.Load(context.Background(), store, runmode.LocalDefaultOrgID); err == nil {
+		t.Fatal("Load: want error surfaced for failing Jira keychain reads, got nil")
+	}
+	if _, err := integrations.LoadSystem(context.Background(), store, runmode.LocalDefaultOrgID); err == nil {
+		t.Fatal("LoadSystem: want error surfaced for failing Jira keychain reads, got nil")
+	}
 }
 
 func TestLoadSave_Roundtrip(t *testing.T) {

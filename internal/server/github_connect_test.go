@@ -549,6 +549,53 @@ func TestGitHubIdentityStatus(t *testing.T) {
 	}
 }
 
+// TestGitHubIdentityStatus_LocalEnvAutoBinds pins the headless local bootstrap
+// path: when TRIAGE_FACTORY_GITHUB_URL/PAT supply the org credential, the user
+// identity status reader validates that env PAT server-side and binds the local
+// user without asking the setup wizard to paste the token again.
+func TestGitHubIdentityStatus_LocalEnvAutoBinds(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeLocal)
+	keyring.MockInit()
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	var gotAuth string
+	ghStub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/v3/user" {
+			http.NotFound(w, r)
+			return
+		}
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"login":"env-octo"}`)
+	}))
+	t.Cleanup(ghStub.Close)
+	t.Setenv("TRIAGE_FACTORY_GITHUB_URL", ghStub.URL)
+	t.Setenv("TRIAGE_FACTORY_GITHUB_PAT", "ghp_env_token")
+
+	rec := doJSON(t, s, "GET", "/api/orgs/"+runmode.LocalDefaultOrgID+"/identity/github", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var out githubIdentityStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !out.Connected || out.Login != "env-octo" || out.Host != ghStub.URL {
+		t.Fatalf("status = %+v, want connected env-octo on %s", out, ghStub.URL)
+	}
+	if gotAuth != "Bearer ghp_env_token" {
+		t.Errorf("whoami Authorization = %q, want env PAT", gotAuth)
+	}
+	login, err := s.users.GetGitHubLogin(ctx, runmode.LocalDefaultUserID, ghStub.URL)
+	if err != nil {
+		t.Fatalf("GetGitHubLogin: %v", err)
+	}
+	if login != "env-octo" {
+		t.Errorf("stored login = %q, want env-octo", login)
+	}
+}
+
 // TestGitHubConnect_IdentityPersistsAcrossLoginProvider closes the SKY-266
 // regression by construction: a connect_oauth binding must survive a
 // subsequent login under a non-GitHub provider (no user_name claim), where

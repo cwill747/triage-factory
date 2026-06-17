@@ -21,3 +21,15 @@ func SetAnthropicModelsURLForTest(t TestT, url string) {
 	anthropicModelsURL = url
 	t.Cleanup(func() { anthropicModelsURL = prev })
 }
+
+// SetKeychainAvailableForTest forces KeychainAvailable to report available for
+// the duration of t, so tests can exercise the keychain-up vs keychain-down
+// branches deterministically without depending on the host's real keychain (or
+// the probe's sync.Once cache). Test-only; mutates a package global, so callers
+// must not run in parallel with each other.
+func SetKeychainAvailableForTest(t TestT, available bool) {
+	t.Helper()
+	prev := keychainAvailableOverride
+	keychainAvailableOverride = &available
+	t.Cleanup(func() { keychainAvailableOverride = prev })
+}

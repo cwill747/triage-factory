@@ -4,10 +4,14 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 
 	"github.com/zalando/go-keyring"
+
+	"github.com/sky-ai-eng/triage-factory/internal/jira"
 )
 
 const service = "triagefactory"
@@ -67,6 +71,14 @@ func EnvProvided() []string {
 	return out
 }
 
+// EnvProvides reports whether the named credential group ("github" | "jira")
+// has values supplied by environment variables. A thin convenience over
+// EnvProvided for the common single-group check, so callers don't hand-roll
+// the slice scan (and can't drift from EnvProvided's group naming).
+func EnvProvides(group string) bool {
+	return slices.Contains(EnvProvided(), group)
+}
+
 // get retrieves a value from the keychain, returning empty string if not found.
 func get(key string) (string, error) {
 	val, err := keyring.Get(service, key)
@@ -94,6 +106,39 @@ func GetSecret(key string) (string, error) {
 		}
 	}
 	return get(key)
+}
+
+// EnvUserSecret applies the TRIAGE_FACTORY_* env overlay to a per-user secret
+// key, the per-user mirror of the org-key overlay GetSecret performs. It is the
+// single place the env overlay knows about per-user keys, so the local-mode
+// SecretStore stays a dumb key/value door and the credential-envelope shape has
+// one owner (this package already depends on internal/jira via ValidateJira).
+//
+// Today only the per-user Jira access token ("jira_token/<host>") has an env
+// source: when the env Jira URL canonicalizes to <host> and an env PAT is set,
+// it returns a Data Center PAT UserCredential envelope. Returns "" (no error)
+// when the key has no env source, the env Jira group isn't provided, or the env
+// host doesn't match the key's host.
+func EnvUserSecret(key string) (string, error) {
+	const jiraPrefix = "jira_token/"
+	if !strings.HasPrefix(key, jiraPrefix) {
+		return "", nil
+	}
+	if !EnvProvides("jira") {
+		return "", nil
+	}
+	envHost, ok := jira.CanonicalHost(os.Getenv(envKeys[keyJiraURL]))
+	if !ok || strings.TrimPrefix(key, jiraPrefix) != envHost {
+		return "", nil
+	}
+	pat := os.Getenv(envKeys[keyJiraPAT])
+	if pat == "" {
+		return "", nil
+	}
+	return jira.MarshalUserCredential(jira.UserCredential{
+		Method: jira.AuthMethodDCPAT,
+		Token:  pat,
+	})
 }
 
 // PutSecret writes value under key in the keychain. If the keychain
@@ -178,7 +223,23 @@ func logEnvOnce() {
 var (
 	keychainProbeOnce sync.Once
 	keychainOK        bool
+
+	// keychainAvailableOverride forces KeychainAvailable's result in tests
+	// (the real probe's sync.Once cache makes it otherwise un-resettable).
+	keychainAvailableOverride *bool
 )
+
+// KeychainAvailable reports whether the OS keychain backend is reachable.
+// Distinguishes "keychain down — env is the only credential source, so a read
+// error means the key is simply unconfigured" from "keychain up — a read error
+// is a genuine fault worth surfacing." Callers that overlay env credentials use
+// it to decide whether a keychain read error is safe to swallow.
+func KeychainAvailable() bool {
+	if keychainAvailableOverride != nil {
+		return *keychainAvailableOverride
+	}
+	return probeKeychain()
+}
 
 func probeKeychain() bool {
 	keychainProbeOnce.Do(func() {

@@ -17,6 +17,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/auth"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // The four well-known integration secret keys. The local SQLite shim
@@ -82,6 +83,9 @@ func Load(ctx context.Context, secrets db.SecretStore, orgID string) (auth.Crede
 	get := func(key string, dst *string) {
 		v, err := secrets.Get(ctx, orgID, key)
 		if err != nil {
+			if localEnvOverlayActive(orgID) {
+				return
+			}
 			errs = append(errs, fmt.Errorf("get %s: %w", key, err))
 			return
 		}
@@ -98,6 +102,21 @@ func Load(ctx context.Context, secrets db.SecretStore, orgID string) (auth.Crede
 		return creds, errors.Join(errs...)
 	}
 	return creds, nil
+}
+
+// localEnvOverlayActive reports whether a keychain read error is safe to
+// swallow as "this key is simply unconfigured" rather than a fault to surface.
+// True only in local mode, for the local default org, with env credentials
+// present AND the keychain backend unavailable — the headless deploy the env
+// overlay exists for, where every keychain read errors and absent keys are
+// genuinely unset. When the keychain IS reachable a read error is a real fault
+// (a transient blip on an actually-configured integration), so it must not be
+// masked — surfacing it is the whole point of separating the two cases.
+func localEnvOverlayActive(orgID string) bool {
+	return runmode.Current() == runmode.ModeLocal &&
+		orgID == runmode.LocalDefaultOrgID &&
+		len(auth.EnvProvided()) > 0 &&
+		!auth.KeychainAvailable()
 }
 
 // LoadSystem is the system/background twin of Load: it reads the exact same
@@ -122,6 +141,9 @@ func LoadSystem(ctx context.Context, secrets db.SecretStore, orgID string) (auth
 	get := func(key string, dst *string) {
 		v, err := secrets.GetSystem(ctx, orgID, key)
 		if err != nil {
+			if localEnvOverlayActive(orgID) {
+				return
+			}
 			errs = append(errs, fmt.Errorf("get %s: %w", key, err))
 			return
 		}

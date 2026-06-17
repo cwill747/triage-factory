@@ -19,6 +19,8 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	ghclient "github.com/sky-ai-eng/triage-factory/internal/github"
+	"github.com/sky-ai-eng/triage-factory/internal/integrations"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // Connect GitHub — the user-to-server OAuth handler that binds a
@@ -329,23 +331,31 @@ func (s *Server) handleGitHubIdentityStatus(w http.ResponseWriter, r *http.Reque
 		login            string
 		host             string
 		connectAvailable bool
+		envGitHubPAT     string
 	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		orgSet, lerr := tx.Orgs.GetSettings(r.Context(), orgID)
 		if lerr != nil {
 			return lerr
 		}
-		ghWeb, okHost := resolveGitHubHost(orgSet.GitHubBaseURL)
+		// Best-effort: legacy/env local installs may have only SecretStore URLs,
+		// with org_settings still blank. Identity must key off the same effective
+		// host Settings shows.
+		creds, _ := integrations.Load(r.Context(), tx.Secrets, orgID)
+		ghWeb, okHost := resolveGitHubHost(effectiveGitHubIdentityBaseURL(orgSet, creds))
 		if okHost {
 			host = ghWeb
 			login, lerr = tx.Users.GetGitHubLogin(r.Context(), userID, ghWeb)
 			if lerr != nil {
 				return lerr
 			}
+			if login == "" && runmode.Current() == runmode.ModeLocal && envProvides("github") {
+				envGitHubPAT = creds.GitHubPAT
+			}
 		} else {
 			// Malformed host config — surface the raw value for display but
 			// report not-connected (we can't key a lookup off a bad host).
-			host = ghclient.ResolveBaseURL(orgSet.GitHubBaseURL)
+			host = ghclient.ResolveBaseURL(effectiveGitHubIdentityBaseURL(orgSet, creds))
 		}
 		app, lerr := tx.GitHubApps.GetForOrg(r.Context(), orgID)
 		if lerr != nil {
@@ -364,6 +374,21 @@ func (s *Server) handleGitHubIdentityStatus(w http.ResponseWriter, r *http.Reque
 	}); err != nil {
 		internalError(w, "github-identity", err)
 		return
+	}
+	if login == "" && host != "" && envGitHubPAT != "" {
+		ghUser, err := auth.ValidateGitHub(r.Context(), host, envGitHubPAT)
+		if err != nil {
+			log.Printf("[github-identity] local env GitHub identity auto-bind skipped for user=%s host=%s org=%s: %v", userID, host, orgID, err)
+		} else if ghUser.Login != "" {
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				return tx.Users.UpsertGitHubIdentity(r.Context(), userID, host, ghUser.Login, "pat")
+			}); err != nil {
+				internalError(w, "github-identity", err)
+				return
+			}
+			login = ghUser.Login
+			log.Printf("[github-identity] bound user=%s login=%s host=%s org=%s source=pat env=true", userID, login, host, orgID)
+		}
 	}
 
 	writeJSON(w, http.StatusOK, githubIdentityStatusResponse{
@@ -421,6 +446,11 @@ func (s *Server) handleGitHubIdentityPAT(w http.ResponseWriter, r *http.Request)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		var lerr error
 		orgSet, lerr = tx.Orgs.GetSettings(r.Context(), orgID)
+		if lerr != nil {
+			return lerr
+		}
+		creds, _ := integrations.Load(r.Context(), tx.Secrets, orgID)
+		orgSet.GitHubBaseURL = effectiveGitHubIdentityBaseURL(orgSet, creds)
 		return lerr
 	}); err != nil {
 		internalError(w, "github-identity", err)

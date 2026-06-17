@@ -356,6 +356,44 @@ func TestJiraIdentityStatus(t *testing.T) {
 	}
 }
 
+// TestJiraIdentityStatus_LocalEnvAutoBinds pins the headless local bootstrap
+// path: when TRIAGE_FACTORY_JIRA_URL/PAT supply the org credential, the user
+// status reader validates that env PAT server-side and binds the local user's
+// Jira identity without requiring another paste in the setup wizard.
+func TestJiraIdentityStatus_LocalEnvAutoBinds(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeLocal)
+	keyring.MockInit()
+	s := newTestServer(t)
+	ctx := context.Background()
+
+	var gotAuth string
+	jiraStub := jiraMyselfStub(t, `{"accountId":"env-acc","displayName":"Env Jira"}`, &gotAuth)
+	t.Setenv("TRIAGE_FACTORY_JIRA_URL", jiraStub.URL)
+	t.Setenv("TRIAGE_FACTORY_JIRA_PAT", "jira_env_token")
+
+	rec := doJSON(t, s, "GET", "/api/orgs/"+runmode.LocalDefaultOrgID+"/identity/jira", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s, want 200", rec.Code, rec.Body.String())
+	}
+	var out jiraIdentityStatusResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !out.Connected || out.Account != "Env Jira" || out.Host != jiraStub.URL {
+		t.Fatalf("status = %+v, want connected Env Jira on %s", out, jiraStub.URL)
+	}
+	if gotAuth != "Bearer jira_env_token" {
+		t.Errorf("myself Authorization = %q, want env PAT", gotAuth)
+	}
+	accountID, displayName, err := s.users.GetJiraIdentity(ctx, runmode.LocalDefaultUserID, jiraStub.URL)
+	if err != nil {
+		t.Fatalf("GetJiraIdentity: %v", err)
+	}
+	if accountID != "env-acc" || displayName != "Env Jira" {
+		t.Errorf("identity = (%q, %q), want (env-acc, Env Jira)", accountID, displayName)
+	}
+}
+
 // TestJiraIdentityStatus_StaleCrossSchemeCredential_NotConnected pins the
 // status reader's deployment-match guard: a user with a stored Data Center PAT
 // whose org later flips to Cloud (a DC→Cloud cutover) reports connected=false —

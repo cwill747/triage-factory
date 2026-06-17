@@ -17,6 +17,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	"github.com/sky-ai-eng/triage-factory/internal/jira"
 	"github.com/sky-ai-eng/triage-factory/internal/jiraoauth"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
 // Per-user Jira access — the Jira sibling of the GitHub per-user identity flow
@@ -105,18 +106,23 @@ func (s *Server) handleJiraIdentityStatus(w http.ResponseWriter, r *http.Request
 		account    string
 		host       string
 		deployment string
+		envJiraPAT string
 	)
 	if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		orgSet, lerr := tx.Orgs.GetSettings(r.Context(), orgID)
 		if lerr != nil {
 			return lerr
 		}
-		jiraHost, okHost := resolveJiraHost(orgSet.JiraBaseURL)
+		// Best-effort: env-overlay/legacy local installs may have only
+		// SecretStore URLs, with org_settings still blank. Identity/access must
+		// key off the same effective host Settings shows.
+		creds, _ := integrations.Load(r.Context(), tx.Secrets, orgID)
+		jiraHost, okHost := resolveJiraHost(effectiveJiraIdentityBaseURL(orgSet, creds))
 		if !okHost {
 			// No (or malformed) Jira host configured — surface the raw value
 			// for display but report not-connected (no host to key a lookup
 			// off). Mirrors the GitHub status reader's bad-host branch.
-			host = strings.TrimRight(strings.TrimSpace(orgSet.JiraBaseURL), "/")
+			host = strings.TrimRight(strings.TrimSpace(effectiveJiraIdentityBaseURL(orgSet, creds)), "/")
 			return nil
 		}
 		host = jiraHost
@@ -129,10 +135,16 @@ func (s *Server) handleJiraIdentityStatus(w http.ResponseWriter, r *http.Request
 		// integrations.Load uses on the request path).
 		method, lerr := tx.Secrets.Get(r.Context(), orgID, integrations.KeyJiraAuthMethod)
 		if lerr != nil {
-			return lerr
+			if !(runmode.Current() == runmode.ModeLocal && envProvides("jira")) {
+				return lerr
+			}
+			method = creds.JiraAuthMethod
 		}
 		deploymentEnum := jira.DeploymentForMarker(jira.AuthMethod(method), jiraHost)
 		deployment = string(deploymentEnum)
+		if runmode.Current() == runmode.ModeLocal && deploymentEnum == jira.DeploymentDataCenter && envProvides("jira") {
+			envJiraPAT = creds.JiraPAT
+		}
 
 		// Claims-checked GetUser (NOT GetUserSystem): this is a request
 		// handler, so the credential read runs on the app pool under the
@@ -180,6 +192,25 @@ func (s *Server) handleJiraIdentityStatus(w http.ResponseWriter, r *http.Request
 	}); err != nil {
 		internalError(w, "jira-identity", err)
 		return
+	}
+	if host != "" && envJiraPAT != "" && (!connected || account == "") {
+		jiraUser, err := auth.ValidateJira(r.Context(), jira.DataCenterPAT(host, envJiraPAT))
+		if err != nil {
+			log.Printf("[jira-identity] local env Jira access auto-bind skipped for user=%s host=%s org=%s: %v", userID, host, orgID, err)
+		} else if jiraUser.StableID() != "" {
+			if err := s.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+				return tx.Users.UpsertJiraIdentity(r.Context(), userID, host, jiraUser.StableID(), jiraUser.DisplayName, "pat")
+			}); err != nil {
+				internalError(w, "jira-identity", err)
+				return
+			}
+			connected = true
+			account = jiraUser.DisplayName
+			if account == "" {
+				account = jiraUser.StableID()
+			}
+			log.Printf("[jira-identity] bound user=%s account=%s host=%s org=%s source=pat env=true", userID, jiraUser.StableID(), host, orgID)
+		}
 	}
 
 	// connect_available is true exactly when an Atlassian OAuth app resolves
@@ -261,7 +292,13 @@ func (s *Server) handleJiraIdentityPAT(w http.ResponseWriter, r *http.Request) {
 		if lerr != nil {
 			return lerr
 		}
+		creds, _ := integrations.Load(r.Context(), tx.Secrets, orgID)
+		orgSet.JiraBaseURL = effectiveJiraIdentityBaseURL(orgSet, creds)
 		authMethod, lerr = tx.Secrets.Get(r.Context(), orgID, integrations.KeyJiraAuthMethod)
+		if lerr != nil && runmode.Current() == runmode.ModeLocal && envProvides("jira") {
+			authMethod = creds.JiraAuthMethod
+			lerr = nil
+		}
 		return lerr
 	}); err != nil {
 		internalError(w, "jira-identity", err)

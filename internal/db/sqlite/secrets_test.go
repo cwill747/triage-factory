@@ -2,6 +2,7 @@ package sqlite_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/zalando/go-keyring"
@@ -303,6 +304,40 @@ func TestSecretStore_SQLite_PerUserKeychainRoundTrip(t *testing.T) {
 	}
 	if got != "" {
 		t.Errorf("after DeleteUser got=%q want empty", got)
+	}
+}
+
+// TestSecretStore_SQLite_PerUserJiraFallsBackToEnv pins the headless local-mode
+// path: TRIAGE_FACTORY_JIRA_URL/PAT can supply the single local user's Jira
+// credential even when no per-user keychain entry exists.
+func TestSecretStore_SQLite_PerUserJiraFallsBackToEnv(t *testing.T) {
+	keyring.MockInit()
+	conn := openSQLiteForTest(t)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+	org := runmode.LocalDefaultOrg
+	const userID = "11111111-1111-1111-1111-111111111111"
+
+	t.Setenv("TRIAGE_FACTORY_JIRA_URL", "https://jira.example.com")
+	t.Setenv("TRIAGE_FACTORY_JIRA_PAT", "jira-env-pat")
+
+	got, err := stores.Secrets.GetUser(ctx, org, userID, "jira_token/https://jira.example.com")
+	if err != nil {
+		t.Fatalf("GetUser env fallback: %v", err)
+	}
+	if got == "" {
+		t.Fatal("GetUser env fallback returned empty credential")
+	}
+	if !strings.Contains(got, `"method":"dc_pat"`) || !strings.Contains(got, `"token":"jira-env-pat"`) {
+		t.Errorf("GetUser env fallback got %q, want dc_pat envelope with env token", got)
+	}
+
+	sysGot, err := stores.Secrets.GetUserSystem(ctx, org, userID, "jira_token/https://jira.example.com")
+	if err != nil {
+		t.Fatalf("GetUserSystem env fallback: %v", err)
+	}
+	if sysGot != got {
+		t.Errorf("GetUserSystem env fallback = %q, want %q", sysGot, got)
 	}
 }
 
