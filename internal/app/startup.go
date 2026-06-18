@@ -11,6 +11,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/integrations"
 	"github.com/sky-ai-eng/triage-factory/internal/routing"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
+	"github.com/sky-ai-eng/triage-factory/internal/server"
 	"github.com/sky-ai-eng/triage-factory/internal/skills"
 	"github.com/sky-ai-eng/triage-factory/internal/worktree"
 	"github.com/sky-ai-eng/triage-factory/pkg/websocket"
@@ -23,6 +24,19 @@ import (
 func (a *App) runStartupTasks(ctx context.Context) {
 	if a.local() {
 		a.wireCloneStatusCallback()
+		// Headless env-driven provisioning (TFAC-411): when TF_HEADLESS is set,
+		// provision the local tenant and seed repos / Jira / identity from env so
+		// a keychain-less, browser-less install reaches setup_complete. Runs
+		// before startPolling → bootstrapBareClones so the seeded repos clone on
+		// the first cycle. Local-mode only; if the seed vars are set without the
+		// trigger, warn rather than silently ignore them.
+		if server.HeadlessEnabled() {
+			if err := a.srv.RunHeadlessBootstrap(ctx); err != nil {
+				bootstrapLog.Error("headless bootstrap failed", "error", err)
+			}
+		} else {
+			server.WarnIfHeadlessSeedVarsOrphaned()
+		}
 	}
 	a.cleanupWorktrees(ctx)
 	if a.local() {
@@ -212,11 +226,21 @@ func (a *App) startKnowledgeWatcher() {
 // repo_profiles.clone_url; targets without a CloneURL are skipped). DB read
 // errors are logged and skipped — the lazy clone inside CreateForPR /
 // CreateForBranch recovers affected delegations on the next run.
-func bootstrapBareClones(repos db.RepoStore) {
+func bootstrapBareClones(repos db.RepoStore, secrets db.SecretStore) {
 	profiles, err := repos.ListSystem(context.Background(), runmode.LocalDefaultOrgID)
 	if err != nil {
 		worktreeLog.Warn("bootstrap: load profiles failed", "error", err)
 		return
+	}
+	// Load the org bot PAT once so HTTPS clones of private repos authenticate.
+	// CloneAuthFor (applied per-target in BootstrapBareClones) no-ops on an SSH
+	// CloneURL or an empty token, so the SSH default and public-repo paths are
+	// unaffected — this only matters for the https-pinned headless install.
+	// Best-effort: a load failure leaves the token empty and falls back to the
+	// prior unauthenticated behavior rather than blocking the warm pass.
+	creds, cerr := integrations.LoadSystem(context.Background(), secrets, runmode.LocalDefaultOrgID)
+	if cerr != nil {
+		worktreeLog.Warn("bootstrap: load credentials failed; HTTPS clones of private repos may fail to warm", "error", cerr)
 	}
 	targets := make([]worktree.BootstrapTarget, 0, len(profiles))
 	for _, p := range profiles {
@@ -224,6 +248,7 @@ func bootstrapBareClones(repos db.RepoStore) {
 			Owner:    p.Owner,
 			Repo:     p.Repo,
 			CloneURL: p.CloneURL,
+			Token:    creds.GitHubPAT,
 		})
 	}
 	worktree.BootstrapBareClones(context.Background(), targets)
