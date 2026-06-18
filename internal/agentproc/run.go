@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
 )
 
@@ -303,6 +305,17 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 		cmd = sandboxCmd
 	} else {
 		nodeArgs := append([]string{wrapperPath}, BuildArgs(opts)...)
+		// Local-mode TF_CLAUDE_BINARY override (non-sandbox path only): point the
+		// SDK at a specific Claude binary. Validated here so a bad path fails the
+		// spawn with a clear message rather than an opaque SDK exec error. The
+		// sandbox branch deliberately ignores it — it runs the image-baked binary.
+		bin, berr := claudeBinaryOverride()
+		if berr != nil {
+			return nil, berr
+		}
+		if bin != "" {
+			nodeArgs = append(nodeArgs, "--claude-bin", bin)
+		}
 		directCmd, derr := newDirectCommand(runCtx, opts, nodeArgs)
 		if derr != nil {
 			return nil, derr
@@ -595,6 +608,47 @@ func newDirectCommand(runCtx context.Context, opts RunOptions, nodeArgs []string
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	}
 	return cmd, nil
+}
+
+// envClaudeBinary is the local-mode override for the Claude binary the Agent
+// SDK launches. Honored only on the direct (non-sandbox) spawn path; the
+// sandboxed multi-tenant path runs the image-baked binary and ignores it.
+const envClaudeBinary = "TF_CLAUDE_BINARY"
+
+// claudeBinaryOverride resolves TF_CLAUDE_BINARY to an absolute path to an
+// executable file, or "" when unset (normal binary resolution). A set-but-
+// unusable value — missing, a directory, or not executable — is a hard error:
+// an explicit override that's wrong should fail the spawn loudly rather than
+// silently fall back to the bundled binary and mask the misconfiguration.
+func claudeBinaryOverride() (string, error) {
+	// Local mode only — independent of the sandbox routing. shouldSandbox() is
+	// (ModeMulti && Linux), so a multi-mode process on a non-Linux host would
+	// otherwise take the direct spawn path and honor this global override,
+	// undercutting the image-baked-binary assumption. Gating on the mode here
+	// keeps the behavior matching the docs and survives any change to where the
+	// sandbox/direct split is drawn.
+	if runmode.Current() != runmode.ModeLocal {
+		return "", nil
+	}
+	raw := strings.TrimSpace(os.Getenv(envClaudeBinary))
+	if raw == "" {
+		return "", nil
+	}
+	abs, err := filepath.Abs(raw)
+	if err != nil {
+		return "", fmt.Errorf("%s=%q: %w", envClaudeBinary, raw, err)
+	}
+	info, err := os.Stat(abs)
+	if err != nil {
+		return "", fmt.Errorf("%s=%q: %w", envClaudeBinary, raw, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("%s=%q is a directory, not a Claude binary", envClaudeBinary, raw)
+	}
+	if info.Mode()&0o111 == 0 {
+		return "", fmt.Errorf("%s=%q is not executable", envClaudeBinary, raw)
+	}
+	return abs, nil
 }
 
 // maxStreamLineBytes caps a single NDJSON line. Well above any
