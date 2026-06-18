@@ -11,6 +11,7 @@ package httpx
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -19,6 +20,13 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/logging"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
+
+// StatusClientClosedRequest is the non-standard 499 code (the nginx
+// convention for "client closed the request before the server answered").
+// net/http defines no constant for it. InternalError records it instead of a
+// 500 when a handler's error is really a canceled request context, so an
+// aborted request stays out of 5xx logs and metrics.
+const StatusClientClosedRequest = 499
 
 // --- JSON responses ---
 
@@ -36,12 +44,50 @@ func WriteJSON(w http.ResponseWriter, status int, v any) {
 // paths, internal IDs) must not leak to other tenants' browsers. scope is the
 // short subsystem tag (e.g. "tasks", "projects", "reviews").
 func InternalError(w http.ResponseWriter, scope string, err error) {
+	// A canceled request context means the caller went away (navigation,
+	// component remount, React StrictMode double-fire) before the handler
+	// finished — the cancellation propagated up through whatever query was
+	// mid-flight. That's not a server fault: an error-level log pages on-call
+	// and a 500 inflates 5xx metrics for a client we can no longer reach.
+	// Record a 499 with a debug breadcrumb instead. The header write is
+	// best-effort — the socket is usually already closed and net/http drops the
+	// write silently.
+	//
+	// Only context.Canceled qualifies, NOT context.DeadlineExceeded: a client
+	// disconnect cancels r.Context() with Canceled, whereas DeadlineExceeded
+	// almost always comes from a server-imposed deadline (a handler's
+	// context.WithTimeout around a slow query/upstream call) — a real fault the
+	// caller may still be waiting on, so it keeps its error log + 500 rather
+	// than being masked as a 499.
+	if IsClientGone(err) {
+		logging.Component(scope).Debug("request canceled by client", "error", err)
+		w.WriteHeader(StatusClientClosedRequest)
+		return
+	}
 	logging.Component(scope).Error("handler error", "error", err)
 	msg := err.Error()
 	if runmode.Current() == runmode.ModeMulti {
 		msg = "internal server error"
 	}
 	WriteJSON(w, http.StatusInternalServerError, map[string]string{"error": msg})
+}
+
+// IsClientGone reports whether err carries a canceled request context — the
+// signature of a caller that disconnected while a handler was mid-flight. The
+// cancellation surfaces from whatever query was running when it tripped,
+// usually wrapped (fmt.Errorf("...: %w", err)), so this matches via errors.Is
+// rather than equality. Callers treat a true result as "the caller is gone,"
+// not a server error — see InternalError.
+//
+// Deliberately scoped to context.Canceled only. context.DeadlineExceeded is
+// excluded because it almost always signals a server-imposed timeout (a
+// handler's context.WithTimeout on a DB/external call), not a vanished client —
+// treating that as client-gone would swallow a genuine server fault the caller
+// may still be waiting on. Exported alongside IsUniqueViolation as part of the
+// kernel's error vocabulary so other choke points can share the one definition
+// instead of re-deriving the check.
+func IsClientGone(err error) bool {
+	return errors.Is(err, context.Canceled)
 }
 
 // NotFound writes a 404 with a "<thing> not found" message. Centralized so the
