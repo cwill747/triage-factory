@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor } from '@testing-library/react'
+import { MemoryRouter } from 'react-router-dom'
 import { HttpError } from '../lib/apiClient'
 import type { PendingInvite } from '../types'
 
@@ -11,9 +12,13 @@ vi.mock('../lib/apiClient', async (importOriginal) => {
   return { ...actual, apiJSON: apiMocks.apiJSON, apiFetch: apiMocks.apiFetch }
 })
 
-// Admin viewer in a concrete active org.
+// Admin viewer in a concrete active org, with org-template access — so the
+// People tab (these tests' subject) and the admin tabs all gate open.
 vi.mock('../hooks/useOrgRole', () => ({
   useOrgRole: () => ({ role: 'admin', isAdmin: true, loading: false }),
+}))
+vi.mock('../hooks/useTemplateScope', () => ({
+  useTemplateScope: () => ({ available: true, ready: true, loading: false }),
 }))
 vi.mock('../contexts/OrgContext', () => ({ useActiveOrgId: () => 'org-1' }))
 vi.mock('../hooks/useTeams', () => ({
@@ -30,6 +35,17 @@ vi.mock('../hooks/useTeams', () => ({
 }))
 
 import OrgPage from './OrgPage'
+
+// OrgPage reads the active tab from the URL (useSearchParams), so it needs a
+// router context. MemoryRouter at its default entry leaves ?tab unset, so the
+// People tab — these tests' subject — is the default.
+function renderPage() {
+  return render(
+    <MemoryRouter>
+      <OrgPage />
+    </MemoryRouter>,
+  )
+}
 
 const OWNER_ROW = {
   user_id: 'u-owner',
@@ -76,13 +92,13 @@ beforeEach(() => {
 
 describe('OrgPage — pending invites', () => {
   it('renders pending invites as muted ghost rows', async () => {
-    render(<OrgPage />)
+    renderPage()
     expect(await screen.findByText('bob@example.com')).toBeInTheDocument()
     expect(screen.getByText(/pending · invited/i)).toBeInTheDocument()
   })
 
   it('hides and shows the ghost rows via the Show invited toggle', async () => {
-    render(<OrgPage />)
+    renderPage()
     await screen.findByText('bob@example.com')
 
     const toggle = screen.getByRole('switch', { name: /show invited/i })
@@ -94,7 +110,7 @@ describe('OrgPage — pending invites', () => {
   })
 
   it('Revoke hits POST /api/invites/{id}/revoke', async () => {
-    render(<OrgPage />)
+    renderPage()
     await screen.findByText('bob@example.com')
 
     fireEvent.click(screen.getByRole('button', { name: /revoke/i }))
@@ -106,7 +122,7 @@ describe('OrgPage — pending invites', () => {
   })
 
   it('Resend revokes the old token then re-creates the invite', async () => {
-    render(<OrgPage />)
+    renderPage()
     await screen.findByText('bob@example.com')
 
     fireEvent.click(screen.getByRole('button', { name: /resend/i }))
@@ -141,7 +157,7 @@ describe('OrgPage — pending invites', () => {
       throw new Error('unexpected apiJSON path: ' + path)
     })
 
-    render(<OrgPage />)
+    renderPage()
     await screen.findByText('bob@example.com')
 
     fireEvent.click(screen.getByRole('button', { name: /resend/i }))
@@ -151,7 +167,7 @@ describe('OrgPage — pending invites', () => {
   })
 
   it('opens the invite modal from the + Invite affordance', async () => {
-    render(<OrgPage />)
+    renderPage()
     await screen.findByText('bob@example.com')
 
     fireEvent.click(screen.getByRole('button', { name: /^invite$/i }))
