@@ -643,7 +643,16 @@ func (s *Server) routes() {
 	s.api("GET /api/teams", th.handleTeamsList)
 	s.apiMutating("POST /api/teams", th.handleTeamCreate)
 
-	// Org invites (TFAC-416, multi-mode only — each handler 404s in local).
+	// Org People roster: list members + change role + remove.
+	// Multi-mode only (each handler 404s in local). GET is any-member;
+	// PATCH/DELETE gate org-admin (DELETE also allows a self-leave). The
+	// last-owner guard is a DB trigger surfaced as a 409.
+	omh := &orgMembersHandler{tx: s.tx, az: s.az}
+	s.api("GET /api/orgs/{org_id}/members", omh.handleOrgMembersList)
+	s.apiMutating("PATCH /api/orgs/{org_id}/members/{user_id}", omh.handleOrgMemberRoleChange)
+	s.apiMutating("DELETE /api/orgs/{org_id}/members/{user_id}", omh.handleOrgMemberRemove)
+
+	// Org invites (multi-mode only — each handler 404s in local).
 	// The admin-facing create/list/revoke gate on org-admin and write
 	// through the app pool; preview + accept are the redeem surfaces and run
 	// on the admin pool (the redeem actor holds a token but no membership).
