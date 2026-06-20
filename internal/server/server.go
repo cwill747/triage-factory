@@ -696,8 +696,31 @@ func (s *Server) routes() {
 	// holder. Listed in preAuthAllowlist.
 	s.mux.HandleFunc("GET /api/invites/preview", ih.handleInvitePreview)
 
-	// Per-org SSO domain claim + DNS-TXT verification (multi-mode only — each
-	// handler 404s in local). All four routes gate on org-admin and write
+	// Per-org SSO connection (TFAC-424, epic TFAC-422) — org-admin-gated,
+	// multi-mode only (each handler 404s in local). POST registers the org's
+	// IdP connection with GoTrue (minting a service_role token server-side)
+	// and writes the TF-owned sso_connections binding; GET returns it plus
+	// the SP Entity-ID/ACS values the operator pastes into Entra; PATCH
+	// enables/disables it. gotrueURL + publicURL are read lazily because
+	// authCfg/deployCfg land after routes() runs.
+	ssoc := &ssoConnectionHandler{
+		tx:        s.tx,
+		az:        s.az,
+		client:    ssoHTTPClient,
+		gotrueURL: s.gotrueAdminBaseURL,
+		publicURL: func() string {
+			if s.deployCfg == nil {
+				return ""
+			}
+			return s.deployCfg.publicURL
+		},
+	}
+	s.api("GET /api/sso/connection", ssoc.handleSSOConnectionGet)
+	s.apiMutating("POST /api/sso/connection", ssoc.handleSSOConnectionCreate)
+	s.apiMutating("PATCH /api/sso/connection", ssoc.handleSSOConnectionUpdate)
+
+	// Per-org SSO domain claim + DNS-TXT verification (TFAC-428; multi-mode only
+	// — each handler 404s in local). All four routes gate on org-admin and write
 	// through the app pool (sso_domains_* RLS). Verify additionally does a
 	// live DNS TXT lookup via the stdlib resolver; only a verified domain
 	// routes logins, and the verify path enforces deployment-wide
