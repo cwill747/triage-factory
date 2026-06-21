@@ -27,12 +27,13 @@ import (
 // Raw maps are kept addressable so downstream callers (D7 /api/me, public.users
 // sync) can pull provider-specific fields without re-parsing.
 type Claims struct {
-	Subject      string
-	Email        string
-	Provider     string
-	UserMetadata map[string]any
-	AppMetadata  map[string]any
-	ExpiresAt    time.Time
+	Subject       string
+	Email         string
+	EmailVerified bool
+	Provider      string
+	UserMetadata  map[string]any
+	AppMetadata   map[string]any
+	ExpiresAt     time.Time
 }
 
 // Verifier validates signed JWTs against a remote JWKS. Safe for concurrent use.
@@ -109,6 +110,15 @@ func extractClaims(mc jwt.MapClaims) (*Claims, error) {
 	}
 	if userMeta, ok := mc["user_metadata"].(map[string]any); ok {
 		out.UserMetadata = userMeta
+	}
+
+	// email_verified gates verified-email account linking. GoTrue emits it
+	// top-level for a confirmed email and mirrors it into user_metadata for the
+	// social/SAML providers; read either, defaulting to false (no link).
+	if ev, ok := mc["email_verified"].(bool); ok {
+		out.EmailVerified = ev
+	} else if out.UserMetadata != nil {
+		out.EmailVerified, _ = out.UserMetadata["email_verified"].(bool)
 	}
 
 	expAt, err := mc.GetExpirationTime()

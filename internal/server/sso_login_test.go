@@ -71,12 +71,13 @@ func (r *authRig) seedAuthOnlyUser() uuid.UUID {
 // upsertUserFromClaims won't mint a github identity row from it.
 func validSAMLClaimsFor(userID uuid.UUID, jwtProviderID string) jwt.MapClaims {
 	return jwt.MapClaims{
-		"sub":   userID.String(),
-		"email": userID.String() + "@corp.example",
-		"iss":   testIssuer,
-		"aud":   testAudience,
-		"exp":   time.Now().Add(1 * time.Hour).Unix(),
-		"iat":   time.Now().Unix(),
+		"sub":            userID.String(),
+		"email":          userID.String() + "@corp.example",
+		"email_verified": true, // SAML assertion emails are verified by definition
+		"iss":            testIssuer,
+		"aud":            testAudience,
+		"exp":            time.Now().Add(1 * time.Hour).Unix(),
+		"iat":            time.Now().Unix(),
 		"app_metadata": map[string]any{
 			"provider":  "sso:" + jwtProviderID,
 			"providers": []any{"sso:" + jwtProviderID},
@@ -160,6 +161,21 @@ func (r *authRig) membershipCount(userID, orgID uuid.UUID) int {
 	return n
 }
 
+// principalOf resolves a GoTrue login identity (auth.users id) to its principal
+// (public.users id) via the user_identities link the callback writes. A genuine
+// first login mints a fresh principal, so memberships land on the principal, not
+// the auth identity — assertions must key on this.
+func (r *authRig) principalOf(authUserID uuid.UUID) uuid.UUID {
+	r.t.Helper()
+	var pid uuid.UUID
+	if err := r.h.AdminDB.QueryRow(
+		`SELECT user_id FROM user_identities WHERE auth_user_id = $1`, authUserID,
+	).Scan(&pid); err != nil {
+		r.t.Fatalf("resolve principal for identity %s: %v", authUserID, err)
+	}
+	return pid
+}
+
 // ---------- callback / JIT tests ----------
 
 // Existing member via SAML → session, lands in their org.
@@ -215,12 +231,13 @@ func TestSSOLogin_NewUser_JITProvisionsMember(t *testing.T) {
 	}
 	sid := r.sidFromResp(resp)
 
-	if got := r.membershipCount(user, uuid.Nil); got != 1 {
+	principal := r.principalOf(user)
+	if got := r.membershipCount(principal, uuid.Nil); got != 1 {
 		t.Fatalf("memberships=%d, want exactly 1", got)
 	}
 	var gotOrg, gotRole string
 	if err := r.h.AdminDB.QueryRow(
-		`SELECT org_id::text, role FROM org_memberships WHERE user_id=$1`, user,
+		`SELECT org_id::text, role FROM org_memberships WHERE user_id=$1`, principal,
 	).Scan(&gotOrg, &gotRole); err != nil {
 		t.Fatalf("read membership: %v", err)
 	}
@@ -260,10 +277,11 @@ func TestSSOLogin_Isolation_ProviderBoundToANeverProvisionsB(t *testing.T) {
 	}
 	sid := r.sidFromResp(resp)
 
-	if got := r.membershipCount(user, orgA); got != 1 {
+	principal := r.principalOf(user)
+	if got := r.membershipCount(principal, orgA); got != 1 {
 		t.Errorf("org A memberships=%d, want 1", got)
 	}
-	if got := r.membershipCount(user, orgB); got != 0 {
+	if got := r.membershipCount(principal, orgB); got != 0 {
 		t.Errorf("LEAK: org B memberships=%d, want 0 — A's provider provisioned into B", got)
 	}
 	if me := r.me(sid); me.ActiveOrgID != orgA.String() {
@@ -318,7 +336,7 @@ func TestSSOLogin_NoMatchingConnection_FallsToOnboarding(t *testing.T) {
 	}
 	sid := r.sidFromResp(resp)
 
-	if got := r.membershipCount(user, uuid.Nil); got != 0 {
+	if got := r.membershipCount(r.principalOf(user), uuid.Nil); got != 0 {
 		t.Errorf("memberships=%d, want 0 (no accidental provisioning without a binding)", got)
 	}
 	me := r.me(sid)
@@ -343,7 +361,7 @@ func TestSSOLogin_DisabledConnection_NoProvisioning(t *testing.T) {
 	if resp.StatusCode != http.StatusFound {
 		t.Fatalf("callback status=%d, want 302", resp.StatusCode)
 	}
-	if got := r.membershipCount(user, uuid.Nil); got != 0 {
+	if got := r.membershipCount(r.principalOf(user), uuid.Nil); got != 0 {
 		t.Errorf("memberships=%d, want 0 (a disabled connection must not JIT)", got)
 	}
 }
@@ -364,7 +382,7 @@ func TestSSOLogin_WritesNoGitHubIdentityRow(t *testing.T) {
 
 	var n int
 	if err := r.h.AdminDB.QueryRow(
-		`SELECT count(*) FROM user_github_identities WHERE user_id = $1`, user,
+		`SELECT count(*) FROM user_github_identities WHERE user_id = $1`, r.principalOf(user),
 	).Scan(&n); err != nil {
 		t.Fatalf("count github identities: %v", err)
 	}
@@ -563,5 +581,92 @@ func TestGoTrueSSO_Non303_Errors(t *testing.T) {
 	cfg := &authConfig{gotrueURL: upstream.URL}
 	if _, err := srv.gotrueSSOFunc(cfg)(context.Background(), "p", "r", "c"); err == nil {
 		t.Fatal("expected an error for a non-303 /sso response, got nil")
+	}
+}
+
+// Verified-email linking: two DISTINCT GoTrue login identities carrying the same
+// verified email must resolve to ONE principal. Drives the full callback, so it
+// also guards the verifier's email_verified extraction: if that regressed to
+// always-false, no link would happen and the identities would fork into separate
+// principals, failing here. Both legs are GitHub callbacks to isolate the
+// verifier + link logic; the real cross-provider GitHub→SAML round-trip (where
+// the second leg also skips the github-identity write) is
+// TestSSOLogin_SAMLEmailLinksExistingGitHubPrincipal.
+func TestSSOLogin_VerifiedEmailLinksToOnePrincipal(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	r := newAuthRig(t)
+
+	const email = "shared@corp.example"
+	authA := r.seedAuthOnlyUser()
+	authB := r.seedAuthOnlyUser()
+
+	withVerifiedEmail := func(id uuid.UUID) jwt.MapClaims {
+		c := validClaimsFor(id)
+		c["email"] = email
+		c["email_verified"] = true
+		return c
+	}
+
+	if resp, _ := r.driveCallbackClaims(withVerifiedEmail(authA)); resp.StatusCode != http.StatusFound {
+		t.Fatalf("login A status=%d, want 302", resp.StatusCode)
+	}
+	if resp, _ := r.driveCallbackClaims(withVerifiedEmail(authB)); resp.StatusCode != http.StatusFound {
+		t.Fatalf("login B status=%d, want 302", resp.StatusCode)
+	}
+	if pA, pB := r.principalOf(authA), r.principalOf(authB); pA != pB {
+		t.Fatalf("identities with the same verified email resolved to principals %s and %s — want one", pA, pB)
+	}
+
+	// An UNVERIFIED matching email must NOT link — a separate principal (the safe
+	// default; we never merge a human on an unverified claim).
+	authC := r.seedAuthOnlyUser()
+	cC := validClaimsFor(authC)
+	cC["email"] = email
+	cC["email_verified"] = false
+	if resp, _ := r.driveCallbackClaims(cC); resp.StatusCode != http.StatusFound {
+		t.Fatalf("login C status=%d, want 302", resp.StatusCode)
+	}
+	if r.principalOf(authC) == r.principalOf(authA) {
+		t.Fatal("unverified matching email linked to the verified principal — must stay separate")
+	}
+}
+
+// The real cross-provider round-trip through the SAML HTTP path: a human logs in
+// via GitHub (minting a principal), then via Entra SAML with the same VERIFIED
+// email — the SAML callback must LINK to the existing GitHub principal (not mint
+// a second) and JIT that principal into the SSO org. Guards the SAML-specific
+// link path the github-on-both test above can't reach.
+func TestSSOLogin_SAMLEmailLinksExistingGitHubPrincipal(t *testing.T) {
+	runmode.SetForTest(t, runmode.ModeMulti)
+	r := newAuthRig(t)
+
+	providerID := uuid.NewString()
+	owner := r.seedUser()
+	orgA, _ := r.seedOrg(owner, "acme")
+	r.seedSSOConnection(orgA, providerID, "member", true)
+
+	// validSAMLClaimsFor uses <id>@corp.example as the verified email; reuse that
+	// exact address for the prior GitHub login so the SAML login links to it.
+	samlAuth := r.seedAuthOnlyUser()
+	sharedEmail := samlAuth.String() + "@corp.example"
+
+	githubAuth := r.seedAuthOnlyUser()
+	gh := validClaimsFor(githubAuth)
+	gh["email"] = sharedEmail
+	gh["email_verified"] = true
+	if resp, _ := r.driveCallbackClaims(gh); resp.StatusCode != http.StatusFound {
+		t.Fatalf("github login status=%d, want 302", resp.StatusCode)
+	}
+	principal := r.principalOf(githubAuth)
+
+	if resp := r.driveSAMLCallback(samlAuth, providerID, providerID); resp.StatusCode != http.StatusFound {
+		t.Fatalf("saml login status=%d, want 302", resp.StatusCode)
+	}
+	if got := r.principalOf(samlAuth); got != principal {
+		t.Fatalf("SAML login minted a new principal %s — want it linked to the existing GitHub principal %s", got, principal)
+	}
+	// The linked principal (not a fresh one) is what gets JIT'd into the SSO org.
+	if got := r.membershipCount(principal, orgA); got != 1 {
+		t.Errorf("linked principal memberships in the SSO org=%d, want 1", got)
 	}
 }
