@@ -171,7 +171,7 @@ func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 
 	switch provider {
 	case "github":
-		codeVerifier, csrf, ok := s.issueOAuthStateCookie(w, r, returnTo, "")
+		codeVerifier, csrf, ok := s.issueOAuthStateCookie(w, r, returnTo, "", false)
 		if !ok {
 			return
 		}
@@ -195,12 +195,13 @@ func (s *Server) handleOAuthStart(w http.ResponseWriter, r *http.Request) {
 }
 
 // issueOAuthStateCookie generates a fresh CSRF token + PKCE verifier, signs
-// them into the HMAC state cookie (with the optional SSO provider_id), and
-// sets it. Returns the verifier (to derive the code_challenge) and the CSRF
-// token (to stitch into redirect_to). On a crypto/marshal failure it writes a
-// 500 and returns ok=false — the caller just returns. Shared by the GitHub and
-// SAML start paths so the state-cookie contract is defined once.
-func (s *Server) issueOAuthStateCookie(w http.ResponseWriter, r *http.Request, returnTo, providerID string) (codeVerifier, csrf string, ok bool) {
+// them into the HMAC state cookie (with the optional SSO provider_id and the
+// verify-before-enforce test flag), and sets it. Returns the verifier (to
+// derive the code_challenge) and the CSRF token (to stitch into redirect_to).
+// On a crypto/marshal failure it writes a 500 and returns ok=false — the caller
+// just returns. Shared by the GitHub and SAML start paths (test=false) and the
+// SSO test-start path (test=true) so the state-cookie contract is defined once.
+func (s *Server) issueOAuthStateCookie(w http.ResponseWriter, r *http.Request, returnTo, providerID string, test bool) (codeVerifier, csrf string, ok bool) {
 	csrfRaw := make([]byte, 16)
 	if _, err := rand.Read(csrfRaw); err != nil {
 		http.Error(w, "internal error", http.StatusInternalServerError)
@@ -217,6 +218,7 @@ func (s *Server) issueOAuthStateCookie(w http.ResponseWriter, r *http.Request, r
 		CSRF:         csrf,
 		CodeVerifier: codeVerifier,
 		ProviderID:   providerID,
+		Test:         test,
 		ExpiresAt:    timeNow().Add(10 * time.Minute).Unix(),
 	}
 	signed, err := state.sign(s.deployCfg.hmacKey)
@@ -276,7 +278,7 @@ func (s *Server) handleSAMLStart(w http.ResponseWriter, r *http.Request, returnT
 		return
 	}
 
-	codeVerifier, csrf, ok := s.issueOAuthStateCookie(w, r, returnTo, providerID)
+	codeVerifier, csrf, ok := s.issueOAuthStateCookie(w, r, returnTo, providerID, false)
 	if !ok {
 		return
 	}
@@ -333,6 +335,19 @@ func (s *Server) handleOAuthCallback(w http.ResponseWriter, r *http.Request) {
 		Name: stateCookieName, Value: "", Path: "/api/auth/",
 		MaxAge: -1, HttpOnly: true, Secure: s.cookieSecure(r), SameSite: http.SameSiteLaxMode,
 	})
+
+	// Verify-before-enforce SSO test (TFAC-431): the admin-gated test-start set
+	// Test in TF's signed state, so this round-trip is a not-yet-enabled
+	// connection's "does my IdP actually work?" check, NOT a login. Complete the
+	// exchange + verify to prove the assertion is valid and readable, then render
+	// pass/fail — completeSAMLConnectionTest short-circuits before any writes (no
+	// principal, no JIT, no session), so a test mints nothing. Branch here, before
+	// authCode is even read, because the test path handles a GoTrue ?error= ACS
+	// rejection as a fail result rather than the plain 400 a real login returns.
+	if state.Test {
+		s.completeSAMLConnectionTest(w, r, state)
+		return
+	}
 
 	authCode := r.URL.Query().Get("code")
 	if authCode == "" {
@@ -1254,7 +1269,16 @@ type stateClaims struct {
 	// Its non-empty presence at the callback is the authoritative "this
 	// login is SSO" signal.
 	ProviderID string `json:"pid,omitempty"`
-	ExpiresAt  int64  `json:"exp"`
+	// Test marks a verify-before-enforce SSO test round-trip (TFAC-431), set
+	// only by the admin-gated test-start endpoint (handleSAMLConnectionTestStart).
+	// When true the callback completes the code exchange + JWT verify — proving
+	// the assertion is valid and readable — then SHORT-CIRCUITS before any
+	// writes: no resolveOrCreatePrincipal, no JIT, no session. It renders a
+	// pass/fail page in the admin's popup instead. Like ProviderID it rides in
+	// TF's OWN signed state (never read back from the GoTrue JWT), so a forged
+	// callback can't flip a real login into the no-write test path or vice versa.
+	Test      bool  `json:"test,omitempty"`
+	ExpiresAt int64 `json:"exp"`
 }
 
 func (sc stateClaims) sign(key [32]byte) (string, error) {
