@@ -1,11 +1,11 @@
-package server
+package sso_test
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -15,9 +15,24 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
-// TFAC-427 — identifier-first SSO login discovery (POST /api/sso/discover).
+// Identifier-first SSO login discovery (POST /api/sso/discover).
 // The endpoint is pre-login (no session), so these requests carry no sid; the
 // admin-pool GetVerifiedByDomain read is what the rig exercises end-to-end.
+
+// ssoDiscoverResponse / ssoStartURL mirror the wire shape the ee discover
+// endpoint emits; these black-box tests assert against the JSON and decode into
+// local copies rather than reaching for ee/sso's unexported view types.
+type ssoDiscoverResponse struct {
+	SSO      bool   `json:"sso"`
+	StartURL string `json:"start_url,omitempty"`
+}
+
+func ssoStartURL(providerID, returnTo string) string {
+	q := url.Values{}
+	q.Set("provider_id", providerID)
+	q.Set("return_to", returnTo)
+	return "/api/auth/oauth/saml?" + q.Encode()
+}
 
 // ssoDiscover POSTs an email to the discovery endpoint as an anonymous visitor
 // (no sid cookie — the whole point is that the caller is pre-login) and decodes
@@ -44,9 +59,7 @@ func ssoDiscover(r *authRig, body any) (ssoDiscoverResponse, string) {
 	}
 	req := httptest.NewRequest(http.MethodPost, "/api/sso/discover", rdr)
 	req.Header.Set("Content-Type", "application/json")
-	rec := httptest.NewRecorder()
-	r.srv.mux.ServeHTTP(rec, req)
-	resp := rec.Result()
+	resp := r.serve(req)
 	raw := readBody(resp)
 	if resp.StatusCode != http.StatusOK {
 		r.t.Fatalf("POST /api/sso/discover: status = %d; want 200 (body=%s)", resp.StatusCode, raw)
@@ -167,18 +180,15 @@ func TestSSODiscover_VerifiedDomain_DrivesIntoSAMLStart(t *testing.T) {
 		t.Fatalf("discovery did not route to SSO (body=%s)", raw)
 	}
 
-	// Follow the start_url. GoTrue's /sso is stubbed to return the IdP redirect;
-	// a 303 proves the provider_id discovery emitted resolves to a real, enabled
+	// Follow the start_url. The fake GoTrue's /sso returns the IdP redirect; a 303
+	// proves the provider_id discovery emitted resolves to a real, enabled
 	// connection at the start endpoint.
-	r.srv.authDeps.gotrueSSO = func(_ context.Context, _, _, _ string) (string, error) {
-		return "https://login.microsoftonline.com/saml?SAMLRequest=abc", nil
+	r.fake.ssoLocation = "https://login.microsoftonline.com/saml?SAMLRequest=abc"
+	resp := r.serve(httptest.NewRequest("GET", body.StartURL, nil))
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("following start_url: status = %d; want 303 to the IdP (body=%s)", resp.StatusCode, readBody(resp))
 	}
-	rec := httptest.NewRecorder()
-	r.srv.mux.ServeHTTP(rec, httptest.NewRequest("GET", body.StartURL, nil))
-	if rec.Code != http.StatusSeeOther {
-		t.Fatalf("following start_url: status = %d; want 303 to the IdP (body=%s)", rec.Code, rec.Body.String())
-	}
-	if loc := rec.Header().Get("Location"); loc != "https://login.microsoftonline.com/saml?SAMLRequest=abc" {
+	if loc := resp.Header.Get("Location"); loc != "https://login.microsoftonline.com/saml?SAMLRequest=abc" {
 		t.Errorf("Location = %q; want the IdP redirect", loc)
 	}
 }
@@ -274,8 +284,8 @@ func TestSSODiscover_CaseInsensitive(t *testing.T) {
 
 // TestSSODiscover_Privacy_NoOrgIdentity: a match returns ONLY {sso, start_url}.
 // The response must never reveal org identity — no org id, org slug, or
-// connection id — only the opaque provider_id. This is the TFAC-422 trust-model
-// bar: mutually-distrusting orgs on one deployment.
+// connection id — only the opaque provider_id. This is the trust-model bar:
+// mutually-distrusting orgs on one deployment.
 func TestSSODiscover_Privacy_NoOrgIdentity(t *testing.T) {
 	runmode.SetForTest(t, runmode.ModeMulti)
 	r := newAuthRig(t)

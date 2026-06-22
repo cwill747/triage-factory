@@ -1,13 +1,10 @@
-package server
+package sso_test
 
 import (
-	"context"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
@@ -15,7 +12,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
-// TFAC-431 — verify-before-enforce SSO test. An org admin round-trips a REAL
+// Verify-before-enforce SSO test. An org admin round-trips a REAL
 // sign-in through their own (possibly not-yet-enabled) connection to confirm the
 // IdP is wired up, and the callback short-circuits before any writes: no
 // session, no membership, no principal, no identity link.
@@ -42,63 +39,35 @@ func (r *authRig) seedVerifiedSSODomain(orgID uuid.UUID, providerID, domain stri
 	}
 }
 
-// stubTestExchange makes gotrueExchange return a JWT minted for claims (the test
-// path verifies it through the live Verifier, so a bad iss/aud still 4xx-equiv).
-func (r *authRig) stubTestExchange(claims jwt.MapClaims) {
+// startSAMLTest drives the admin-initiated verify-test start (GET
+// /api/sso/connection/test), which derives the connection from the admin's
+// active org and mints a Test=true state. Returns the state cookies + the csrf
+// (captured from the fake's /sso) to echo back at the callback.
+func (r *authRig) startSAMLTest(adminSid string) (cookies []*http.Cookie, csrf string) {
 	r.t.Helper()
-	token := r.signKey.mintJWT(r.t, claims)
-	r.srv.authDeps.gotrueExchange = func(ctx context.Context, code, verifier string) (string, string, int64, error) {
-		return token, "refresh-" + uuid.NewString(), time.Now().Add(time.Hour).Unix(), nil
+	resp := r.requestWithSid("GET", "/api/sso/connection/test", adminSid)
+	if resp.StatusCode != http.StatusSeeOther {
+		r.t.Fatalf("test-start status=%d, want 303 (body=%s)", resp.StatusCode, readBody(resp))
 	}
+	return resp.Cookies(), r.fake.ssoCSRF()
 }
 
-// fireSAMLTestCallback signs a Test=true state for stateProviderID and drives the
-// callback with the given query values (a `code`, or an `error`). The caller
-// stubs gotrueExchange first when a code is supplied.
-func (r *authRig) fireSAMLTestCallback(stateProviderID string, q url.Values) *http.Response {
+// fireSAMLTestCallback starts a verify-test as adminSid, then drives the test
+// callback with q (a `code`, or an `error`). When a code is supplied, the caller
+// stages the exchange first (stageToken / failNextToken).
+func (r *authRig) fireSAMLTestCallback(adminSid string, q url.Values) *http.Response {
 	r.t.Helper()
-	csrf := "test-csrf-" + uuid.NewString()
-	state := stateClaims{
-		ReturnTo:     "/dashboard",
-		CSRF:         csrf,
-		CodeVerifier: "test-pkce-verifier",
-		ProviderID:   stateProviderID,
-		Test:         true,
-		ExpiresAt:    time.Now().Add(10 * time.Minute).Unix(),
-	}
-	signed, err := state.sign(r.srv.deployCfg.hmacKey)
-	if err != nil {
-		r.t.Fatalf("sign state: %v", err)
-	}
-	q.Set("state", csrf)
-	req := httptest.NewRequest("GET", "/api/auth/callback?"+q.Encode(), nil)
-	req.AddCookie(&http.Cookie{Name: stateCookieName, Value: signed})
-	rec := httptest.NewRecorder()
-	r.srv.mux.ServeHTTP(rec, req)
-	return rec.Result()
+	cookies, csrf := r.startSAMLTest(adminSid)
+	return r.fireCallback(cookies, csrf, q)
 }
 
-// driveSAMLTest is the happy-path driver: stub the exchange to return a token for
-// claims, then drive the test callback with a code.
-func (r *authRig) driveSAMLTest(claims jwt.MapClaims, stateProviderID string) *http.Response {
+// driveSAMLTest is the happy-path driver: sign in the admin, start the test,
+// stage the exchange to return a token for claims, then fire the test callback.
+func (r *authRig) driveSAMLTest(adminID uuid.UUID, claims jwt.MapClaims) *http.Response {
 	r.t.Helper()
-	r.stubTestExchange(claims)
-	q := url.Values{}
-	q.Set("code", "fake-"+uuid.NewString())
-	return r.fireSAMLTestCallback(stateProviderID, q)
-}
-
-// hasSidCookie reports whether the response set a non-empty sid cookie (a
-// session was minted) — the test path must never set one.
-func (r *authRig) hasSidCookie(resp *http.Response) bool {
-	r.t.Helper()
-	name := r.srv.sidCookieName()
-	for _, c := range resp.Cookies() {
-		if c.Name == name && c.Value != "" {
-			return true
-		}
-	}
-	return false
+	sid := r.signInAs(adminID)
+	r.fake.stageToken(r.signKey.mintJWT(r.t, claims))
+	return r.fireSAMLTestCallback(sid, url.Values{"code": {"fake-" + uuid.NewString()}})
 }
 
 func (r *authRig) identityLinkCount(authUserID uuid.UUID) int {
@@ -121,75 +90,8 @@ func (r *authRig) publicUserCount() int {
 	return n
 }
 
-// ---------- result rendering (no DB needed) ----------
-
-// renderSAMLTestResult executes the template for every outcome, escapes the
-// IdP-derived fields, and ships the lock-down CSP. Runs without a testcontainer.
-func TestSSOTestResultRendering(t *testing.T) {
-	s := &Server{}
-	cases := []struct {
-		name string
-		res  samlTestResult
-		want []string
-		deny []string
-	}{
-		{
-			name: "pass with domain match",
-			res:  samlTestResult{Pass: true, Email: "a@corp.com", EmailVerified: true, Domain: "corp.com", DomainMatch: true},
-			want: []string{"SSO test passed", "a@corp.com", "is verified for your organization"},
-			deny: []string{"SSO test failed"},
-		},
-		{
-			name: "pass without domain match",
-			res:  samlTestResult{Pass: true, Email: "a@corp.com", EmailVerified: true, Domain: "corp.com"},
-			want: []string{"SSO test passed", "is not a verified domain for your organization"},
-		},
-		{
-			name: "fail surfaces the reason",
-			res:  samlTestResult{Reason: "Sign-in completed, but the assertion carried no email claim."},
-			want: []string{"SSO test failed", "no email claim"},
-			deny: []string{"SSO test passed"},
-		},
-		{
-			// An assertion carrying markup must be escaped, not rendered live.
-			name: "escapes IdP-derived markup",
-			res:  samlTestResult{Pass: true, Email: "<script>alert(1)</script>@x.com", Domain: "x.com"},
-			want: []string{"&lt;script&gt;"},
-			deny: []string{"<script>alert(1)"},
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			rec := httptest.NewRecorder()
-			s.renderSAMLTestResult(rec, tc.res)
-			if rec.Code != http.StatusOK {
-				t.Fatalf("code=%d, want 200", rec.Code)
-			}
-			body := rec.Body.String()
-			for _, w := range tc.want {
-				if !strings.Contains(body, w) {
-					t.Errorf("body missing %q:\n%s", w, body)
-				}
-			}
-			for _, d := range tc.deny {
-				if strings.Contains(body, d) {
-					t.Errorf("body unexpectedly contains %q", d)
-				}
-			}
-			// The per-response CSP overrides the global one, so it must itself
-			// carry default-src 'none' AND frame-ancestors 'none' (clickjacking) —
-			// the override must not silently drop the latter.
-			csp := rec.Header().Get("Content-Security-Policy")
-			if !strings.Contains(csp, "default-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") {
-				t.Errorf("CSP backstop missing or weakened: %q", csp)
-			}
-			// The page embeds IdP-derived PII (email), so it must not be cached.
-			if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
-				t.Errorf("Cache-Control=%q, want no-store (page carries PII)", cc)
-			}
-		})
-	}
-}
+// TestSSOTestResultRendering moved to ee/sso/handlers_test.go with
+// renderSAMLTestResult.
 
 // ---------- callback test-branch tests ----------
 
@@ -209,7 +111,7 @@ func TestSSOTest_ValidRoundTrip_PassesAndWritesNothing(t *testing.T) {
 	user := r.seedAuthOnlyUser() // genuine first login: only auth.users exists
 	usersBefore := r.publicUserCount()
 
-	resp := r.driveSAMLTest(validSAMLClaimsFor(user, providerID), providerID)
+	resp := r.driveSAMLTest(owner, validSAMLClaimsFor(user, providerID))
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200 (the test renders a result page)", resp.StatusCode)
@@ -226,7 +128,7 @@ func TestSSOTest_ValidRoundTrip_PassesAndWritesNothing(t *testing.T) {
 	}
 
 	// The load-bearing invariant: a test writes NOTHING.
-	if r.hasSidCookie(resp) {
+	if r.gotSidCookie(resp) {
 		t.Error("test response set a sid cookie — a test must NOT mint a session")
 	}
 	if got := r.identityLinkCount(user); got != 0 {
@@ -255,7 +157,7 @@ func TestSSOTest_DomainMatch_WhenVerifiedDomainExists(t *testing.T) {
 	r.seedVerifiedSSODomain(orgA, providerID, "corp.example")
 
 	user := r.seedAuthOnlyUser()
-	resp := r.driveSAMLTest(validSAMLClaimsFor(user, providerID), providerID)
+	resp := r.driveSAMLTest(owner, validSAMLClaimsFor(user, providerID))
 
 	body := readBody(resp)
 	if !strings.Contains(body, "SSO test passed") {
@@ -278,7 +180,7 @@ func TestSSOTest_NoDomainMatch_StillPasses(t *testing.T) {
 	r.seedSSOConnection(orgA, providerID, "member", true) // no domain seeded
 
 	user := r.seedAuthOnlyUser()
-	resp := r.driveSAMLTest(validSAMLClaimsFor(user, providerID), providerID)
+	resp := r.driveSAMLTest(owner, validSAMLClaimsFor(user, providerID))
 
 	body := readBody(resp)
 	if !strings.Contains(body, "SSO test passed") {
@@ -305,7 +207,7 @@ func TestSSOTest_MissingEmail_Fails(t *testing.T) {
 	delete(claims, "email") // the classic Entra "email claim not mapped" misconfig
 	delete(claims, "email_verified")
 
-	resp := r.driveSAMLTest(claims, providerID)
+	resp := r.driveSAMLTest(owner, claims)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status=%d, want 200", resp.StatusCode)
@@ -317,7 +219,7 @@ func TestSSOTest_MissingEmail_Fails(t *testing.T) {
 	if !strings.Contains(body, "no email claim") {
 		t.Errorf("fail message did not name the missing email claim:\n%s", body)
 	}
-	if r.hasSidCookie(resp) {
+	if r.gotSidCookie(resp) {
 		t.Error("a failed test set a sid cookie")
 	}
 	if got := r.identityLinkCount(user); got != 0 {
@@ -336,12 +238,11 @@ func TestSSOTest_ExchangeError_Fails(t *testing.T) {
 	orgA, _ := r.seedOrg(owner, "acme")
 	r.seedSSOConnection(orgA, providerID, "member", true)
 
-	r.srv.authDeps.gotrueExchange = func(ctx context.Context, code, verifier string) (string, string, int64, error) {
-		return "", "", 0, context.DeadlineExceeded // any error stands in for a rejected assertion
-	}
+	sid := r.signInAs(owner)
+	r.fake.failNextToken() // GoTrue rejects the assertion (cert mismatch / bad signature)
 	q := url.Values{}
 	q.Set("code", "fake-"+uuid.NewString())
-	resp := r.fireSAMLTestCallback(providerID, q)
+	resp := r.fireSAMLTestCallback(sid, q)
 
 	body := readBody(resp)
 	if !strings.Contains(body, "SSO test failed") {
@@ -368,16 +269,14 @@ func TestSSOTest_TokenVerifyFails_Fails(t *testing.T) {
 	// Exchange succeeds but returns a JWT the live Verifier rejects: a valid
 	// signature over the wrong issuer. (A garbage string would also fail, but a
 	// well-formed-yet-untrusted token exercises the verifier's claim checks.)
+	sid := r.signInAs(owner)
 	user := r.seedAuthOnlyUser()
 	badClaims := validSAMLClaimsFor(user, providerID)
 	badClaims["iss"] = "https://wrong-issuer.example"
-	token := r.signKey.mintJWT(t, badClaims)
-	r.srv.authDeps.gotrueExchange = func(ctx context.Context, code, verifier string) (string, string, int64, error) {
-		return token, "refresh-" + uuid.NewString(), time.Now().Add(time.Hour).Unix(), nil
-	}
+	r.fake.stageToken(r.signKey.mintJWT(t, badClaims))
 	q := url.Values{}
 	q.Set("code", "fake-"+uuid.NewString())
-	resp := r.fireSAMLTestCallback(providerID, q)
+	resp := r.fireSAMLTestCallback(sid, q)
 
 	body := readBody(resp)
 	if !strings.Contains(body, "SSO test failed") {
@@ -386,7 +285,7 @@ func TestSSOTest_TokenVerifyFails_Fails(t *testing.T) {
 	if !strings.Contains(body, "failed verification") {
 		t.Errorf("fail message did not mention verification:\n%s", body)
 	}
-	if r.hasSidCookie(resp) {
+	if r.gotSidCookie(resp) {
 		t.Error("a failed test set a sid cookie")
 	}
 	if got := r.identityLinkCount(user); got != 0 {
@@ -404,11 +303,12 @@ func TestSSOTest_ACSErrorParam_Fails(t *testing.T) {
 	owner := r.seedUser()
 	orgA, _ := r.seedOrg(owner, "acme")
 	r.seedSSOConnection(orgA, providerID, "member", true)
+	sid := r.signInAs(owner)
 
 	q := url.Values{}
 	q.Set("error", "access_denied")
 	q.Set("error_description", "SAML assertion signature mismatch")
-	resp := r.fireSAMLTestCallback(providerID, q)
+	resp := r.fireSAMLTestCallback(sid, q)
 
 	body := readBody(resp)
 	if !strings.Contains(body, "SSO test failed") {
@@ -422,7 +322,9 @@ func TestSSOTest_ACSErrorParam_Fails(t *testing.T) {
 // ---------- test-start endpoint tests ----------
 
 // An org admin starting a test on a NOT-yet-enabled connection → 303 to the IdP,
-// with TF's signed state carrying Test=true + the connection's provider_id.
+// after TF posts GoTrue's /sso with the active-org connection's provider_id and
+// an S256 PKCE challenge, having set a state cookie. (Test=true lives in the
+// signed state, opaque to the client; the round-trip tests above prove it took.)
 func TestSSOTestStart_AdminNotYetEnabled_RedirectsWithTestState(t *testing.T) {
 	runmode.SetForTest(t, runmode.ModeMulti)
 	r := newAuthRig(t)
@@ -433,12 +335,7 @@ func TestSSOTestStart_AdminNotYetEnabled_RedirectsWithTestState(t *testing.T) {
 	r.seedSSOConnection(orgA, providerID, "member", false) // disabled — testable
 	sid := r.signInAs(owner)
 
-	var gotProvider, gotChallenge string
-	r.srv.authDeps.gotrueSSO = func(ctx context.Context, pid, redirectTo, challenge string) (string, error) {
-		gotProvider, gotChallenge = pid, challenge
-		return "https://login.microsoftonline.com/saml?SAMLRequest=abc", nil
-	}
-
+	r.fake.ssoLocation = "https://login.microsoftonline.com/saml?SAMLRequest=abc"
 	resp := r.requestWithSid("GET", "/api/sso/connection/test", sid)
 	if resp.StatusCode != http.StatusSeeOther {
 		t.Fatalf("status=%d, want 303 (body=%s)", resp.StatusCode, readBody(resp))
@@ -446,31 +343,21 @@ func TestSSOTestStart_AdminNotYetEnabled_RedirectsWithTestState(t *testing.T) {
 	if loc := resp.Header.Get("Location"); loc != "https://login.microsoftonline.com/saml?SAMLRequest=abc" {
 		t.Errorf("Location=%q, want the IdP redirect", loc)
 	}
-	if gotProvider != providerID {
-		t.Errorf("provider_id posted to GoTrue=%q, want %q (the active-org connection)", gotProvider, providerID)
+	body := r.fake.lastSSO()
+	if body["provider_id"] != providerID {
+		t.Errorf("provider_id posted to GoTrue=%q, want %q (the active-org connection)", body["provider_id"], providerID)
 	}
-
-	var stateVal string
+	if body["code_challenge_method"] != "S256" || body["code_challenge"] == "" {
+		t.Errorf("PKCE challenge not posted to GoTrue: %v", body)
+	}
+	var sawState bool
 	for _, c := range resp.Cookies() {
-		if c.Name == stateCookieName {
-			stateVal = c.Value
+		if c.Value != "" && c.Name != sidCookieName {
+			sawState = true
 		}
 	}
-	if stateVal == "" {
-		t.Fatal("no state cookie set")
-	}
-	sc, err := parseStateCookie(stateVal, r.srv.deployCfg.hmacKey)
-	if err != nil {
-		t.Fatalf("parse state cookie: %v", err)
-	}
-	if !sc.Test {
-		t.Error("state cookie did not carry Test=true")
-	}
-	if sc.ProviderID != providerID {
-		t.Errorf("state provider_id=%q, want %q", sc.ProviderID, providerID)
-	}
-	if gotChallenge != pkceChallenge(sc.CodeVerifier) {
-		t.Error("challenge posted to GoTrue is not S256(verifier in state)")
+	if !sawState {
+		t.Error("no state cookie set on the test-start")
 	}
 }
 
@@ -493,17 +380,11 @@ func TestSSOTestStart_NonAdmin_404(t *testing.T) {
 	}
 	sid := r.signInAs(member)
 
-	called := false
-	r.srv.authDeps.gotrueSSO = func(ctx context.Context, _, _, _ string) (string, error) {
-		called = true
-		return "", nil
-	}
-
 	resp := r.requestWithSid("GET", "/api/sso/connection/test", sid)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status=%d, want 404 for a non-admin", resp.StatusCode)
 	}
-	if called {
+	if r.fake.ssoCalls() != 0 {
 		t.Error("GoTrue /sso was called for a non-admin")
 	}
 }
@@ -520,16 +401,5 @@ func TestSSOTestStart_NoConnection_404(t *testing.T) {
 	resp := r.requestWithSid("GET", "/api/sso/connection/test", sid)
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("status=%d, want 404 when no connection is registered", resp.StatusCode)
-	}
-}
-
-// Local mode (and an unwired multi deploy) has no auth stack → 404 ("feature
-// absent"), exercised directly via the authDeps==nil guard.
-func TestSSOTestStart_NoAuthStack_404(t *testing.T) {
-	srv := &Server{} // authDeps nil → SSO doesn't exist here
-	rec := httptest.NewRecorder()
-	srv.handleSAMLConnectionTestStart(rec, httptest.NewRequest("GET", "/api/sso/connection/test", nil))
-	if rec.Code != http.StatusNotFound {
-		t.Errorf("status=%d, want 404 when the auth stack is unwired (local mode)", rec.Code)
 	}
 }

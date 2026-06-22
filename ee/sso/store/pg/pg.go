@@ -1,4 +1,11 @@
-package postgres
+// Package pg holds the Postgres implementations of the Enterprise Edition
+// SSO stores and registers them with core's store-extension registry for
+// the "postgres" dialect: same app/admin pool split and RLS posture as the
+// rest of the Postgres data layer, reading core's transaction handle as a
+// db.Execer and the domain/interface types from ssostore.
+//
+// Licensed under the Enterprise Edition License (see ee/LICENSE).
+package pg
 
 import (
 	"context"
@@ -6,36 +13,48 @@ import (
 	"errors"
 	"fmt"
 
+	ssostore "github.com/sky-ai-eng/triage-factory/ee/sso/store"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
-	"github.com/sky-ai-eng/triage-factory/internal/domain"
 )
 
-// ssoConnectionStore is the Postgres impl of db.SSOConnectionStore. Holds
-// both pools — see the SSOConnectionStore interface comment for the
-// pool-split rationale.
-//
-//   - app: Create, GetByID, ListByOrg, Update, Delete. Request-handler
-//     reads/writes gated by the sso_connections_* RLS policies (org-admin
-//     in the current org).
-//   - admin: GetByProviderID. The login-time JIT actor has no membership in
-//     the target org, so RLS can't express the lookup; the provider_id is
-//     the authorization.
-type ssoConnectionStore struct {
-	app   queryer
-	admin queryer
+func init() {
+	db.RegisterStoreExtension("postgres", ssostore.ExtKey, func(app, admin db.Execer) any {
+		return &ssostore.Bundle{
+			Connections: newSSOConnectionStore(app, admin),
+			Domains:     newSSODomainStore(app, admin),
+			BreakGlass:  newSSOBreakGlassStore(app, admin),
+		}
+	})
 }
 
-func newSSOConnectionStore(app, admin queryer) db.SSOConnectionStore {
+// rowScanner is the read shape shared by *sql.Row and *sql.Rows, so
+// scanSSODomain + scanSSOConnection serve both the single-row GetByID and
+// the iterating ListByOrg without duplicating the column list.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// ssoConnectionStore is the Postgres impl of ssostore.SSOConnectionStore.
+//
+//   - app: Create, GetByID, ListByOrg, Update, Delete. Request-handler
+//     reads/writes gated by the sso_connections_* RLS policies.
+//   - admin: GetByProviderID / MarkTestedByProviderID. The login/test
+//     actor has no membership; the provider_id is the authorization.
+type ssoConnectionStore struct {
+	app   db.Execer
+	admin db.Execer
+}
+
+func newSSOConnectionStore(app, admin db.Execer) ssostore.SSOConnectionStore {
 	return &ssoConnectionStore{app: app, admin: admin}
 }
 
-var _ db.SSOConnectionStore = (*ssoConnectionStore)(nil)
+var _ ssostore.SSOConnectionStore = (*ssoConnectionStore)(nil)
 
-func (s *ssoConnectionStore) Create(ctx context.Context, p domain.CreateSSOConnectionParams) (string, error) {
+func (s *ssoConnectionStore) Create(ctx context.Context, p ssostore.CreateSSOConnectionParams) (string, error) {
 	// Mirror the schema DEFAULTs in Go so an unset field still produces a
 	// valid row; enabled isn't a param (new connections are always created
-	// enabled — see CreateSSOConnectionParams), so it falls to the column
-	// DEFAULT.
+	// enabled), so it falls to the column DEFAULT.
 	kind := p.Kind
 	if kind == "" {
 		kind = "saml"
@@ -56,7 +75,7 @@ func (s *ssoConnectionStore) Create(ctx context.Context, p domain.CreateSSOConne
 	return id, nil
 }
 
-func (s *ssoConnectionStore) GetByID(ctx context.Context, orgID, id string) (*domain.SSOConnection, error) {
+func (s *ssoConnectionStore) GetByID(ctx context.Context, orgID, id string) (*ssostore.SSOConnection, error) {
 	c, err := scanSSOConnection(s.app.QueryRowContext(ctx, `
 		SELECT id::text, org_id::text, kind, provider_id, default_role::text,
 		       enabled, enforced, last_tested_at, created_at, updated_at
@@ -72,7 +91,7 @@ func (s *ssoConnectionStore) GetByID(ctx context.Context, orgID, id string) (*do
 	return &c, nil
 }
 
-func (s *ssoConnectionStore) ListByOrg(ctx context.Context, orgID string) ([]domain.SSOConnection, error) {
+func (s *ssoConnectionStore) ListByOrg(ctx context.Context, orgID string) ([]ssostore.SSOConnection, error) {
 	rows, err := s.app.QueryContext(ctx, `
 		SELECT id::text, org_id::text, kind, provider_id, default_role::text,
 		       enabled, enforced, last_tested_at, created_at, updated_at
@@ -85,7 +104,7 @@ func (s *ssoConnectionStore) ListByOrg(ctx context.Context, orgID string) ([]dom
 	}
 	defer rows.Close()
 
-	out := []domain.SSOConnection{}
+	out := []ssostore.SSOConnection{}
 	for rows.Next() {
 		c, err := scanSSOConnection(rows)
 		if err != nil {
@@ -96,19 +115,19 @@ func (s *ssoConnectionStore) ListByOrg(ctx context.Context, orgID string) ([]dom
 	return out, rows.Err()
 }
 
-// scanSSOConnection reads the full connection column list (shared by GetByID's
-// single-row read and ListByOrg's iteration) into a domain.SSOConnection,
-// unwrapping the nullable last_tested_at.
-func scanSSOConnection(sc rowScanner) (domain.SSOConnection, error) {
+// scanSSOConnection reads the full connection column list (shared by
+// GetByID's single-row read and ListByOrg's iteration) into a
+// ssostore.SSOConnection, unwrapping the nullable last_tested_at.
+func scanSSOConnection(sc rowScanner) (ssostore.SSOConnection, error) {
 	var (
-		c          domain.SSOConnection
+		c          ssostore.SSOConnection
 		lastTested sql.NullTime
 	)
 	if err := sc.Scan(
 		&c.ID, &c.OrgID, &c.Kind, &c.ProviderID, &c.DefaultRole,
 		&c.Enabled, &c.Enforced, &lastTested, &c.CreatedAt, &c.UpdatedAt,
 	); err != nil {
-		return domain.SSOConnection{}, err
+		return ssostore.SSOConnection{}, err
 	}
 	if lastTested.Valid {
 		c.LastTestedAt = &lastTested.Time
@@ -116,12 +135,10 @@ func scanSSOConnection(sc rowScanner) (domain.SSOConnection, error) {
 	return c, nil
 }
 
-func (s *ssoConnectionStore) Update(ctx context.Context, orgID, id string, p domain.UpdateSSOConnectionParams) error {
+func (s *ssoConnectionStore) Update(ctx context.Context, orgID, id string, p ssostore.UpdateSSOConnectionParams) error {
 	// An empty DefaultRole means "leave the role unchanged" — COALESCE
-	// preserves the stored value. (Create's "" → 'member' fallback is right
-	// for a brand-new row, but reusing it here would silently downgrade an
-	// 'admin' default to 'member' on a call that only meant to flip enabled.)
-	// A non-empty 'owner' still trips the sso_connections_role_not_owner CHECK.
+	// preserves the stored value. A non-empty 'owner' still trips the
+	// sso_connections_role_not_owner CHECK.
 	if _, err := s.app.ExecContext(ctx, `
 		UPDATE sso_connections
 		SET default_role = COALESCE(NULLIF($1, '')::public.org_role, default_role),
@@ -142,8 +159,8 @@ func (s *ssoConnectionStore) Delete(ctx context.Context, orgID, id string) error
 	return nil
 }
 
-func (s *ssoConnectionStore) GetByProviderID(ctx context.Context, providerID string) (*domain.SSOProviderBinding, error) {
-	var b domain.SSOProviderBinding
+func (s *ssoConnectionStore) GetByProviderID(ctx context.Context, providerID string) (*ssostore.SSOProviderBinding, error) {
+	var b ssostore.SSOProviderBinding
 	err := s.admin.QueryRowContext(ctx, `
 		SELECT org_id::text, default_role::text, enabled
 		FROM sso_connections
@@ -169,9 +186,10 @@ func (s *ssoConnectionStore) SetEnforced(ctx context.Context, orgID, id string, 
 }
 
 func (s *ssoConnectionStore) MarkTestedByProviderID(ctx context.Context, providerID string) error {
-	// Admin pool: the verify-before-enforce Test callback carries TF's signed
-	// state (the provider_id) but no membership claims, so this can't go through
-	// RLS — the provider_id is the lookup authorization, mirroring GetByProviderID.
+	// Admin pool: the verify-before-enforce Test callback carries TF's
+	// signed state (the provider_id) but no membership claims, so this
+	// can't go through RLS — the provider_id is the lookup authorization,
+	// mirroring GetByProviderID.
 	if _, err := s.admin.ExecContext(ctx, `
 		UPDATE sso_connections SET last_tested_at = now()
 		WHERE provider_id = $1
@@ -181,25 +199,24 @@ func (s *ssoConnectionStore) MarkTestedByProviderID(ctx context.Context, provide
 	return nil
 }
 
-// ssoDomainStore is the Postgres impl of db.SSODomainStore. Holds both
-// pools — see the SSODomainStore interface comment for the rationale.
+// ssoDomainStore is the Postgres impl of ssostore.SSODomainStore.
 //
-//   - app: Create, ListByOrg, GetByID, SetVerified, Delete. Request-handler
-//     reads/writes gated by the sso_domains_* RLS policies (org-admin).
-//   - admin: GetVerifiedByDomain. The routing actor is pre-login with no
-//     membership; the verified domain is the authorization.
+//   - app: Create, ListByOrg, GetByID, SetVerified, Delete (sso_domains_*
+//     RLS, org-admin).
+//   - admin: GetVerifiedByDomain. The routing actor is pre-login; the
+//     verified domain is the authorization.
 type ssoDomainStore struct {
-	app   queryer
-	admin queryer
+	app   db.Execer
+	admin db.Execer
 }
 
-func newSSODomainStore(app, admin queryer) db.SSODomainStore {
+func newSSODomainStore(app, admin db.Execer) ssostore.SSODomainStore {
 	return &ssoDomainStore{app: app, admin: admin}
 }
 
-var _ db.SSODomainStore = (*ssoDomainStore)(nil)
+var _ ssostore.SSODomainStore = (*ssoDomainStore)(nil)
 
-func (s *ssoDomainStore) Create(ctx context.Context, p domain.CreateSSODomainParams) (string, error) {
+func (s *ssoDomainStore) Create(ctx context.Context, p ssostore.CreateSSODomainParams) (string, error) {
 	var id string
 	err := s.app.QueryRowContext(ctx, `
 		INSERT INTO sso_domains (connection_id, org_id, domain, token)
@@ -212,7 +229,7 @@ func (s *ssoDomainStore) Create(ctx context.Context, p domain.CreateSSODomainPar
 	return id, nil
 }
 
-func (s *ssoDomainStore) ListByOrg(ctx context.Context, orgID string) ([]domain.SSODomain, error) {
+func (s *ssoDomainStore) ListByOrg(ctx context.Context, orgID string) ([]ssostore.SSODomain, error) {
 	rows, err := s.app.QueryContext(ctx, `
 		SELECT id::text, connection_id::text, org_id::text, domain, token,
 		       verified_at, created_at, updated_at
@@ -225,7 +242,7 @@ func (s *ssoDomainStore) ListByOrg(ctx context.Context, orgID string) ([]domain.
 	}
 	defer rows.Close()
 
-	out := []domain.SSODomain{}
+	out := []ssostore.SSODomain{}
 	for rows.Next() {
 		d, err := scanSSODomain(rows)
 		if err != nil {
@@ -236,7 +253,7 @@ func (s *ssoDomainStore) ListByOrg(ctx context.Context, orgID string) ([]domain.
 	return out, rows.Err()
 }
 
-func (s *ssoDomainStore) GetByID(ctx context.Context, orgID, id string) (*domain.SSODomain, error) {
+func (s *ssoDomainStore) GetByID(ctx context.Context, orgID, id string) (*ssostore.SSODomain, error) {
 	d, err := scanSSODomain(s.app.QueryRowContext(ctx, `
 		SELECT id::text, connection_id::text, org_id::text, domain, token,
 		       verified_at, created_at, updated_at
@@ -256,8 +273,8 @@ func (s *ssoDomainStore) SetVerified(ctx context.Context, orgID, id string) erro
 	// Only stamp a still-pending row. The verified-global-unique index
 	// (sso_domains_verified_global_uniq) fires here if another org already
 	// verified the same domain — the error propagates (opaquely) and the
-	// surrounding tx rolls back. Re-verifying an already-verified own row is
-	// idempotent against the WHERE guard (zero rows, no error).
+	// surrounding tx rolls back. Re-verifying an already-verified own row
+	// is idempotent against the WHERE guard.
 	if _, err := s.app.ExecContext(ctx, `
 		UPDATE sso_domains SET verified_at = now()
 		WHERE id = $1 AND org_id = $2 AND verified_at IS NULL
@@ -276,17 +293,13 @@ func (s *ssoDomainStore) Delete(ctx context.Context, orgID, id string) error {
 	return nil
 }
 
-func (s *ssoDomainStore) GetVerifiedByDomain(ctx context.Context, domainName string) (*domain.SSODomainRoute, error) {
+func (s *ssoDomainStore) GetVerifiedByDomain(ctx context.Context, domainName string) (*ssostore.SSODomainRoute, error) {
 	// Exact lower(domain) match, verified rows only — no suffix / longest-
-	// match (corp.com never matches eng.corp.com). The verified-global-
-	// unique index guarantees at most one row, so no ordering/limit needed.
-	//
-	// The join also pins c.org_id = d.org_id: the sso_domains_connection_fkey
-	// composite FK already guarantees the pair is consistent, so this is
-	// defense-in-depth — a belt-and-suspenders guard that a mismatched row
-	// (from a future bug or manual write) can never route a verified domain
+	// match. The verified-global-unique index guarantees at most one row.
+	// The join pins c.org_id = d.org_id (defense-in-depth on top of the
+	// composite FK) so a mismatched row can never route a verified domain
 	// to a connection in a different org.
-	var r domain.SSODomainRoute
+	var r ssostore.SSODomainRoute
 	err := s.admin.QueryRowContext(ctx, `
 		SELECT d.connection_id::text, d.org_id::text, c.provider_id, c.enabled, c.enforced
 		FROM sso_domains d
@@ -302,33 +315,44 @@ func (s *ssoDomainStore) GetVerifiedByDomain(ctx context.Context, domainName str
 	return &r, nil
 }
 
-// ssoBreakGlassStore is the Postgres impl of db.SSOBreakGlassStore. Holds both
-// pools — see the SSOBreakGlassStore interface comment for the rationale.
-//
-//   - app: Add, RemoveGuarded, SeedOwnerIfEmpty. Request-handler reads/writes
-//     gated by the sso_break_glass_* RLS policies (org-admin).
-//   - admin: List, IsBreakGlass, ResolveVerifiedEmailMember. List joins
-//     user_identities (admin-pool-only); IsBreakGlass is the login-time bypass
-//     check; ResolveVerifiedEmailMember reads cross-principal identities. All
-//     three are org-scoped in SQL behind an admin-gated/login-time caller.
-type ssoBreakGlassStore struct {
-	app   queryer
-	admin queryer
+func scanSSODomain(sc rowScanner) (ssostore.SSODomain, error) {
+	var (
+		d          ssostore.SSODomain
+		verifiedAt sql.NullTime
+	)
+	if err := sc.Scan(
+		&d.ID, &d.ConnectionID, &d.OrgID, &d.Domain, &d.Token,
+		&verifiedAt, &d.CreatedAt, &d.UpdatedAt,
+	); err != nil {
+		return ssostore.SSODomain{}, err
+	}
+	if verifiedAt.Valid {
+		d.VerifiedAt = &verifiedAt.Time
+	}
+	return d, nil
 }
 
-func newSSOBreakGlassStore(app, admin queryer) db.SSOBreakGlassStore {
+// ssoBreakGlassStore is the Postgres impl of ssostore.SSOBreakGlassStore.
+//
+//   - app: Add, RemoveGuarded, SeedOwnerIfEmpty (sso_break_glass_* RLS).
+//   - admin: List, IsBreakGlass, ResolveVerifiedEmailMember — read
+//     cross-principal identity data behind an admin-gated/login-time caller.
+type ssoBreakGlassStore struct {
+	app   db.Execer
+	admin db.Execer
+}
+
+func newSSOBreakGlassStore(app, admin db.Execer) ssostore.SSOBreakGlassStore {
 	return &ssoBreakGlassStore{app: app, admin: admin}
 }
 
-var _ db.SSOBreakGlassStore = (*ssoBreakGlassStore)(nil)
+var _ ssostore.SSOBreakGlassStore = (*ssoBreakGlassStore)(nil)
 
-func (s *ssoBreakGlassStore) List(ctx context.Context, orgID string) ([]domain.SSOBreakGlassPrincipal, error) {
-	// Admin pool: the email comes from user_identities, which is admin-pool-only
-	// by the principal-model design (RLS-enabled, no tf_app grant — the app pool
-	// can't read it). The handler has already gated org-admin, and this read is
-	// strictly scoped to bg.org_id = $1, so admin (BYPASSRLS) leaks nothing
-	// cross-org. Join the principal's display name; email is the most-recently-
-	// verified identity (COALESCE to '' when none). Newest designation first.
+func (s *ssoBreakGlassStore) List(ctx context.Context, orgID string) ([]ssostore.SSOBreakGlassPrincipal, error) {
+	// Admin pool: the email comes from user_identities, admin-pool-only by
+	// the principal-model design. The handler has gated org-admin and this
+	// read is strictly scoped to bg.org_id = $1, so admin leaks nothing
+	// cross-org. Newest designation first.
 	rows, err := s.admin.QueryContext(ctx, `
 		SELECT bg.user_id::text,
 		       COALESCE(u.display_name, ''),
@@ -349,9 +373,9 @@ func (s *ssoBreakGlassStore) List(ctx context.Context, orgID string) ([]domain.S
 	}
 	defer rows.Close()
 
-	out := []domain.SSOBreakGlassPrincipal{}
+	out := []ssostore.SSOBreakGlassPrincipal{}
 	for rows.Next() {
-		var p domain.SSOBreakGlassPrincipal
+		var p ssostore.SSOBreakGlassPrincipal
 		if err := rows.Scan(&p.UserID, &p.DisplayName, &p.Email, &p.CreatedAt); err != nil {
 			return nil, fmt.Errorf("scan sso_break_glass: %w", err)
 		}
@@ -371,16 +395,12 @@ func (s *ssoBreakGlassStore) Add(ctx context.Context, orgID, userID string) erro
 }
 
 func (s *ssoBreakGlassStore) RemoveGuarded(ctx context.Context, orgID, userID string) (blockedLast bool, err error) {
-	// One statement so the enforced-check, count, presence, and delete all read a
-	// SINGLE snapshot — the lockout-safety invariant ("never enforced with zero
-	// break-glass") can't be raced by a concurrent enforce-toggle or a sibling
-	// remove. The DELETE fires UNLESS the org has an enforced connection AND this
-	// would drop the last principal. A data-modifying CTE's changes aren't visible
-	// to the rest of the query, so the trailing EXISTS still sees the row's
-	// pre-delete state: blocked_last is true exactly when the row was present but
-	// the guard prevented its removal (present, enforced, last). A no-op remove of
-	// a non-member is blocked_last=false (idempotent), as is a delete that went
-	// through. App pool — every table here is RLS-gated to the org-admin caller.
+	// One statement so the enforced-check, count, presence, and delete all
+	// read a SINGLE snapshot — the lockout-safety invariant ("never
+	// enforced with zero break-glass") can't be raced. The DELETE fires
+	// UNLESS the org has an enforced connection AND this would drop the last
+	// principal. blocked_last is true exactly when the row was present but
+	// the guard prevented its removal. App pool — RLS-gated to org-admin.
 	if err := s.app.QueryRowContext(ctx, `
 		WITH del AS (
 			DELETE FROM sso_break_glass
@@ -400,9 +420,9 @@ func (s *ssoBreakGlassStore) RemoveGuarded(ctx context.Context, orgID, userID st
 }
 
 func (s *ssoBreakGlassStore) SeedOwnerIfEmpty(ctx context.Context, orgID string) error {
-	// Insert the org owner only when the set is empty — the "default: the owner"
-	// behavior. The NOT EXISTS guard keeps it from re-adding an owner an admin
-	// deliberately removed (while another break-glass principal stands in).
+	// Insert the org owner only when the set is empty — the "default: the
+	// owner" behavior. The NOT EXISTS guard keeps it from re-adding an owner
+	// an admin deliberately removed (while another principal stands in).
 	if _, err := s.app.ExecContext(ctx, `
 		INSERT INTO sso_break_glass (org_id, user_id)
 		SELECT o.id, o.owner_user_id
@@ -418,9 +438,8 @@ func (s *ssoBreakGlassStore) SeedOwnerIfEmpty(ctx context.Context, orgID string)
 
 func (s *ssoBreakGlassStore) ResolveVerifiedEmailMember(ctx context.Context, orgID, email string) (string, error) {
 	// Admin pool: resolving an arbitrary email to its principal reads
-	// user_identities rows that don't belong to the caller (RLS would hide
-	// them). The org_memberships join confines the result to a member of orgID,
-	// so no principal outside the admin's org is ever returned.
+	// user_identities rows that don't belong to the caller. The
+	// org_memberships join confines the result to a member of orgID.
 	var userID string
 	err := s.admin.QueryRowContext(ctx, `
 		SELECT om.user_id::text
@@ -449,28 +468,4 @@ func (s *ssoBreakGlassStore) IsBreakGlass(ctx context.Context, orgID, userID str
 		return false, fmt.Errorf("is sso_break_glass: %w", err)
 	}
 	return ok, nil
-}
-
-// rowScanner is the read shape shared by *sql.Row and *sql.Rows, so
-// scanSSODomain + scanSSOConnection serve both the single-row GetByID and the
-// iterating ListByOrg without duplicating the column list.
-type rowScanner interface {
-	Scan(dest ...any) error
-}
-
-func scanSSODomain(sc rowScanner) (domain.SSODomain, error) {
-	var (
-		d          domain.SSODomain
-		verifiedAt sql.NullTime
-	)
-	if err := sc.Scan(
-		&d.ID, &d.ConnectionID, &d.OrgID, &d.Domain, &d.Token,
-		&verifiedAt, &d.CreatedAt, &d.UpdatedAt,
-	); err != nil {
-		return domain.SSODomain{}, err
-	}
-	if verifiedAt.Valid {
-		d.VerifiedAt = &verifiedAt.Time
-	}
-	return d, nil
 }

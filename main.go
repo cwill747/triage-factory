@@ -7,8 +7,13 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/sky-ai-eng/triage-factory/ee"
 	"github.com/sky-ai-eng/triage-factory/internal/app"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
+
+	// Enterprise Edition SSO: registers its store factories, route installer,
+	// and LoginExtension via init(). Gated at runtime on the `sso` entitlement.
+	_ "github.com/sky-ai-eng/triage-factory/ee/sso"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -44,7 +49,13 @@ func run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	// Server mode. Translate SIGINT/SIGTERM into context cancellation so the
+	// Server mode. Verify any Enterprise license token (TF_LICENSE) and
+	// register the entitlements checker before wiring subsystems, so
+	// feature gates see the right answer from first boot. No/invalid token
+	// → community default (every enterprise feature off). Never fatal.
+	ee.Install()
+
+	// Translate SIGINT/SIGTERM into context cancellation so the
 	// HTTP server and background workers shut down gracefully.
 	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -1,94 +1,35 @@
-package server
+package sso_test
 
 import (
 	"encoding/json"
 	"net/http"
-	"net/http/httptest"
-	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db/pgtest"
-	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
-// ssoTestServiceToken is the static service-role bearer the tests configure via
-// TF_GOTRUE_SERVICE_ROLE_TOKEN; the fake GoTrue checks TF forwards it verbatim.
-// Opaque here — TF treats the token as opaque and just presents it, so the
-// handler test only needs to prove forwarding. (jwk-init's own tests cover that
-// the real token is a valid RS256 service-role JWT with a matching kid.)
-const ssoTestServiceToken = "test-service-role-token-deadbeefdeadbeefdeadbeefdeadbeef"
-
-// ssoFakeGoTrue is a minimal stand-in for GoTrue's admin SSO API. It checks the
-// bearer matches the configured service-role token, records the POST it
-// receives, and returns a fresh provider id (a UUID) on 201 — the shape
-// createSAMLProvider reads.
-type ssoFakeGoTrue struct {
-	srv       *httptest.Server
-	wantToken string
-
-	mu        sync.Mutex
-	postCount int
-	lastBody  map[string]any
+// ssoConnectionView / ssoConnectionResponse mirror the wire shape the ee
+// endpoint emits; the tests decode into these local copies (the rig's fake
+// GoTrue + service-role-token plumbing live in rig_test.go).
+type ssoConnectionView struct {
+	ID          string    `json:"id"`
+	Kind        string    `json:"kind"`
+	ProviderID  string    `json:"provider_id"`
+	DefaultRole string    `json:"default_role"`
+	Enabled     bool      `json:"enabled"`
+	Enforced    bool      `json:"enforced"`
+	Tested      bool      `json:"tested"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
-func newSSOFakeGoTrue(t *testing.T, wantToken string) *ssoFakeGoTrue {
-	t.Helper()
-	f := &ssoFakeGoTrue{wantToken: wantToken}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/admin/sso/providers", func(w http.ResponseWriter, r *http.Request) {
-		// GoTrue authenticates the admin call by the service-role token; here we
-		// assert TF presented exactly the configured static token.
-		if r.Header.Get("Authorization") != "Bearer "+f.wantToken {
-			w.WriteHeader(http.StatusUnauthorized)
-			return
-		}
-		if r.Method != http.MethodPost {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		var body map[string]any
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		f.mu.Lock()
-		f.postCount++
-		f.lastBody = body
-		f.mu.Unlock()
-		writeJSON(w, http.StatusCreated, map[string]any{"id": uuid.NewString()})
-	})
-	f.srv = httptest.NewServer(mux)
-	t.Cleanup(f.srv.Close)
-	return f
-}
-
-func (f *ssoFakeGoTrue) posts() int {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.postCount
-}
-
-func (f *ssoFakeGoTrue) lastPostBody() map[string]any {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.lastBody
-}
-
-// newSSORig builds a multi-mode auth rig wired to point GoTrue admin calls at a
-// fake, with the service-role token set in the env. Returns the rig + the fake
-// so tests can assert what TF sent to GoTrue.
-func newSSORig(t *testing.T) (*authRig, *ssoFakeGoTrue) {
-	t.Helper()
-	runmode.SetForTest(t, runmode.ModeMulti)
-	fake := newSSOFakeGoTrue(t, ssoTestServiceToken)
-	t.Setenv(envServiceRoleToken, ssoTestServiceToken)
-	r := newAuthRig(t)
-	// The rig wires SetAuthDeps with an unused GoTrue URL; repoint it at the
-	// fake. The handler reads it lazily via s.gotrueAdminBaseURL on each call.
-	r.srv.authCfg.gotrueURL = fake.srv.URL
-	return r, fake
+type ssoConnectionResponse struct {
+	Connection *ssoConnectionView `json:"connection"`
+	EntityID   string             `json:"entity_id"`
+	ACSURL     string             `json:"acs_url"`
 }
 
 // TestSSOConnectionCreate_NoServiceToken_503: with TF_GOTRUE_SERVICE_ROLE_TOKEN
@@ -102,7 +43,7 @@ func TestSSOConnectionCreate_NoServiceToken_503(t *testing.T) {
 
 	t.Setenv(envServiceRoleToken, "") // override: token not configured
 
-	resp := doInviteReq(r, http.MethodPost, "/api/sso/connection", sid,
+	resp := doReq(r, http.MethodPost, "/api/sso/connection", sid,
 		map[string]string{"metadata_url": "https://idp/metadata.xml"})
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d; want 503 when service-role token unset (body=%s)", resp.StatusCode, readBody(resp))
@@ -122,7 +63,7 @@ func TestSSOConnectionCreate_HappyPath(t *testing.T) {
 	sid := r.signInAs(owner)
 
 	const metadataURL = "https://login.microsoftonline.com/tenant/federationmetadata.xml"
-	resp := doInviteReq(r, http.MethodPost, "/api/sso/connection", sid,
+	resp := doReq(r, http.MethodPost, "/api/sso/connection", sid,
 		map[string]string{"metadata_url": metadataURL})
 	raw := readBody(resp)
 	if resp.StatusCode != http.StatusCreated {
@@ -189,7 +130,7 @@ func TestSSOConnectionCreate_NonAdmin_404(t *testing.T) {
 	pgtest.AddOrgMember(t, r.h, member.String(), orgID.String(), teamID.String(), "member", "member")
 	sid := r.signInAs(member)
 
-	resp := doInviteReq(r, http.MethodPost, "/api/sso/connection", sid,
+	resp := doReq(r, http.MethodPost, "/api/sso/connection", sid,
 		map[string]string{"metadata_url": "https://idp/metadata.xml"})
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d; want 404 (non-admin); body=%s", resp.StatusCode, readBody(resp))
@@ -214,7 +155,7 @@ func TestSSOConnectionCreate_Idempotent(t *testing.T) {
 	orgID, _ := r.seedOrg(owner, "sso-idem")
 	sid := r.signInAs(owner)
 
-	first := doInviteReq(r, http.MethodPost, "/api/sso/connection", sid,
+	first := doReq(r, http.MethodPost, "/api/sso/connection", sid,
 		map[string]string{"metadata_url": "https://idp/metadata.xml"})
 	if first.StatusCode != http.StatusCreated {
 		t.Fatalf("first status = %d; want 201 (body=%s)", first.StatusCode, readBody(first))
@@ -224,7 +165,7 @@ func TestSSOConnectionCreate_Idempotent(t *testing.T) {
 
 	// A second call (even with a different metadata URL) is a no-op reuse:
 	// rotating the metadata is a deferred follow-up, so no 2nd provider.
-	second := doInviteReq(r, http.MethodPost, "/api/sso/connection", sid,
+	second := doReq(r, http.MethodPost, "/api/sso/connection", sid,
 		map[string]string{"metadata_url": "https://idp/metadata-changed.xml"})
 	raw := readBody(second)
 	if second.StatusCode != http.StatusOK {
@@ -258,13 +199,13 @@ func TestSSOConnectionUpdate_EnableDisable(t *testing.T) {
 	r.seedOrg(owner, "sso-toggle")
 	sid := r.signInAs(owner)
 
-	create := doInviteReq(r, http.MethodPost, "/api/sso/connection", sid,
+	create := doReq(r, http.MethodPost, "/api/sso/connection", sid,
 		map[string]string{"metadata_url": "https://idp/metadata.xml"})
 	if create.StatusCode != http.StatusCreated {
 		t.Fatalf("create status = %d (body=%s)", create.StatusCode, readBody(create))
 	}
 
-	dis := doInviteReq(r, http.MethodPatch, "/api/sso/connection", sid,
+	dis := doReq(r, http.MethodPatch, "/api/sso/connection", sid,
 		map[string]bool{"enabled": false})
 	raw := readBody(dis)
 	if dis.StatusCode != http.StatusOK {
@@ -279,7 +220,7 @@ func TestSSOConnectionUpdate_EnableDisable(t *testing.T) {
 		t.Errorf("disable changed default_role to %q; want member preserved", disBody.Connection.DefaultRole)
 	}
 
-	en := doInviteReq(r, http.MethodPatch, "/api/sso/connection", sid,
+	en := doReq(r, http.MethodPatch, "/api/sso/connection", sid,
 		map[string]bool{"enabled": true})
 	var enBody ssoConnectionResponse
 	_ = json.Unmarshal([]byte(readBody(en)), &enBody)
@@ -296,7 +237,7 @@ func TestSSOConnectionUpdate_NoConnection_404(t *testing.T) {
 	r.seedOrg(owner, "sso-patch-empty")
 	sid := r.signInAs(owner)
 
-	resp := doInviteReq(r, http.MethodPatch, "/api/sso/connection", sid,
+	resp := doReq(r, http.MethodPatch, "/api/sso/connection", sid,
 		map[string]bool{"enabled": false})
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("status = %d; want 404 (no connection)", resp.StatusCode)
@@ -311,11 +252,11 @@ func TestSSOConnectionGet_ReturnsSPValues(t *testing.T) {
 	r.seedOrg(owner, "sso-get")
 	sid := r.signInAs(owner)
 
-	wantEntity := r.srv.deployCfg.publicURL + "/auth/v1/sso/saml/metadata"
-	wantACS := r.srv.deployCfg.publicURL + "/auth/v1/sso/saml/acs"
+	wantEntity := testPublicURL + "/auth/v1/sso/saml/metadata"
+	wantACS := testPublicURL + "/auth/v1/sso/saml/acs"
 
 	// Before registration: SP values present, connection null.
-	pre := doInviteReq(r, http.MethodGet, "/api/sso/connection", sid, nil)
+	pre := doReq(r, http.MethodGet, "/api/sso/connection", sid, nil)
 	rawPre := readBody(pre)
 	if pre.StatusCode != http.StatusOK {
 		t.Fatalf("get(pre) status = %d (body=%s)", pre.StatusCode, rawPre)
@@ -335,9 +276,9 @@ func TestSSOConnectionGet_ReturnsSPValues(t *testing.T) {
 	}
 
 	// After registration: connection present, SP values unchanged.
-	doInviteReq(r, http.MethodPost, "/api/sso/connection", sid,
+	doReq(r, http.MethodPost, "/api/sso/connection", sid,
 		map[string]string{"metadata_url": "https://idp/metadata.xml"})
-	post := doInviteReq(r, http.MethodGet, "/api/sso/connection", sid, nil)
+	post := doReq(r, http.MethodGet, "/api/sso/connection", sid, nil)
 	var ab ssoConnectionResponse
 	_ = json.Unmarshal([]byte(readBody(post)), &ab)
 	if ab.Connection == nil {
@@ -354,16 +295,15 @@ func TestSSOConnectionGet_ReturnsSPValues(t *testing.T) {
 // response. Uses GET (no CSRF) so a blanked publicURL doesn't trip the
 // same-origin check.
 func TestSSOConnectionGet_NoPublicURL_500(t *testing.T) {
-	r, _ := newSSORig(t)
+	// Build the deployment with no public URL configured, so PublicURL() returns
+	// "" and the handler must fail fast rather than emit relative SP paths. (GET
+	// only, so the blanked publicURL doesn't trip the same-origin CSRF check.)
+	r := newAuthRigWith(t, "")
 	owner := r.seedUser()
 	r.seedOrg(owner, "sso-no-public-url")
 	sid := r.signInAs(owner)
 
-	// Blank the public URL after sign-in (the rig wired it for the OAuth flow);
-	// publicURL() now returns "".
-	r.srv.deployCfg.publicURL = ""
-
-	resp := doInviteReq(r, http.MethodGet, "/api/sso/connection", sid, nil)
+	resp := doReq(r, http.MethodGet, "/api/sso/connection", sid, nil)
 	if resp.StatusCode != http.StatusInternalServerError {
 		t.Fatalf("status = %d; want 500 when public URL unconfigured (body=%s)", resp.StatusCode, readBody(resp))
 	}
@@ -385,7 +325,7 @@ func TestSSOConnectionCreate_NonHTTPSMetadata_400(t *testing.T) {
 		"ftp://idp/metadata.xml",
 		"not a url",
 	} {
-		resp := doInviteReq(r, http.MethodPost, "/api/sso/connection", sid,
+		resp := doReq(r, http.MethodPost, "/api/sso/connection", sid,
 			map[string]string{"metadata_url": bad})
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("metadata_url=%q: status = %d; want 400", bad, resp.StatusCode)
@@ -404,7 +344,7 @@ func TestSSOConnectionCreate_NonHTTPSMetadata_400(t *testing.T) {
 }
 
 // TestSSOConnection_OrgIsolation: org B's admin can neither see nor modify org
-// A's connection. This is the cross-org isolation boundary TFAC-426's JIT trusts
+// A's connection. This is the cross-org isolation boundary SSO JIT trusts
 // (provider_id → exactly one org), enforced by RLS + requireOrg + the org-scoped
 // store reads — the non-admin 404 covers privilege, this covers tenancy.
 func TestSSOConnection_OrgIsolation(t *testing.T) {
@@ -416,7 +356,7 @@ func TestSSOConnection_OrgIsolation(t *testing.T) {
 
 	// Org A registers a connection.
 	sidA := r.signInAs(ownerA)
-	if resp := doInviteReq(r, http.MethodPost, "/api/sso/connection", sidA,
+	if resp := doReq(r, http.MethodPost, "/api/sso/connection", sidA,
 		map[string]string{"metadata_url": "https://idp-a/metadata.xml"}); resp.StatusCode != http.StatusCreated {
 		t.Fatalf("org A create status = %d (body=%s)", resp.StatusCode, readBody(resp))
 	}
@@ -424,7 +364,7 @@ func TestSSOConnection_OrgIsolation(t *testing.T) {
 	sidB := r.signInAs(ownerB)
 
 	// Org B's GET must not surface org A's connection (RLS-scoped read).
-	getB := doInviteReq(r, http.MethodGet, "/api/sso/connection", sidB, nil)
+	getB := doReq(r, http.MethodGet, "/api/sso/connection", sidB, nil)
 	if getB.StatusCode != http.StatusOK {
 		t.Fatalf("org B get status = %d (body=%s)", getB.StatusCode, readBody(getB))
 	}
@@ -435,7 +375,7 @@ func TestSSOConnection_OrgIsolation(t *testing.T) {
 	}
 
 	// Org B's PATCH finds no connection in its own org → 404; it cannot reach A.
-	if resp := doInviteReq(r, http.MethodPatch, "/api/sso/connection", sidB,
+	if resp := doReq(r, http.MethodPatch, "/api/sso/connection", sidB,
 		map[string]bool{"enabled": false}); resp.StatusCode != http.StatusNotFound {
 		t.Errorf("org B patch status = %d; want 404 (no connection in B)", resp.StatusCode)
 	}
@@ -459,33 +399,5 @@ func TestSSOConnection_OrgIsolation(t *testing.T) {
 	}
 }
 
-// TestSSOConnection_LocalMode404: every route 404s in local mode (N=1, no IdP).
-// adminGate checks runmode before touching any dependency, so this is a pure
-// unit test — no rig, no GoTrue, no store needed. (In production withSession
-// injects sentinel claims in local mode and the handler then 404s the same way;
-// the multi-mode auth rig can't represent local mode because it always wires
-// authDeps, so it's tested directly here instead.)
-func TestSSOConnection_LocalMode404(t *testing.T) {
-	runmode.SetForTest(t, runmode.ModeLocal)
-	h := &ssoConnectionHandler{}
-
-	cases := []struct {
-		method string
-		fn     func(http.ResponseWriter, *http.Request)
-	}{
-		{http.MethodGet, h.handleSSOConnectionGet},
-		{http.MethodPost, h.handleSSOConnectionCreate},
-		{http.MethodPatch, h.handleSSOConnectionUpdate},
-	}
-	for _, tc := range cases {
-		t.Run(tc.method, func(t *testing.T) {
-			// Body is irrelevant — adminGate 404s before it's read.
-			req := httptest.NewRequest(tc.method, "/api/sso/connection", nil)
-			rec := httptest.NewRecorder()
-			tc.fn(rec, req)
-			if rec.Code != http.StatusNotFound {
-				t.Fatalf("%s status = %d; want 404 in local mode", tc.method, rec.Code)
-			}
-		})
-	}
-}
+// TestSSOConnection_LocalMode404 moved to ee/sso/handlers_test.go with the
+// connection handler.
