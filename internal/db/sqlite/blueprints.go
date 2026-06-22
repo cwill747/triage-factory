@@ -879,19 +879,64 @@ func (s *blueprintStore) MarkRunStatus(ctx context.Context, orgID, id string, st
 	if abortedAtStep != nil {
 		stepArg = *abortedAtStep
 	}
-	res, err := s.q.ExecContext(ctx, `
-		UPDATE blueprint_runs
-		SET status = ?, abort_reason = ?, aborted_at_step = ?, completed_at = ?
-		WHERE id = ? AND status IN ('running','pending_approval','open')
-	`, string(status), reasonArg, stepArg, time.Now().UTC(), id)
+	now := time.Now().UTC()
+	// Flip the blueprint_run terminal AND cancel any still-active child
+	// run in one transaction, so a terminal parent can never be observed (or
+	// committed) alongside a live child. inTx composes with the caller's tx when
+	// MarkRunStatus runs inside SyntheticClaimsWithTx (manual path) and opens a
+	// fresh one on the bare admin/system handle — either way the two writes are
+	// all-or-nothing. Without a non-terminal child a cancel that raced the
+	// dispatcher's claim/setup window (or a parked open/pending_approval step the
+	// sequence-cancel path skips) would strand a child 'running', keeping the
+	// dispatcher on phantom work and pinning its feature branch in a worktree,
+	// requeuing forever.
+	var changed bool
+	err := inTx(ctx, s.q, func(q queryer) error {
+		res, err := q.ExecContext(ctx, `
+			UPDATE blueprint_runs
+			SET status = ?, abort_reason = ?, aborted_at_step = ?, completed_at = ?
+			WHERE id = ? AND status IN ('running','pending_approval','open')
+		`, string(status), reasonArg, stepArg, now, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		changed = n > 0
+		// Only on a real transition (changed) to a terminal target; a no-op flip
+		// or a non-terminal target leaves children alone. In the common terminate
+		// paths the triggering step is already terminal, so this is a guard that
+		// fires only on the race.
+		if changed && status.Terminal() {
+			return cancelOrphanedChildRuns(ctx, q, id)
+		}
+		return nil
+	})
 	if err != nil {
 		return false, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
-	}
-	return n > 0, nil
+	return changed, nil
+}
+
+// cancelOrphanedChildRuns marks every non-terminal child run of blueprintRunID
+// 'cancelled' (stamping completed_at). Called by MarkRunStatus's atomic flip;
+// RunQueueStore.ReconcileOrphanedRuns applies the same terminal-status filter in
+// its own boot sweep (it can't share this body — different store, different
+// scope). The filter is the canonical run terminal set used across the agentrun
+// store.
+func cancelOrphanedChildRuns(ctx context.Context, q queryer, blueprintRunID string) error {
+	_, err := q.ExecContext(ctx, `
+		UPDATE runs
+		SET status = 'cancelled',
+		    completed_at = COALESCE(completed_at, ?),
+		    stop_reason = COALESCE(stop_reason, 'blueprint_terminal'),
+		    result_summary = COALESCE(NULLIF(result_summary, ''), ?)
+		WHERE blueprint_run_id = ?
+		  AND status NOT IN (`+runTerminalStatusesSQL+`)
+	`, time.Now().UTC(), "Cancelled: owning blueprint run reached a terminal state", blueprintRunID)
+	return err
 }
 
 func (s *blueprintStore) ReopenRunForResume(ctx context.Context, orgID, id string) (bool, error) {

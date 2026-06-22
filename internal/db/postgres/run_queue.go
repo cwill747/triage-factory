@@ -24,6 +24,13 @@ func newRunQueueStore(conn *sql.DB) db.RunQueueStore {
 
 var _ db.RunQueueStore = (*runQueueStore)(nil)
 
+// runTerminalStatusesSQL is the canonical set of terminal runs.status values as
+// a SQL IN-list body. The reconcile sweep and the orphaned-child cancel
+// (blueprints.go) interpolate it instead of re-spelling the literal, so the
+// "non-terminal child" predicate has one definition. Other queries that add
+// dormant statuses (open/pending_approval) to this set keep their own list.
+const runTerminalStatusesSQL = `'completed','failed','cancelled','task_unsolvable'`
+
 // runQueueClaimCols is the column list ClaimNextRun returns.
 const runQueueClaimCols = `id::text, org_id::text, task_id::text, COALESCE(prompt_id, ''), status, COALESCE(model, ''),
 	COALESCE(worktree_path, ''), COALESCE(session_id, ''), trigger_type, COALESCE(trigger_id::text, ''),
@@ -122,6 +129,29 @@ func (s *runQueueStore) ResetProcessingRuns(ctx context.Context) (int, error) {
 		)
 		AND blueprint_run_id IN (SELECT id FROM blueprint_runs WHERE status = 'running')
 	`)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
+}
+
+func (s *runQueueStore) ReconcileOrphanedRuns(ctx context.Context) (int, error) {
+	// Boot self-heal — see RunQueueStore.ReconcileOrphanedRuns and the
+	// SQLite mirror. Admin pool (BYPASSRLS): a cross-org system sweep with no
+	// per-user identity, the same posture as ResetProcessingRuns.
+	res, err := s.conn.ExecContext(ctx, `
+		UPDATE runs
+		SET status = 'cancelled',
+		    completed_at = COALESCE(completed_at, now()),
+		    stop_reason = COALESCE(stop_reason, 'blueprint_terminal'),
+		    result_summary = COALESCE(NULLIF(result_summary, ''), $1)
+		WHERE status NOT IN (`+runTerminalStatusesSQL+`)
+		  AND blueprint_run_id IN (
+		      SELECT id FROM blueprint_runs
+		      WHERE status IN ('completed','aborted','failed','cancelled')
+		  )
+	`, "Cancelled: owning blueprint run reached a terminal state")
 	if err != nil {
 		return 0, err
 	}
