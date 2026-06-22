@@ -44,6 +44,11 @@ type recordingJiraServer struct {
 	failAssign     bool
 
 	transitionPosted chan struct{}
+	// claimStateRead fires after the GetClaimState issue read is served — the
+	// observable point of a no-op mirror pass (one that reads state and then
+	// transitions nothing), so a test can join a detached mirror goroutine even
+	// when it makes no write.
+	claimStateRead chan struct{}
 }
 
 // idToStatus maps the transition ids the fake serves back to their target
@@ -60,6 +65,7 @@ func newRecordingJiraServer(t *testing.T, status, assignee string) *recordingJir
 		status:           status,
 		assignee:         assignee,
 		transitionPosted: make(chan struct{}, 8),
+		claimStateRead:   make(chan struct{}, 8),
 	}
 	r.srv = httptest.NewServer(http.HandlerFunc(r.handle))
 	t.Cleanup(r.srv.Close)
@@ -122,6 +128,10 @@ func (r *recordingJiraServer) handle(w http.ResponseWriter, req *http.Request) {
 			assigneeJSON = `{"name":"` + assignee + `"}`
 		}
 		_, _ = io.WriteString(w, `{"key":"SKY-1","fields":{"status":{"name":"`+status+`"},"assignee":`+assigneeJSON+`}}`)
+		select {
+		case r.claimStateRead <- struct{}{}:
+		default:
+		}
 	default:
 		w.WriteHeader(http.StatusOK)
 	}
@@ -168,6 +178,19 @@ func (r *recordingJiraServer) waitTransition(t *testing.T) {
 	case <-r.transitionPosted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for the mirror's Jira transition")
+	}
+}
+
+// waitClaimState blocks until the fake has served one GetClaimState issue read,
+// or fails on timeout — the deterministic join for a mirror pass that makes no
+// write (so waitTransition would never fire). After this returns the mirror
+// goroutine has read state and made its (no-op) decision.
+func (r *recordingJiraServer) waitClaimState(t *testing.T) {
+	t.Helper()
+	select {
+	case <-r.claimStateRead:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for the mirror's Jira claim-state read")
 	}
 }
 
@@ -566,11 +589,43 @@ func TestRecomputeBoard_GitHubTask_NoMirror(t *testing.T) {
 	}
 }
 
-// --- Hook 2: terminateBlueprint completed -> done mirror ------------------
+// --- Hook 2: terminateBlueprint completed -> in-progress mirror -----------
 
-// A clean blueprint completion transitions the ticket to DoneCanonical.
-func TestTerminateBlueprint_CompletedJiraTask_MirrorsDone(t *testing.T) {
-	s, database, runID, taskID, fake, res := setupJiraMirrorFixture(t, "done", "In Progress", "bot")
+// A clean blueprint completion re-asserts the InProgress bucket — NOT Done. The
+// agent has opened its PR and the work is awaiting human review + merge, which is
+// still "in progress" to a Jira watcher; the ticket only reaches Done when its
+// PR merges (a separate, entity-driven mirror). Starting from To Do/unassigned
+// also exercises the self-heal: completion brings a ticket left behind by a
+// failed dispatch-time mirror up to In Progress.
+func TestTerminateBlueprint_CompletedJiraTask_MirrorsInProgress(t *testing.T) {
+	s, database, runID, taskID, fake, res := setupJiraMirrorFixture(t, "complete", "To Do", "")
+	stampBotClaim(t, database, taskID)
+	bpr := blueprintRunIDForRun(t, database, runID)
+
+	s.terminateBlueprint(runmode.LocalDefaultOrgID, bpr, taskID, "event", "",
+		time.Now(), runConfig{orgID: runmode.LocalDefaultOrgID}, domain.BlueprintRunStatusCompleted, "", nil, true)
+
+	if got := readTaskStatus(t, database, taskID); got != "done" {
+		t.Fatalf("task status = %q, want done (the board card still completes)", got)
+	}
+	fake.waitTransition(t)
+	if n := res.systemCalls(); n != 1 {
+		t.Errorf("ForSystem calls = %d, want 1", n)
+	}
+	assigns, transitions := fake.snapshot()
+	if assigns != 1 {
+		t.Errorf("assigns = %d, want 1 (completion assigns the bot + moves to In Progress)", assigns)
+	}
+	if len(transitions) != 1 || transitions[0] != "In Progress" {
+		t.Errorf("transitions = %v, want [In Progress] (completion must not move the ticket to Done)", transitions)
+	}
+}
+
+// A clean completion never transitions an already-In-Progress ticket — the
+// common case (the dispatch-time mirror already moved it) is an idempotent
+// no-op, and crucially does NOT advance it to Done.
+func TestTerminateBlueprint_CompletedJiraTask_AlreadyInProgress_NoDoneMove(t *testing.T) {
+	s, database, runID, taskID, fake, _ := setupJiraMirrorFixture(t, "complete-noop", "In Progress", "bot")
 	stampBotClaim(t, database, taskID)
 	bpr := blueprintRunIDForRun(t, database, runID)
 
@@ -580,20 +635,22 @@ func TestTerminateBlueprint_CompletedJiraTask_MirrorsDone(t *testing.T) {
 	if got := readTaskStatus(t, database, taskID); got != "done" {
 		t.Fatalf("task status = %q, want done", got)
 	}
-	fake.waitTransition(t)
-	if n := res.systemCalls(); n != 1 {
-		t.Errorf("ForSystem calls = %d, want 1", n)
+	// Join the detached mirror goroutine on its claim-state read (it makes no
+	// write, so there is no transition to wait on) before asserting — otherwise
+	// the assertion would win the race and pass even if a bug introduced an
+	// erroneous transition.
+	fake.waitClaimState(t)
+	// The mirror reads claim state but, finding the ticket already In Progress +
+	// assigned, makes no write — and crucially never advances it to Done.
+	if _, transitions := fake.snapshot(); len(transitions) != 0 {
+		t.Errorf("transitions = %v, want none (already In Progress; completion must not move to Done)", transitions)
 	}
-	assigns, transitions := fake.snapshot()
-	if assigns != 0 {
-		t.Errorf("assigns = %d, want 0 (done leaves the ticket assigned to the bot)", assigns)
-	}
-	if len(transitions) != 1 || transitions[0] != "Done" {
-		t.Errorf("transitions = %v, want [Done]", transitions)
+	if got := fake.currentStatus(); got != "In Progress" {
+		t.Errorf("final status = %q, want In Progress (completion never reaches Done)", got)
 	}
 }
 
-// A failed/aborted blueprint must NOT move the ticket to Done — the mirror is
+// A failed/aborted blueprint must NOT move the ticket at all — the mirror is
 // gated to the completed branch only, so ForSystem is never reached.
 func TestTerminateBlueprint_AbortedJiraTask_NoMirror(t *testing.T) {
 	s, database, runID, taskID, fake, res := setupJiraMirrorFixture(t, "abort", "In Progress", "bot")
@@ -612,7 +669,8 @@ func TestTerminateBlueprint_AbortedJiraTask_NoMirror(t *testing.T) {
 }
 
 // User takeover before a clean completion: the task is no longer agent-owned,
-// so the done hook skips the Jira transition (the terminal write is the user's).
+// so the completion hook skips the Jira mirror (the terminal write is the
+// user's).
 func TestTerminateBlueprint_CompletedButUserTookOver_NoMirror(t *testing.T) {
 	s, database, runID, taskID, fake, res := setupJiraMirrorFixture(t, "takeover", "In Progress", "bot")
 	stampUserClaim(t, database, taskID) // takeover flipped the claim to the user
@@ -622,7 +680,7 @@ func TestTerminateBlueprint_CompletedButUserTookOver_NoMirror(t *testing.T) {
 		time.Now(), runConfig{orgID: runmode.LocalDefaultOrgID}, domain.BlueprintRunStatusCompleted, "", nil, true)
 
 	if n := res.systemCalls(); n != 0 {
-		t.Errorf("ForSystem calls = %d, want 0 (user takeover: bot must not mirror the done transition)", n)
+		t.Errorf("ForSystem calls = %d, want 0 (user takeover: bot must not mirror the completion)", n)
 	}
 	if _, transitions := fake.snapshot(); len(transitions) != 0 {
 		t.Errorf("transitions = %v, want none after takeover", transitions)
