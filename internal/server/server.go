@@ -129,9 +129,14 @@ type Server struct {
 	// Local mode always passes runmode.LocalDefaultOrgID; multi-mode
 	// handlers thread the request's orgID through so the callback
 	// can't fire one org's poller restart with another org's PAT.
-	onGitHubChanged func(orgID string) // GitHub creds/repos changed — full restart + re-profile
+	onGitHubChanged func(orgID string) // GitHub creds/access changed — evict the reachable-repo cache + re-due the org's GitHub poll (profiling is driven by the system:poll "profiler" subscriber, not here)
 	onJiraChanged   func(orgID string) // Jira config changed — restart Jira poller only
 	scorerTrigger   func(orgID string) // invoked after non-poll task creation (e.g. carry-over) to kick the per-org scorer immediately
+	// profilerTrigger kicks the per-org repo-profiling manager. force=true
+	// bypasses the 3-day TTL — the explicit "Re-profile" button and a
+	// repo-set change both want an immediate re-profile rather than waiting
+	// out a poll interval. Nil until SetProfilerTrigger runs.
+	profilerTrigger func(orgID string, force bool)
 	// dashboardBackfill seeds a bound user's trailing-window PR history into the
 	// entity store so the personal dashboard isn't blank for history that
 	// predates tracking (TFAC-396). Multi-mode only — wired to the poller's
@@ -1158,15 +1163,17 @@ func (s *Server) SetCurator(c *curator.Curator) {
 }
 
 // SetOnGitHubChanged registers a callback for GitHub config changes (creds, URL, repos).
-// This triggers a full restart: invalidate profiles → stop all pollers → re-profile → restart.
+// The callback re-dues the org's GitHub poll so the new credential/repo set
+// applies on the next wake; repo profiling is no longer triggered here — it's
+// driven by the system:poll "profiler" subscriber off that poll's completion.
 // The orgID is the tenant whose creds changed — closure re-resolves via SecretStore.
 //
 // The registered callback is wrapped so the reachable-repo enumeration cache
-// (SKY-409) is evicted for the org *before* the restart logic runs: a creds
+// (SKY-409) is evicted for the org *before* the re-due runs: a creds
 // rotation, App install, or repo-set change can move which repos the org can
 // reach, and a stale cached enumeration must never satisfy the next write.
 //
-// Handlers fire this callback in a goroutine (the restart is slow), so the
+// Handlers fire this callback in a goroutine, so the
 // eviction is asynchronous: a second write landing in the same instant as a
 // first could still read the pre-eviction cache. That race is benign — the
 // cache was just validated as correct, and the near-simultaneous second write
@@ -1193,6 +1200,14 @@ func (s *Server) SetOnJiraChanged(fn func(orgID string)) {
 // next poll cycle.
 func (s *Server) SetScorerTrigger(fn func(orgID string)) {
 	s.scorerTrigger = fn
+}
+
+// SetProfilerTrigger registers the per-org repo-profiling trigger (the
+// Manager's Trigger). force=true bypasses the 3-day TTL. Used by the
+// repo-set-change / "Re-profile" path so a re-profile starts immediately
+// rather than waiting for the next poll cycle's TTL-gated pass.
+func (s *Server) SetProfilerTrigger(fn func(orgID string, force bool)) {
+	s.profilerTrigger = fn
 }
 
 // SetDashboardBackfiller registers the per-user dashboard-history backfill

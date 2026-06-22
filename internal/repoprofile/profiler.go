@@ -33,6 +33,11 @@ type Profiler struct {
 	repos    db.RepoStore // profile reads + upserts go through the store
 	orgs     db.OrgsStore // iterate active orgs at the top of each profile run
 	ws       *websocket.Hub
+
+	// batchFn runs one Haiku profiling batch. Defaulted to profileBatch;
+	// overridable so tests can exercise the with-docs upsert / fallback paths
+	// without spawning a real agent subprocess.
+	batchFn func(ctx context.Context, orgID string, batch []repoWithDocs, secrets agentproc.SecretsReader) ([]repoProfileResult, error)
 }
 
 // NewProfiler creates a Profiler with the given GitHub resolver, per-org
@@ -40,7 +45,7 @@ type Profiler struct {
 // resolver is consulted per (org, owner) inside the profiling loop so the
 // same code path serves both local (keychain PAT) and multi (App token).
 func NewProfiler(resolver github.Resolver, secrets agentproc.SecretsReader, database *sql.DB, repos db.RepoStore, orgs db.OrgsStore, ws *websocket.Hub) *Profiler {
-	return &Profiler{resolver: resolver, secrets: secrets, database: database, repos: repos, orgs: orgs, ws: ws}
+	return &Profiler{resolver: resolver, secrets: secrets, database: database, repos: repos, orgs: orgs, ws: ws, batchFn: profileBatch}
 }
 
 // repoWithDocs groups a repo profile with the documentation text to send to the LLM.
@@ -62,6 +67,10 @@ type repoWithDocs struct {
 // returned error is only non-nil if context is cancelled mid-flight;
 // individual-org failures degrade gracefully (row writes still happen
 // where possible, falls back to docs-only).
+//
+// Run is the all-orgs sweep retained for tests and ad-hoc backfill; the
+// running server profiles per-org through the Manager's Runner (driven by
+// the system:poll: "profiler" subscriber), which calls RunOrg directly.
 func (p *Profiler) Run(ctx context.Context, force bool) error {
 	orgIDs, err := p.orgs.ListActiveSystem(ctx)
 	if err != nil {
@@ -71,12 +80,7 @@ func (p *Profiler) Run(ctx context.Context, force bool) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		repos, err := p.repos.ListConfiguredNamesSystem(ctx, orgID)
-		if err != nil {
-			repoprofileLog.Error("load configured repos failed", "org", orgID, "error", err)
-			continue
-		}
-		if err := p.runOrg(ctx, orgID, repos, force); err != nil {
+		if _, err := p.RunOrg(ctx, orgID, force); err != nil {
 			if ctx.Err() != nil {
 				return err
 			}
@@ -86,18 +90,47 @@ func (p *Profiler) Run(ctx context.Context, force bool) error {
 	return nil
 }
 
+// RunOrg profiles a single org's configured repos. It is the per-org unit
+// the Manager's per-org Runner drives off system:poll: sentinels (each
+// carries evt.OrgID) and the explicit re-profile button. It resolves the
+// org's configured repo list, then reuses runOrg — including its TTL skip,
+// per-repo client resolution + skip-on-error, and the "fetch error leaves
+// the row untouched for retry" contract (TFAC-331). force bypasses the
+// 3-day TTL. The returned bool reports whether any profile row was written
+// this cycle (see runOrg) — the Runner uses it to skip the bare-clone
+// bootstrap on a no-op TTL-skip cycle.
+func (p *Profiler) RunOrg(ctx context.Context, orgID string, force bool) (bool, error) {
+	repos, err := p.repos.ListConfiguredNamesSystem(ctx, orgID)
+	if err != nil {
+		return false, fmt.Errorf("load configured repos: %w", err)
+	}
+	return p.runOrg(ctx, orgID, repos, force)
+}
+
 // runOrg profiles one org's repos. Per-repo failures are logged and
 // the loop continues — partial progress is better than aborting the
 // whole batch on a transient GitHub API failure or a malformed repo
 // name. Cross-org repo dedup at the GitHub fetch layer (two orgs
 // both polling owner/repo doing two fetches) is a deferred concern
 // — local mode is N=1 so there's no immediate dedup pressure.
-func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, force bool) error {
+// The returned bool reports whether this cycle *successfully persisted* any
+// profile row — at least one repo passed the TTL + fetch gate and had its
+// clone metadata written by an UpsertSystem that returned nil. A
+// steady-state cycle where every repo is TTL-skipped (or where every write
+// failed) returns false, letting the caller skip the post-profile bare-clone
+// bootstrap (and its per-repo WS broadcasts) when nothing landed on disk.
+func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, force bool) (bool, error) {
 	if len(repos) == 0 {
-		return nil
+		return false, nil
 	}
 
 	repoprofileLog.Info("profiling configured repos", "org", orgID, "repos", len(repos))
+
+	// touched flips true the first time a repo's row is *successfully*
+	// upserted this cycle (any of the three write sites below). A failed
+	// write leaves it false so the caller doesn't bootstrap bare clones for
+	// a clone_url that never landed.
+	touched := false
 
 	// Resolve the clone protocol once for the whole run rather than
 	// re-reading per-org settings inside the per-repo loop. The setting
@@ -117,7 +150,7 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 
 	for _, name := range repos {
 		if err := ctx.Err(); err != nil {
-			return err
+			return touched, err
 		}
 
 		parts := strings.SplitN(name, "/", 2)
@@ -195,9 +228,25 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 			DefaultBranch: defaultBranch,
 		}
 
+		// A repo with no docs is fully inspected by this fetch — there's
+		// nothing to send to the LLM, so stamp profiled_at now to gate it
+		// behind the TTL. Without this, a docs-less repo has profiled_at=nil
+		// forever and gets all four files re-fetched every poll cycle (the
+		// profiler now runs per-cycle, not just on config change). Repos WITH
+		// docs are stamped in the batch path below — and only on a successful
+		// run, so a transient batch failure still retries next cycle
+		// (error ≠ absence, the TFAC-331 invariant).
+		docs := buildDocText(readme, claudeMd, agentsMd)
+		if docs == "" {
+			now := time.Now()
+			prof.ProfiledAt = &now
+		}
+
 		// Persist docs flags immediately so the UI can show them before profiling completes
 		if err := p.repos.UpsertSystem(ctx, orgID, prof); err != nil {
 			repoprofileLog.Error("upsert docs flags failed", "repo", name, "error", err)
+		} else {
+			touched = true
 		}
 		if p.ws != nil {
 			p.ws.Broadcast(websocket.Event{
@@ -212,7 +261,6 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 			})
 		}
 
-		docs := buildDocText(readme, claudeMd, agentsMd)
 		if docs == "" {
 			withoutDocs = append(withoutDocs, prof)
 		} else {
@@ -226,7 +274,7 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 	profiled := 0
 	for i := 0; i < len(withDocs); i += profileBatchSize {
 		if err := ctx.Err(); err != nil {
-			return err
+			return touched, err
 		}
 
 		end := i + profileBatchSize
@@ -235,7 +283,7 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 		}
 		batch := withDocs[i:end]
 
-		results, err := profileBatch(ctx, orgID, batch, p.secrets)
+		results, err := p.batchFn(ctx, orgID, batch, p.secrets)
 		if err != nil {
 			repoprofileLog.Error("profile batch failed", "batch", i/profileBatchSize+1, "error", err)
 			repoNames := make([]string, len(batch))
@@ -247,6 +295,8 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 			for _, d := range batch {
 				if uErr := p.repos.UpsertSystem(ctx, orgID, d.profile); uErr != nil {
 					repoprofileLog.Error("upsert fallback failed", "repo", d.profile.ID, "error", uErr)
+				} else {
+					touched = true
 				}
 			}
 			continue
@@ -262,12 +312,18 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 			prof := d.profile
 			if text := byRepo[prof.ID]; text != "" {
 				prof.ProfileText = text
-				prof.ProfiledAt = &now
 			}
+			// Stamp on every successful batch result, even when the model
+			// returned empty text: the batch completing IS a finished
+			// inspection, so gate it behind the TTL. (A FAILED batch took the
+			// fallback path above, which leaves profiled_at unset so the repo
+			// retries next cycle — error ≠ absence.)
+			prof.ProfiledAt = &now
 			if err := p.repos.UpsertSystem(ctx, orgID, prof); err != nil {
 				repoprofileLog.Error("upsert profile failed", "repo", prof.ID, "error", err)
 				continue
 			}
+			touched = true
 			if prof.ProfileText != "" {
 				profiled++
 				if p.ws != nil {
@@ -285,7 +341,7 @@ func (p *Profiler) runOrg(ctx context.Context, orgID string, repos []string, for
 	}
 
 	repoprofileLog.Info("profile run done", "profiled_with_ai", profiled, "without_docs", len(withoutDocs))
-	return nil
+	return touched, nil
 }
 
 // repoProfileInput is the per-repo JSON sent to the LLM.
