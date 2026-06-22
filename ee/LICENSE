@@ -16,6 +16,18 @@ repository-root LICENSE file). The Enterprise Edition is NOT covered by that
 BSL grant and does NOT convert to an open-source license on the BSL Change
 Date or at any other time.
 
+For clarity, the Enterprise Edition source may be compiled into a binary that
+also contains components licensed under the BSL. "Use of the Enterprise
+Edition" means enabling, activating, or otherwise exercising its features,
+which requires a valid license key from the Licensor. Building or running a
+binary in which the Enterprise Edition features remain disabled — such as a
+community build or a local, single-tenant deployment with no license key — does
+not by itself constitute use of the Enterprise Edition and does not, on its
+own, require a subscription under Section 3. The Enterprise Edition components
+remain subject to this license, including the source-availability and
+redistribution terms of Sections 2 and 4, whether or not their features are
+enabled.
+
 2. SOURCE AVAILABILITY (READ AND AUDIT)
 
 The Enterprise Edition source is provided in this repository for
