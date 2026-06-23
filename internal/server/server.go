@@ -900,14 +900,14 @@ func (s *Server) routes() {
 	s.api("GET /api/factory/snapshot", fh.handleFactorySnapshot)
 	s.apiMutating("POST /api/factory/delegate", s.handleFactoryDelegate)
 
-	ph := &promptsHandler{db: s.db, tx: s.tx}
+	ph := &promptsHandler{db: s.db, tx: s.tx, az: s.az}
 	s.api("GET /api/event-types", ph.handleEventTypes)
 	s.api("GET /api/event-schemas", handleEventSchemasList)
 	s.api("GET /api/event-schemas/{event_type}", handleEventSchemaGet)
 	// Unified event_handlers endpoints (SKY-259). Replace the former
 	// /api/task-rules + /api/triggers split — kind is passed as ?kind=
 	// on list, in the body on create, derived on update.
-	eh := &eventHandlersHandler{tx: s.tx}
+	eh := &eventHandlersHandler{tx: s.tx, az: s.az}
 	s.api("GET /api/event-handlers", eh.handleEventHandlersList)
 	s.apiMutating("POST /api/event-handlers", eh.handleEventHandlerCreate)
 	s.apiMutating("PUT /api/event-handlers/reorder", eh.handleEventHandlerReorder)
@@ -923,7 +923,7 @@ func (s *Server) routes() {
 	s.apiMutating("PUT /api/prompts/{id}", ph.handlePromptPut)
 	s.apiMutating("DELETE /api/prompts/{id}", ph.handlePromptDelete)
 	s.api("GET /api/prompts/{id}/stats", ph.handlePromptStats)
-	bh := &blueprintsHandler{tx: s.tx, spawner: func() *delegate.Spawner { return s.spawner }}
+	bh := &blueprintsHandler{tx: s.tx, az: s.az, spawner: func() *delegate.Spawner { return s.spawner }}
 	s.api("GET /api/blueprints", bh.handleBlueprintsList)
 	s.apiMutating("POST /api/blueprints", bh.handleBlueprintCreate)
 	s.apiMutating("PUT /api/blueprints/{id}", bh.handleBlueprintUpdate)

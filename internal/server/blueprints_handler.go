@@ -13,6 +13,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/server/authz"
 	"github.com/sky-ai-eng/triage-factory/internal/server/prompts"
 	"github.com/sky-ai-eng/triage-factory/internal/server/teamscope"
 )
@@ -22,10 +23,36 @@ import (
 // spawner, which is wired onto the server after construction.
 type blueprintsHandler struct {
 	tx      db.TxRunner
+	az      *authz.Checker
 	spawner func() *delegate.Spawner
 }
 
 const maxBlueprintSteps = 50
+
+// gateBlueprintWrite rejects a viewer before a write against an existing
+// blueprint (TFAC-447), pre-loading the row to resolve its team. It returns
+// false (the caller should return — a response was already written) when the
+// caller is a viewer (403 "view-only access") or the load failed (500). A
+// missing blueprint passes through (returns true) so the handler's own nil-check
+// renders the 404 — RequireTeamWrite is never reached for an absent row, the
+// same shape the prompt-delete gate uses. The same-team guards inside the
+// restructure handlers (merge/reconnect refuse cross-team) mean gating on the
+// host/path blueprint's team is sufficient for those.
+func (bh *blueprintsHandler) gateBlueprintWrite(w http.ResponseWriter, r *http.Request, orgID, userID, id string) bool {
+	var bp *domain.Blueprint
+	if err := bh.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
+		var e error
+		bp, e = tx.Blueprints.Get(r.Context(), orgID, id)
+		return e
+	}); err != nil {
+		internalError(w, "blueprints", err)
+		return false
+	}
+	if bp == nil {
+		return true // let the handler's own nil-check render the 404
+	}
+	return bh.az.RequireTeamWrite(w, r, orgID, userID, bp.TeamID)
+}
 
 // --- Blueprint header CRUD -----------------------------------------------
 
@@ -115,6 +142,14 @@ func (bh *blueprintsHandler) handleBlueprintCreate(w http.ResponseWriter, r *htt
 
 	id := uuid.New().String()
 	userID := ClaimsFrom(r.Context()).Subject
+
+	// Reject viewers before authoring a blueprint (TFAC-447): resolve the acting
+	// team read-only (no last-acting stamp — we may 403) and gate. The main tx
+	// re-resolves (and stamps) only for callers that pass.
+	if !gateActingTeamWrite(w, r, bh.tx, bh.az, orgID, userID, req.TeamID, "blueprints") {
+		return
+	}
+
 	var created *domain.Blueprint
 	var firstPromptID string
 	if err := bh.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
@@ -187,6 +222,11 @@ func (bh *blueprintsHandler) handleBlueprintUpdate(w http.ResponseWriter, r *htt
 		return
 	}
 
+	// Viewers can't rename a blueprint (TFAC-447).
+	if !bh.gateBlueprintWrite(w, r, orgID, userID, id) {
+		return
+	}
+
 	var updated *domain.Blueprint
 	if err := bh.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
 		existing, e := tx.Blueprints.Get(r.Context(), orgID, id)
@@ -237,6 +277,11 @@ func (bh *blueprintsHandler) handleBlueprintDelete(w http.ResponseWriter, r *htt
 	}
 	userID := ClaimsFrom(r.Context()).Subject
 	id := r.PathValue("id")
+
+	// Viewers can't delete a blueprint (TFAC-447).
+	if !bh.gateBlueprintWrite(w, r, orgID, userID, id) {
+		return
+	}
 
 	var found bool
 	if err := bh.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
@@ -393,6 +438,11 @@ func (bh *blueprintsHandler) handleBlueprintStepsPut(w http.ResponseWriter, r *h
 		notFound(w, "blueprint")
 		return
 	}
+	// Viewers can't rewrite a blueprint's steps (TFAC-447). Gate on the
+	// already-loaded blueprint's team — no extra round-trip.
+	if !bh.az.RequireTeamWrite(w, r, orgID, userID, blueprint.TeamID) {
+		return
+	}
 
 	var req blueprintStepsPutRequest
 	if !decodeJSON(w, r, &req, "") {
@@ -516,6 +566,13 @@ func (bh *blueprintsHandler) handleBlueprintMerge(w http.ResponseWriter, r *http
 		return
 	}
 
+	// Viewers can't restructure blueprints (TFAC-447). Gate on the host; the
+	// same-team guard below refuses a cross-team source, so the host's team is
+	// the write scope.
+	if !bh.gateBlueprintWrite(w, r, orgID, userID, hostID) {
+		return
+	}
+
 	var (
 		host, source *domain.Blueprint
 		merged       *domain.Blueprint
@@ -633,6 +690,11 @@ func (bh *blueprintsHandler) handleBlueprintSplit(w http.ResponseWriter, r *http
 		return
 	}
 	atIndex := *req.AtStepIndex
+
+	// Viewers can't restructure blueprints (TFAC-447).
+	if !bh.gateBlueprintWrite(w, r, orgID, userID, id) {
+		return
+	}
 
 	newID := uuid.New().String()
 	var (
@@ -754,6 +816,13 @@ func (bh *blueprintsHandler) handleBlueprintReconnect(w http.ResponseWriter, r *
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target_blueprint_id is required"})
 		return
 	}
+
+	// Viewers can't restructure blueprints (TFAC-447). Gate on the host; the
+	// same-team guard below refuses a cross-team target.
+	if !bh.gateBlueprintWrite(w, r, orgID, userID, id) {
+		return
+	}
+
 	atIndex := *req.AtStepIndex
 	orphanID := uuid.New().String()
 
@@ -894,6 +963,11 @@ func (bh *blueprintsHandler) handleBlueprintDuplicate(w http.ResponseWriter, r *
 	}
 	if len(req.PromptIDs) == 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "prompt_ids is required"})
+		return
+	}
+
+	// Viewers can't duplicate prompts into a new blueprint (TFAC-447).
+	if !gateActingTeamWrite(w, r, bh.tx, bh.az, orgID, userID, req.TeamID, "blueprints") {
 		return
 	}
 
