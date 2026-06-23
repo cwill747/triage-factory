@@ -8,6 +8,7 @@ import (
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	sqlitestore "github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
+	"github.com/sky-ai-eng/triage-factory/internal/domain"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 )
 
@@ -167,5 +168,214 @@ func TestTeamsStore_SQLite_Update_NotFound(t *testing.T) {
 	_, err := stores.Teams.Update(context.Background(), "no-such-team", strptr("X"), strptr("x"), nil)
 	if !errors.Is(err, db.ErrTeamNotFound) {
 		t.Fatalf("Update on missing team = %v; want ErrTeamNotFound", err)
+	}
+}
+
+// --- Archive / restore soft-delete (TFAC-448) ---
+
+// TestTeamsStore_SQLite_Archive_HidesFromReadsButResolvesViaSystem pins the
+// core soft-delete read filtering: archive stamps deleted_at, ListForUser stops
+// returning the team (the request-facing filter), but GetSystem still resolves
+// it with DeletedAt populated (the lifecycle path).
+func TestTeamsStore_SQLite_Archive_HidesFromReadsButResolvesViaSystem(t *testing.T) {
+	conn := openSQLiteForTest(t)
+	orgID, teamID := seedSQLiteTeam(t, conn)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+
+	// Visible before archive.
+	teams, err := stores.Teams.ListForUser(ctx, orgID)
+	if err != nil {
+		t.Fatalf("ListForUser: %v", err)
+	}
+	if !containsTeam(teams, teamID) {
+		t.Fatalf("team %s not in ListForUser before archive", teamID)
+	}
+
+	if err := stores.Teams.Archive(ctx, teamID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+
+	// Gone from the request-facing read.
+	teams, err = stores.Teams.ListForUser(ctx, orgID)
+	if err != nil {
+		t.Fatalf("ListForUser after archive: %v", err)
+	}
+	if containsTeam(teams, teamID) {
+		t.Errorf("archived team %s still in ListForUser", teamID)
+	}
+
+	// Still resolvable via the System read, with DeletedAt set.
+	got, err := stores.Teams.GetSystem(ctx, orgID, teamID)
+	if err != nil {
+		t.Fatalf("GetSystem: %v", err)
+	}
+	if got == nil {
+		t.Fatalf("GetSystem returned nil for archived team")
+	}
+	if got.DeletedAt == nil {
+		t.Errorf("GetSystem.DeletedAt is nil for archived team; want non-nil")
+	}
+}
+
+// TestTeamsStore_SQLite_Archive_AlreadyArchivedIsNotFound: re-archiving an
+// already-archived team affects zero rows → ErrTeamNotFound (the handler maps it
+// to 409 "already archived").
+func TestTeamsStore_SQLite_Archive_AlreadyArchivedIsNotFound(t *testing.T) {
+	conn := openSQLiteForTest(t)
+	_, teamID := seedSQLiteTeam(t, conn)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+
+	if err := stores.Teams.Archive(ctx, teamID); err != nil {
+		t.Fatalf("first Archive: %v", err)
+	}
+	if err := stores.Teams.Archive(ctx, teamID); !errors.Is(err, db.ErrTeamNotFound) {
+		t.Fatalf("second Archive = %v; want ErrTeamNotFound", err)
+	}
+}
+
+// TestTeamsStore_SQLite_Restore_RevivesTeam: restore clears deleted_at, the team
+// returns to ListForUser, and GetSystem.DeletedAt goes back to nil.
+func TestTeamsStore_SQLite_Restore_RevivesTeam(t *testing.T) {
+	conn := openSQLiteForTest(t)
+	orgID, teamID := seedSQLiteTeam(t, conn)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+
+	if err := stores.Teams.Archive(ctx, teamID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	if err := stores.Teams.Restore(ctx, teamID); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+
+	teams, err := stores.Teams.ListForUser(ctx, orgID)
+	if err != nil {
+		t.Fatalf("ListForUser after restore: %v", err)
+	}
+	if !containsTeam(teams, teamID) {
+		t.Errorf("restored team %s not back in ListForUser", teamID)
+	}
+	got, err := stores.Teams.GetSystem(ctx, orgID, teamID)
+	if err != nil {
+		t.Fatalf("GetSystem: %v", err)
+	}
+	if got == nil || got.DeletedAt != nil {
+		t.Errorf("GetSystem after restore = %+v; want non-nil row with DeletedAt nil", got)
+	}
+}
+
+// TestTeamsStore_SQLite_Restore_NotArchivedIsNotFound: restoring an active team
+// affects zero rows → ErrTeamNotFound (the handler maps it to 409 "not archived").
+func TestTeamsStore_SQLite_Restore_NotArchivedIsNotFound(t *testing.T) {
+	conn := openSQLiteForTest(t)
+	_, teamID := seedSQLiteTeam(t, conn)
+	stores := sqlitestore.New(conn)
+
+	if err := stores.Teams.Restore(context.Background(), teamID); !errors.Is(err, db.ErrTeamNotFound) {
+		t.Fatalf("Restore on active team = %v; want ErrTeamNotFound", err)
+	}
+}
+
+// TestTeamsStore_SQLite_GetDefaultForOrg_SkipsArchived: an archived team is never
+// the org's default — the default-team pick filters deleted_at IS NULL.
+func TestTeamsStore_SQLite_GetDefaultForOrg_SkipsArchived(t *testing.T) {
+	conn := openSQLiteForTest(t)
+	orgID, teamID := seedSQLiteTeam(t, conn)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+
+	if got, _ := stores.Teams.GetDefaultForOrg(ctx, orgID); got != teamID {
+		t.Fatalf("default before archive = %q; want %q", got, teamID)
+	}
+	if err := stores.Teams.Archive(ctx, teamID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	if got, _ := stores.Teams.GetDefaultForOrg(ctx, orgID); got != "" {
+		t.Errorf("default after archiving sole team = %q; want \"\"", got)
+	}
+}
+
+// TestTeamsStore_SQLite_ListArchivedForOrgSystem: returns only archived teams in
+// the org, with DeletedAt populated.
+func TestTeamsStore_SQLite_ListArchivedForOrgSystem(t *testing.T) {
+	conn := openSQLiteForTest(t)
+	orgID, teamID := seedSQLiteTeam(t, conn)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+
+	// A second, active team in the same org — must NOT appear in the archived list.
+	if _, err := conn.Exec(
+		`INSERT INTO teams (id, org_id, slug, name) VALUES (?, ?, 'live', 'Live')`,
+		"team-live", orgID,
+	); err != nil {
+		t.Fatalf("seed live team: %v", err)
+	}
+
+	if got, err := stores.Teams.ListArchivedForOrgSystem(ctx, orgID); err != nil || len(got) != 0 {
+		t.Fatalf("ListArchivedForOrgSystem before archive = %v, %v; want empty", got, err)
+	}
+	if err := stores.Teams.Archive(ctx, teamID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	got, err := stores.Teams.ListArchivedForOrgSystem(ctx, orgID)
+	if err != nil {
+		t.Fatalf("ListArchivedForOrgSystem: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != teamID {
+		t.Fatalf("ListArchivedForOrgSystem = %+v; want exactly the archived team %s", got, teamID)
+	}
+	if got[0].DeletedAt == nil {
+		t.Errorf("archived team DeletedAt is nil; want non-nil")
+	}
+}
+
+func containsTeam(teams []domain.Team, id string) bool {
+	for _, t := range teams {
+		if t.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTeamsStore_SQLite_TeamIDsForUserInOrgSystem_ExcludesArchived pins the
+// router-facing exclusion (TFAC-448): the team-resolution the event router uses
+// to route new tasks drops archived teams, so an archived team never receives
+// new work.
+func TestTeamsStore_SQLite_TeamIDsForUserInOrgSystem_ExcludesArchived(t *testing.T) {
+	conn := openSQLiteForTest(t)
+	orgID, teamID := seedSQLiteTeam(t, conn)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+
+	const userID = "user-tids"
+	if _, err := conn.Exec(`INSERT INTO users (id, display_name) VALUES (?, 'U')`, userID); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := conn.Exec(
+		`INSERT INTO memberships (user_id, team_id, role) VALUES (?, ?, 'member')`, userID, teamID,
+	); err != nil {
+		t.Fatalf("seed membership: %v", err)
+	}
+
+	ids, err := stores.Teams.TeamIDsForUserInOrgSystem(ctx, orgID, userID)
+	if err != nil {
+		t.Fatalf("TeamIDsForUserInOrgSystem: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != teamID {
+		t.Fatalf("before archive = %v; want [%s]", ids, teamID)
+	}
+
+	if err := stores.Teams.Archive(ctx, teamID); err != nil {
+		t.Fatalf("Archive: %v", err)
+	}
+	ids, err = stores.Teams.TeamIDsForUserInOrgSystem(ctx, orgID, userID)
+	if err != nil {
+		t.Fatalf("TeamIDsForUserInOrgSystem after archive: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Errorf("archived team still routed: %v; want []", ids)
 	}
 }
