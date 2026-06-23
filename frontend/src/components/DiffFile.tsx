@@ -100,6 +100,21 @@ export default function DiffFile({
 
   const commentCount = comments.length
 
+  // A file with no hunks renders an empty body. That happens for genuinely
+  // empty diffs, but also for the too-large-diff fallback, where the backend
+  // reassembles per-file patches and emits patch-less placeholder entries
+  // (binary files, oversized files whose patch GitHub dropped, pure renames) —
+  // react-diff-view keeps the file header but parses no hunks, so the
+  // distinction the diff text carried is lost. Show a note instead of a blank
+  // body so a truncated PR reads as a list of accounted-for files rather than
+  // mystery empty rows.
+  const emptyBodyNote =
+    file.hunks.length === 0
+      ? file.type === 'rename'
+        ? 'Renamed with no textual changes (or content omitted from the truncated diff).'
+        : 'No diff to display — file content omitted (binary, or too large to render in this view). Open the PR on GitHub to see the full change.'
+      : null
+
   return (
     <div className="backdrop-blur-xl bg-surface-raised/70 border border-border-glass rounded-2xl overflow-hidden shadow-sm shadow-black/[0.02]">
       {/* File header */}
@@ -148,19 +163,24 @@ export default function DiffFile({
       </button>
 
       {/* Diff content */}
-      {!collapsed && (
-        <div className="border-t border-border-subtle overflow-x-auto">
-          <Diff
-            viewType="unified"
-            diffType={file.type}
-            hunks={file.hunks}
-            widgets={widgets}
-            tokens={tokens}
-          >
-            {(hunks: HunkData[]) => hunks.map((hunk) => <Hunk key={hunk.content} hunk={hunk} />)}
-          </Diff>
-        </div>
-      )}
+      {!collapsed &&
+        (emptyBodyNote ? (
+          <div className="border-t border-border-subtle px-4 py-3">
+            <p className="text-[12px] text-text-tertiary italic">{emptyBodyNote}</p>
+          </div>
+        ) : (
+          <div className="border-t border-border-subtle overflow-x-auto">
+            <Diff
+              viewType="unified"
+              diffType={file.type}
+              hunks={file.hunks}
+              widgets={widgets}
+              tokens={tokens}
+            >
+              {(hunks: HunkData[]) => hunks.map((hunk) => <Hunk key={hunk.content} hunk={hunk} />)}
+            </Diff>
+          </div>
+        ))}
     </div>
   )
 }

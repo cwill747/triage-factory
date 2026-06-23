@@ -490,11 +490,57 @@ func (rh *reviewsHandler) handleReviewDiff(w http.ResponseWriter, r *http.Reques
 
 	file := r.URL.Query().Get("file")
 	diff, err := gh.GetPRDiff(review.Owner, review.Repo, review.PRNumber, file)
+	truncationNote := ""
 	if err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "GitHub API error: " + err.Error()})
-		return
+		// HTTP 406 is GitHub refusing the verbatim diff media type because the
+		// diff is too large to render. Rather than 502-ing — which left the
+		// overlay stuck on "Failed to load diff" with no recourse — fall back
+		// to the per-file patches (the same path the delegated-agent CLI uses)
+		// and reassemble an approximate unified diff. Any other error is a real
+		// failure and still propagates.
+		if !ghclient.IsHTTP406(err) {
+			reviewsLog.Error("review diff failed",
+				"review", review.ID, "owner", review.Owner, "repo", review.Repo, "pr", review.PRNumber, "error", err)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "GitHub API error: " + err.Error()})
+			return
+		}
+		files, filesErr := gh.GetPRFiles(review.Owner, review.Repo, review.PRNumber)
+		if filesErr != nil {
+			reviewsLog.Error("review diff fallback failed",
+				"review", review.ID, "owner", review.Owner, "repo", review.Repo, "pr", review.PRNumber, "error", filesErr)
+			writeJSON(w, http.StatusBadGateway, map[string]string{"error": "GitHub API error: " + filesErr.Error()})
+			return
+		}
+		if file != "" {
+			diff = ghclient.SingleFileDiff(files, file)
+			if diff == "" {
+				// The requested file isn't in the (capped) file list — either
+				// it's genuinely not part of the PR, or it sits beyond
+				// MaxPRFiles. Either way an empty 200 + truncation banner would
+				// render a banner over nothing, so surface it as a 404 the
+				// frontend shows verbatim.
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "file " + file + " is not part of this PR's diff (or lies beyond the file-listing cap)"})
+				return
+			}
+		} else {
+			diff = ghclient.ReassemblePRDiff(files)
+		}
+		truncationNote = "diff too large to fetch in full from GitHub; showing per-file patches reassembled from the files API (binary and oversized files may be summarized rather than shown)"
+		// GetPRFiles stops at MaxPRFiles, so a monstrous PR — exactly the case
+		// this fallback exists for — can have its file list itself truncated.
+		// Say so, otherwise the note implies every file is at least summarized.
+		if len(files) >= ghclient.MaxPRFiles {
+			truncationNote += fmt.Sprintf("; only the first %d files are listed", ghclient.MaxPRFiles)
+		}
 	}
 
+	// X-Diff-Truncated tells the frontend to render a banner above the file
+	// list when the reassembly fallback kicked in — mirrors the pending-PR
+	// diff endpoint. The full PR is still on GitHub; this only bounds what's
+	// rendered in the review preview.
+	if truncationNote != "" {
+		w.Header().Set("X-Diff-Truncated", truncationNote)
+	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Write([]byte(diff))
 }
