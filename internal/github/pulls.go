@@ -190,8 +190,8 @@ type PRFile struct {
 	Deletions        int    `json:"deletions"`
 	// Patch is the unified diff hunks for the file. GitHub omits it for
 	// binary files and also for oversized/truncated diffs — so an empty Patch
-	// does not by itself mean the file is binary (see isBinaryFile, which also
-	// checks the line counts).
+	// does not by itself mean the file is binary (see IsBinaryFile in
+	// reassemble.go, which also checks the line counts).
 	Patch string `json:"patch,omitempty"`
 }
 

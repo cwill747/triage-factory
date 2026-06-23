@@ -140,6 +140,44 @@ func TestReviewDiff_AppOnlyOrg_Success(t *testing.T) {
 	}
 }
 
+// TestReviewDiff_TooLarge_ReassembledFallback covers the whole point of the
+// fix: when GitHub refuses the verbatim diff media type with HTTP 406 ("diff
+// too large"), the handler must fall back to GET .../files and reassemble an
+// approximate diff rather than 502-ing the overlay into its dead-ended state.
+func TestReviewDiff_TooLarge_ReassembledFallback(t *testing.T) {
+	keyring.MockInit()
+	srv := newTestServer(t)
+	mux := newAppAPIMux()
+	mux.HandleFunc("GET /api/v3/repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"message":"Sorry, the diff exceeded the maximum number of lines."}`, http.StatusNotAcceptable)
+	})
+	mux.HandleFunc("GET /api/v3/repos/{owner}/{repo}/pulls/{number}/files", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]map[string]any{
+			{"filename": "a.go", "status": "modified", "additions": 1, "deletions": 0, "patch": "@@ -1 +1,2 @@\n x\n+y"},
+			{"filename": "img.png", "status": "added", "additions": 0, "deletions": 0},
+		})
+	})
+	stub := httptest.NewServer(mux)
+	t.Cleanup(stub.Close)
+	seedApp(t, srv, stub, acmeInstall())
+
+	reviewID := seedReview(t, srv, "acme", "api", 7)
+	rec := doJSON(t, srv, http.MethodGet, "/api/reviews/"+reviewID+"/diff", nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("diff = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "diff --git a/a.go b/a.go") || !strings.Contains(body, "+y") {
+		t.Errorf("reassembled body missing a.go patch; got:\n%s", body)
+	}
+	if !strings.Contains(body, "Binary files a/img.png and b/img.png differ") {
+		t.Errorf("reassembled body missing binary marker for img.png; got:\n%s", body)
+	}
+	if rec.Header().Get("X-Diff-Truncated") == "" {
+		t.Error("expected X-Diff-Truncated header to be set on the reassembled fallback")
+	}
+}
+
 func TestReviewDiff_NoCredentials_503(t *testing.T) {
 	keyring.MockInit()
 	srv := newTestServer(t)

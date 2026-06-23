@@ -513,10 +513,25 @@ func (rh *reviewsHandler) handleReviewDiff(w http.ResponseWriter, r *http.Reques
 		}
 		if file != "" {
 			diff = ghclient.SingleFileDiff(files, file)
+			if diff == "" {
+				// The requested file isn't in the (capped) file list — either
+				// it's genuinely not part of the PR, or it sits beyond
+				// MaxPRFiles. Either way an empty 200 + truncation banner would
+				// render a banner over nothing, so surface it as a 404 the
+				// frontend shows verbatim.
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "file " + file + " is not part of this PR's diff (or lies beyond the file-listing cap)"})
+				return
+			}
 		} else {
 			diff = ghclient.ReassemblePRDiff(files)
 		}
 		truncationNote = "diff too large to fetch in full from GitHub; showing per-file patches reassembled from the files API (binary and oversized files may be summarized rather than shown)"
+		// GetPRFiles stops at MaxPRFiles, so a monstrous PR — exactly the case
+		// this fallback exists for — can have its file list itself truncated.
+		// Say so, otherwise the note implies every file is at least summarized.
+		if len(files) >= ghclient.MaxPRFiles {
+			truncationNote += fmt.Sprintf("; only the first %d files are listed", ghclient.MaxPRFiles)
+		}
 	}
 
 	// X-Diff-Truncated tells the frontend to render a banner above the file
