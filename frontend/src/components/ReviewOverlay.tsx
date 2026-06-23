@@ -37,6 +37,11 @@ export default function ReviewOverlay({ runID, open, onClose }: Props) {
   const [files, setFiles] = useState<FileData[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // truncationNote is the X-Diff-Truncated header from /diff, set when the PR
+  // diff was too large for GitHub to return verbatim and the backend
+  // reassembled it from per-file patches. Surfaced as a banner so the user
+  // knows the rendered diff is approximate.
+  const [truncationNote, setTruncationNote] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   // Extract the primitive id so useCallback deps below can reference a stable
   // value (string | undefined) instead of review?.id, which is what the
@@ -49,6 +54,7 @@ export default function ReviewOverlay({ runID, open, onClose }: Props) {
     let cancelled = false
     setLoading(true)
     setError(null)
+    setTruncationNote(null)
     ;(async () => {
       try {
         // Fetch review metadata + comments
@@ -60,11 +66,20 @@ export default function ReviewOverlay({ runID, open, onClose }: Props) {
 
         // Fetch diff
         const diffRes = await fetch(`/api/reviews/${reviewData.id}/diff`)
-        if (!diffRes.ok) throw new Error('Failed to load diff')
+        if (!diffRes.ok) {
+          // Backend returns JSON {"error": "..."} on failure. Surface it
+          // verbatim instead of a generic "Failed to load diff" so the user
+          // sees the actual reason. (The too-large case no longer reaches
+          // here — the backend reassembles per-file patches and flags it via
+          // X-Diff-Truncated below.)
+          const data = await diffRes.json().catch(() => ({}))
+          throw new Error(data.error || `Failed to load diff (${diffRes.status})`)
+        }
         const diffText = await diffRes.text()
         if (cancelled) return
         const parsed = parseDiff(diffText)
         setFiles(parsed)
+        setTruncationNote(diffRes.headers.get('X-Diff-Truncated'))
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : String(err))
       } finally {
@@ -266,6 +281,13 @@ export default function ReviewOverlay({ runID, open, onClose }: Props) {
                     submitting={submitting}
                   />
 
+                  {truncationNote && (
+                    <div className="rounded-xl border border-snooze/30 bg-snooze/[0.06] px-4 py-3 text-[12px] text-text-secondary">
+                      <span className="font-semibold text-text-primary">Diff truncated:</span>{' '}
+                      {truncationNote}.
+                    </div>
+                  )}
+
                   {/* Diff files */}
                   <div className="space-y-3">
                     {files.map((file, i) => {
@@ -283,7 +305,7 @@ export default function ReviewOverlay({ runID, open, onClose }: Props) {
                     })}
                   </div>
 
-                  {files.length === 0 && (
+                  {files.length === 0 && !truncationNote && (
                     <div className="text-center py-12">
                       <p className="text-[13px] text-text-tertiary">No diff available</p>
                     </div>
