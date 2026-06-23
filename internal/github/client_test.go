@@ -1,8 +1,14 @@
 package github
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
 	"testing"
 )
 
@@ -87,6 +93,117 @@ func TestGraphQLURL(t *testing.T) {
 			got := graphqlURL(tt.baseURL)
 			if got != tt.want {
 				t.Errorf("graphqlURL(%q) = %q, want %q", tt.baseURL, got, tt.want)
+			}
+		})
+	}
+}
+
+// captureHandler is a minimal slog.Handler that records emitted entries so a
+// test can assert exactly what — and how often — a code path logged. It enables
+// every level and keeps records in order. Handle is safe for concurrent use, as
+// the slog.Handler contract requires.
+type captureHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+func (h *captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// recorded returns a snapshot of the captured records under lock.
+func (h *captureHandler) recorded() []slog.Record {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]slog.Record(nil), h.records...)
+}
+
+// graphqlServing starts an httptest server that returns body verbatim for any
+// request, registers its teardown, and returns the base URL for clientAgainst.
+func graphqlServing(t *testing.T, body string) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+// TestPostGraphQL_PartialError_ReturnsData pins the partial-error path: a 200
+// carrying both a usable `data` block and an `errors[]` entry (the FORBIDDEN
+// statusCheckRollup shape an App without statuses:read produces) returns the
+// data with no error, so the batch's other PRs survive one forbidden field
+// instead of the whole refresh aborting. It also asserts the degradation is
+// announced exactly once — a single WARN per response, not one per node.
+func TestPostGraphQL_PartialError_ReturnsData(t *testing.T) {
+	logs := &captureHandler{}
+	prev := githubLog
+	githubLog = slog.New(logs)
+	t.Cleanup(func() { githubLog = prev })
+
+	body := `{"data":{"nodes":[{"number":1}]},"errors":[{"type":"FORBIDDEN","path":["nodes",0,"commits","nodes",0,"commit","statusCheckRollup"],"message":"Resource not accessible by integration"}]}`
+	data, err := clientAgainst(graphqlServing(t, body)).PostGraphQL(map[string]any{"query": "{ __typename }"})
+	if err != nil {
+		t.Fatalf("PostGraphQL with partial data should not error, got %v", err)
+	}
+	if !strings.Contains(string(data), `"number":1`) {
+		t.Errorf("expected the usable data to pass through; got %s", string(data))
+	}
+
+	recs := logs.recorded()
+	if len(recs) != 1 {
+		t.Fatalf("expected exactly one log record, got %d", len(recs))
+	}
+	const wantMsg = "GraphQL partial error; using partial data"
+	if got := recs[0]; got.Level != slog.LevelWarn || got.Message != wantMsg {
+		t.Errorf("log = %v %q; want WARN %q", got.Level, got.Message, wantMsg)
+	}
+}
+
+// TestPostGraphQL_TotalError_Errors pins the total-failure path: with no usable
+// `data` alongside `errors[]` (the genuine-failure shape — bad query, cost
+// ceiling, auth), PostGraphQL returns an error rather than handing callers an
+// empty result. Covers null `data`, an absent `data` key, and that a multi-error
+// response notes the dropped tail instead of silently showing only the first.
+func TestPostGraphQL_TotalError_Errors(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want []string // substrings the returned error must contain
+	}{
+		{
+			name: "null data",
+			body: `{"data":null,"errors":[{"type":"INSUFFICIENT_SCOPES","path":["viewer"],"message":"insufficient scopes"}]}`,
+			want: []string{"insufficient scopes"},
+		},
+		{
+			name: "absent data key",
+			body: `{"errors":[{"type":"FORBIDDEN","path":["viewer"],"message":"forbidden field"}]}`,
+			want: []string{"forbidden field"},
+		},
+		{
+			name: "multiple errors note the dropped tail",
+			body: `{"data":null,"errors":[{"message":"first"},{"message":"second"},{"message":"third"}]}`,
+			want: []string{"first", "and 2 more"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := clientAgainst(graphqlServing(t, tt.body)).PostGraphQL(map[string]any{"query": "{ __typename }"})
+			if err == nil {
+				t.Fatalf("expected an error for %s, got nil", tt.name)
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error = %q; want it to contain %q", err.Error(), want)
+				}
 			}
 		})
 	}
