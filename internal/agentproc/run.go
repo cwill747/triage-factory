@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/githooks"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/sandbox"
 )
@@ -554,6 +555,24 @@ func newSandboxCommand(runCtx context.Context, opts RunOptions, wrapperPath stri
 		})
 	}
 
+	// The TF-controlled git hooks dir (F2, TFAC-456), bind-mounted RO at a
+	// fixed in-sandbox path. core.hooksPath (set in the GIT_CONFIG_* env by
+	// startProxiesForSandbox) points here, so the hooks fire for every repo
+	// the agent touches. Mounted unconditionally (cheap, RO) so subdir
+	// clones in a repo-less Jira run are covered too. The dir is ensured on
+	// the host at startup; the os.Stat guard is purely for paths where that
+	// didn't run (e.g. a unit test driving Run directly) — a missing source
+	// is skipped rather than failing the run, and core.hooksPath at a
+	// non-existent dir is a git no-op anyway.
+	hooksDir := githooks.HostDir()
+	if _, statErr := os.Stat(hooksDir); statErr == nil {
+		extraMounts = append(extraMounts, sandbox.Mount{
+			Source:      hooksDir,
+			Destination: githooks.SandboxDir,
+			Options:     []string{"ro"},
+		})
+	}
+
 	// Start the per-run agenthost daemon (when wired). The socket must exist
 	// on disk before sandbox.Wrap reads the spec, since the spec references
 	// the source path of every bind mount. cleanup owns the daemon's Close so
@@ -641,7 +660,16 @@ func newDirectCommand(runCtx context.Context, opts RunOptions, nodeArgs []string
 	}
 	cmd := exec.CommandContext(runCtx, "node", nodeArgs...)
 	cmd.Dir = opts.Cwd
-	cmd.Env = mergeEnv(os.Environ(), opts.ExtraEnv, creds)
+	// Install the TF-controlled git hooks dir as process-scoped
+	// core.hooksPath for this agent (F2, TFAC-456). This is the local /
+	// non-sandbox path — the sandbox sets the same key via its GIT_CONFIG_*
+	// block (startProxiesForSandbox), so it deliberately lives here, off the
+	// sandbox branch, to avoid two GIT_CONFIG_COUNT sources colliding.
+	// DirectAgentEnv layers our entry over the assembled env at the next
+	// free index (dropping + re-emitting the inherited count), so a
+	// pre-existing operator GIT_CONFIG_* set is preserved and the operator's
+	// ~/.gitconfig is never touched — env-scoped only.
+	cmd.Env = githooks.DirectAgentEnv(mergeEnv(os.Environ(), opts.ExtraEnv, creds))
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		// Process is non-nil here because the watcher only fires after
