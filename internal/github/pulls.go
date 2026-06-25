@@ -595,19 +595,30 @@ func (c *Client) DismissReview(owner, repo string, number, reviewID int, message
 	return err
 }
 
-// AddComment adds a top-level issue comment to a PR.
+// AddComment adds a top-level issue comment to a PR and returns its id.
 func (c *Client) AddComment(owner, repo string, number int, body string) (int, error) {
+	id, _, err := c.AddCommentWithURL(owner, repo, number, body)
+	return id, err
+}
+
+// AddCommentWithURL is AddComment but also returns the new comment's html_url
+// — the canonical web link GitHub computes, correct for issues-vs-pulls and
+// for GHES without us having to assemble it. The host-side artifact recorder
+// (cmd/exec/agenthost) keys the comment artifact on the id and stamps this url;
+// the agent-facing AddComment drops it because the IPC surface doesn't carry a
+// comment url back to the sandbox.
+func (c *Client) AddCommentWithURL(owner, repo string, number int, body string) (int, string, error) {
 	data, err := c.Post(fmt.Sprintf("/repos/%s/%s/issues/%d/comments", owner, repo, number), map[string]any{
 		"body": body,
 	})
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	return intVal(raw, "id"), nil
+	return intVal(raw, "id"), strVal(raw, "html_url"), nil
 }
 
 // ReplyToComment replies to a review comment thread.
@@ -640,23 +651,42 @@ func (c *Client) ReactToComment(owner, repo string, commentID int, emoji string)
 
 // UpdateComment updates a comment body. Tries issue comments first, then review comments.
 func (c *Client) UpdateComment(owner, repo string, commentID int, body string) error {
+	_, err := c.UpdateCommentScoped(owner, repo, commentID, body)
+	return err
+}
+
+// UpdateCommentScoped is UpdateComment that also reports whether the comment it
+// updated was a top-level issue comment (true) or a review line-comment (false,
+// reached via the pulls/comments fallback). The host-side artifact recorder
+// keys off this so it records only standalone comments — review line-comments
+// ride the review artifact, not a comment artifact (TFAC-466). isIssueComment is
+// meaningful only when err is nil.
+func (c *Client) UpdateCommentScoped(owner, repo string, commentID int, body string) (isIssueComment bool, err error) {
 	payload := map[string]any{"body": body}
-	_, err := c.Patch(fmt.Sprintf("/repos/%s/%s/issues/comments/%d", owner, repo, commentID), payload)
-	if err == nil {
-		return nil
+	if _, err = c.Patch(fmt.Sprintf("/repos/%s/%s/issues/comments/%d", owner, repo, commentID), payload); err == nil {
+		return true, nil
 	}
 	_, err = c.Patch(fmt.Sprintf("/repos/%s/%s/pulls/comments/%d", owner, repo, commentID), payload)
-	return err
+	return false, err
 }
 
 // DeleteComment deletes a comment. Tries issue comments first, then review comments.
 func (c *Client) DeleteComment(owner, repo string, commentID int) error {
-	_, err := c.Delete(fmt.Sprintf("/repos/%s/%s/issues/comments/%d", owner, repo, commentID))
-	if err == nil {
-		return nil
+	_, err := c.DeleteCommentScoped(owner, repo, commentID)
+	return err
+}
+
+// DeleteCommentScoped is DeleteComment that also reports whether the comment it
+// deleted was a top-level issue comment (true) or a review line-comment (false,
+// reached via the pulls/comments fallback). Same contract as UpdateCommentScoped
+// — only standalone comments are recorded as artifacts. isIssueComment is
+// meaningful only when err is nil.
+func (c *Client) DeleteCommentScoped(owner, repo string, commentID int) (isIssueComment bool, err error) {
+	if _, err = c.Delete(fmt.Sprintf("/repos/%s/%s/issues/comments/%d", owner, repo, commentID)); err == nil {
+		return true, nil
 	}
 	_, err = c.Delete(fmt.Sprintf("/repos/%s/%s/pulls/comments/%d", owner, repo, commentID))
-	return err
+	return false, err
 }
 
 // restPR is the subset of the REST pull-request object (GET
