@@ -314,6 +314,111 @@ func TestArtifactStore_Postgres_ListByTeam_IncludesDetached(t *testing.T) {
 	}
 }
 
+// TestArtifactStore_Postgres_UpsertPreservesExternalIDAndURL pins that an
+// upsert leaving external_id/url empty does NOT blank values an earlier upsert
+// stored. They are the backing object's stable coordinates and only fill in;
+// a reconciliation pass or a URL-less mutation must not erase them. State
+// still follows the latest writer.
+func TestArtifactStore_Postgres_UpsertPreservesExternalIDAndURL(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	orgID, userID, teamID := pgtest.SeedOrgWithUser(t, h, "alice")
+	runID := seedPgArtifactRun(t, h, orgID, teamID, userID)
+	stores := pgstore.New(h.AdminDB, h.AdminDB, pgtest.SecretKey)
+	ctx := context.Background()
+
+	key := domain.ArtifactDedupKey("jira", "issue", "SKY-1", "")
+	if _, err := stores.Artifacts.Upsert(ctx, orgID, domain.Artifact{
+		RunID: runID, OrgID: orgID, TeamID: teamID,
+		Provider: "jira", Kind: "issue", Target: "SKY-1",
+		ExternalID: "SKY-1", URL: "https://jira.example.com/browse/SKY-1",
+		State: domain.ArtifactStateIssueCreated, DedupKey: key,
+	}); err != nil {
+		t.Fatalf("first Upsert: %v", err)
+	}
+
+	out, err := stores.Artifacts.Upsert(ctx, orgID, domain.Artifact{
+		RunID: runID, OrgID: orgID, TeamID: teamID,
+		Provider: "jira", Kind: "issue", Target: "SKY-1",
+		State: domain.ArtifactStateIssueUpdated, DedupKey: key,
+	})
+	if err != nil {
+		t.Fatalf("second Upsert: %v", err)
+	}
+	if out.ExternalID != "SKY-1" || out.URL != "https://jira.example.com/browse/SKY-1" {
+		t.Errorf("external_id/url were blanked by an empty upsert: ext=%q url=%q", out.ExternalID, out.URL)
+	}
+	if out.State != domain.ArtifactStateIssueUpdated {
+		t.Errorf("state should follow the latest writer, got %q", out.State)
+	}
+
+	// A non-empty value still overwrites.
+	out, err = stores.Artifacts.Upsert(ctx, orgID, domain.Artifact{
+		RunID: runID, OrgID: orgID, TeamID: teamID,
+		Provider: "jira", Kind: "issue", Target: "SKY-1",
+		ExternalID: "SKY-1", URL: "https://jira.example.com/browse/SKY-1?focusedId=9",
+		State: domain.ArtifactStateIssueUpdated, DedupKey: key,
+	})
+	if err != nil {
+		t.Fatalf("third Upsert: %v", err)
+	}
+	if out.URL != "https://jira.example.com/browse/SKY-1?focusedId=9" {
+		t.Errorf("non-empty url did not overwrite: %q", out.URL)
+	}
+}
+
+// TestArtifactStore_Postgres_UpsertSystem_BypassesRLS pins the admin-pool
+// write path the event-triggered exec choke point depends on (TFAC-459): a
+// run with no creator user has no JWT-claims context, so its artifact insert
+// is unreachable through tf_app (artifacts_insert demands a team-writing
+// user). UpsertSystem routes to the admin pool and lands the row; the app-pool
+// Upsert on the same bare (claims-less) connection is rejected, proving the
+// System variant is doing real pool-routing work, not riding ambient access.
+func TestArtifactStore_Postgres_UpsertSystem_BypassesRLS(t *testing.T) {
+	h := pgtest.Shared(t)
+	h.Reset(t)
+	orgID, _, teamID := pgtest.SeedOrgWithUser(t, h, "alice")
+
+	// app = AppDB (authenticator, RLS-active, no claims set here); admin =
+	// AdminDB (BYPASSRLS). This is the production pool split.
+	stores := pgstore.New(h.AdminDB, h.AppDB, pgtest.SecretKey)
+	ctx := context.Background()
+
+	// run_id left empty (NULL) so this isolates the write-policy/pool routing
+	// from the runs FK.
+	art := domain.Artifact{
+		OrgID: orgID, TeamID: teamID,
+		Provider: domain.ArtifactProviderJira, Kind: domain.ArtifactKindIssue,
+		Target: "SKY-1", ExternalID: "SKY-1", State: domain.ArtifactStateIssueCreated,
+		DedupKey: domain.ArtifactDedupKey("jira", "issue", "SKY-1", ""),
+	}
+
+	// The app-pool write with no claims context fails — exactly why the
+	// event-triggered writer needs the admin path.
+	if _, err := stores.Artifacts.Upsert(ctx, orgID, art); err == nil {
+		t.Fatal("expected the claims-less app-pool Upsert to be rejected")
+	}
+
+	// UpsertSystem (admin pool) lands the row.
+	out, err := stores.Artifacts.UpsertSystem(ctx, orgID, art)
+	if err != nil {
+		t.Fatalf("UpsertSystem: %v", err)
+	}
+	if out.ID == "" || out.Target != "SKY-1" || out.State != domain.ArtifactStateIssueCreated {
+		t.Errorf("UpsertSystem row malformed: %+v", out)
+	}
+
+	var count int
+	if err := h.AdminDB.QueryRow(
+		`SELECT COUNT(*) FROM artifacts WHERE team_id = $1 AND dedup_key = 'jira:issue:SKY-1'`, teamID,
+	).Scan(&count); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("UpsertSystem did not land the row: count = %d, want 1", count)
+	}
+}
+
 // seedPgArtifactRun mints a minimal run the artifacts.run_id FK can point
 // at. origin is non-'blueprint' so runs_origin_requires_parents doesn't
 // demand a parent chain; trigger_type='manual' needs a non-NULL creator.
