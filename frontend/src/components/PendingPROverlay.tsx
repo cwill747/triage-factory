@@ -5,100 +5,106 @@ import type { FileData } from 'react-diff-view'
 import DiffFile from './DiffFile'
 import PendingPRSummary from './PendingPRSummary'
 
-// PendingPR mirrors the JSON shape internal/server/pending_prs_handler.go
-// returns. submitted_at is omitted on the wire when nil; the field
-// stays optional here so the frontend can tell the row apart from a
-// row that was just created (locked=false, no submitted_at) from one
-// mid-submit (locked=true, submitted_at present but row not yet
-// deleted because GitHub failed).
-interface PendingPR {
+// PRArtifact mirrors the JSON shape internal/server/artifacts_handler.go returns
+// for a pull_request artifact. title/body are the LIVE PR values (fetched from
+// GitHub via GetPR), not a local snapshot — the draft PR is a real GitHub object
+// now, edited 1:1.
+interface PRArtifact {
   id: string
-  run_id: string
+  run_id?: string
   owner: string
   repo: string
+  number: number
   head_branch: string
-  head_sha: string
   base_branch: string
   title: string
   body: string
-  draft: boolean
-  locked: boolean
-  submitted_at?: string
+  url: string
+  state: string
 }
 
 interface Props {
-  runID: string
+  artifactId: string
   open: boolean
   onClose: () => void
 }
 
-// PendingPROverlay is the modal the user opens from a delegated
-// run's "Open PR" button. Mirrors ReviewOverlay's shape (backdrop +
-// centered panel + summary + diff list) but with PR-specific
-// affordances:
+// PendingPROverlay is the modal the user opens from a delegated run's "Open PR"
+// button. The agent already opened a real GitHub draft PR; this overlay reads it
+// 1:1, edits title/body live, shows the diff from GitHub, and on "Open PR" marks
+// the draft ready for review (approve). Mirrors ReviewOverlay's shape (backdrop +
+// centered panel + summary + diff list) but with PR-specific affordances:
 //   - title editor (reviews don't have a title)
-//   - draft checkbox at submit time
 //   - no inline-comment surface (commentsByFile is always empty)
+//   - no draft toggle (the PR is always a draft until approval promotes it)
 //
-// The diff comes from the bare clone via /api/pending-prs/{id}/diff
-// rather than from GitHub's diff API — the PR doesn't exist yet, so
-// there's nothing to fetch from there. Server-side livePRDiff fetches
-// origin/{head} into the bare's local ref before computing the diff
-// (the agent's `git push` doesn't auto-sync the bare).
-export default function PendingPROverlay({ runID, open, onClose }: Props) {
-  const [pr, setPR] = useState<PendingPR | null>(null)
+// The diff comes from GitHub (/api/artifacts/{id}/diff) — the PR exists, so the
+// server proxies GitHub's diff with the same 406→per-file fallback the review
+// overlay uses.
+export default function PendingPROverlay({ artifactId, open, onClose }: Props) {
+  const [pr, setPR] = useState<PRArtifact | null>(null)
   const [files, setFiles] = useState<FileData[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
-  // draft initializes from the row's persisted value (the agent's
-  // queue-time --draft hint). Reset by the fetch effect on every
-  // overlay open so a previously-toggled state can't leak across
-  // different pending PRs.
-  const [draft, setDraft] = useState(false)
-  // truncationNote is the X-Diff-Truncated header from /diff,
-  // surfaced as a banner so the user knows the diff was capped at
-  // the server's 4MB limit (parseDiff of the truncated text alone
-  // would just yield fewer files — or zero files when the first
-  // file alone overruns — and the "No diff available" fallback
-  // would mislead the user into thinking the PR is empty).
+  // truncationNote is the X-Diff-Truncated header from /diff, surfaced as a
+  // banner so the user knows the diff was capped/reassembled (parseDiff of the
+  // truncated text alone would just yield fewer files — or zero — and the "No
+  // diff available" fallback would mislead the user into thinking it's empty).
   const [truncationNote, setTruncationNote] = useState<string | null>(null)
-  const prId = pr?.id
+  // diffError is isolated from `error`: the diff is secondary to the summary, so
+  // a transient 406/502 on it must NOT hide the (already-loaded) editable PR.
+  // It renders as an inline banner while title/body editing + approve stay live.
+  const [diffError, setDiffError] = useState<string | null>(null)
+  // submitError is the "Open PR" (approve) failure, shown as an inline banner
+  // rather than the full-screen error state: a partial failure (UpdatePR landed
+  // but MarkPRReady failed) is safely retryable in place — the artifact stays
+  // draft and approve re-strips/re-appends the footer — so we keep the editor
+  // visible instead of forcing a close-and-reopen.
+  const [submitError, setSubmitError] = useState<string | null>(null)
 
-  // Fetch PR + diff. Reset stale state from any prior PR before the
-  // new fetch lands so the user doesn't see leftover values
-  // briefly.
+  // Fetch the PR artifact, then the diff. Reset stale state from any prior PR
+  // before the new fetch lands so the user doesn't see leftover values briefly.
   useEffect(() => {
-    if (!open || !runID) return
+    if (!open || !artifactId) return
     let cancelled = false
     setLoading(true)
     setError(null)
+    setSubmitError(null)
     setPR(null)
     setFiles([])
     setTruncationNote(null)
+    setDiffError(null)
     ;(async () => {
+      // PR fetch — a failure here blocks: there's nothing to edit or approve
+      // without the PR, so it lands in `error` (the full-screen error state).
+      let prData: PRArtifact
       try {
-        const prRes = await fetch(`/api/agent/runs/${runID}/pending-pr`)
+        const prRes = await fetch(`/api/artifacts/${artifactId}`)
         if (!prRes.ok) {
           const data = await prRes.json().catch(() => ({}))
-          throw new Error(data.error || `Failed to load pending PR (${prRes.status})`)
+          throw new Error(data.error || `Failed to load PR (${prRes.status})`)
         }
-        const prData: PendingPR = await prRes.json()
-        if (cancelled) return
-        setPR(prData)
-        // Initialize the draft checkbox from the persisted hint.
-        // Resetting here (rather than letting the prior overlay's
-        // value persist) is what fixes the cross-overlay leak.
-        setDraft(prData.draft)
+        prData = await prRes.json()
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err))
+          setLoading(false)
+        }
+        return
+      }
+      if (cancelled) return
+      setPR(prData)
 
-        const diffRes = await fetch(`/api/pending-prs/${prData.id}/diff`)
+      // Diff fetch — isolated: its failure must not block editing/approving, so
+      // it lands in diffError (an inline banner), never the full-screen error.
+      try {
+        const diffRes = await fetch(`/api/artifacts/${artifactId}/diff`)
         if (!diffRes.ok) {
-          // Server returns JSON {"error": "..."} on 502 (e.g.
-          // "couldn't find remote ref" when the agent skipped
-          // git push). Surface that body verbatim so the user
-          // sees the actual reason instead of a generic
-          // "Failed to load diff" — the backend already produces
-          // an actionable message, no point swallowing it.
+          // Server returns JSON {"error": "..."} on failure. Surface that body
+          // verbatim so the user sees the actual reason instead of a generic
+          // "Failed to load diff" — the backend already produces an actionable
+          // message, no point swallowing it.
           const data = await diffRes.json().catch(() => ({}))
           throw new Error(data.error || `Failed to load diff (${diffRes.status})`)
         }
@@ -107,7 +113,7 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
         setFiles(parseDiff(diffText))
         setTruncationNote(diffRes.headers.get('X-Diff-Truncated'))
       } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : String(err))
+        if (!cancelled) setDiffError(err instanceof Error ? err.message : String(err))
       } finally {
         if (!cancelled) setLoading(false)
       }
@@ -116,110 +122,88 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
     return () => {
       cancelled = true
     }
-  }, [open, runID])
+  }, [open, artifactId])
 
-  // savesInFlight tracks how many PATCH requests for title/body are
-  // currently outstanding. The submit handler awaits the most recent
-  // save's promise before POSTing so the user can't click Save and
-  // immediately Open PR before the edit lands — that race would
-  // submit the row's pre-edit state, dropping the user's last edit.
-  // useRef rather than state because submitting reads it
-  // synchronously and we don't want to trigger re-renders on
-  // increment.
+  // lastSavePromise tracks the most recent in-flight title/body PATCH so the
+  // submit handler awaits it before approving — otherwise a click-Save-then-
+  // click-Open-PR race could promote the PR before the last edit lands.
   const lastSavePromise = useRef<Promise<void> | null>(null)
 
-  // Title + body updates — explicit-Save model (PendingPRSummary's
-  // Edit / Save / Cancel buttons drive this), not autosave. Returns
-  // the underlying PATCH promise so PendingPRSummary can await it
-  // before clearing edit-mode state, and so handleSubmit can await
-  // any in-flight save before opening the PR.
-  //
-  // We DON'T do optimistic updates here. The pre-fix version set
-  // pr.title eagerly and swallowed PATCH failures, so a 400 ("title
-  // cannot be empty") or transient 500 left the local cache showing
-  // the new title while the server still had the old one — clicking
-  // Open PR would then submit the stale server value, silently
-  // dropping the user's edit. Pessimistic update + throw-on-!ok lets
-  // PendingPRSummary keep the user in edit mode and surface the
-  // error.
-  const patchPR = useCallback(async (id: string, body: object) => {
-    const res = await fetch(`/api/pending-prs/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}))
-      throw new Error(data.error || `Save failed (${res.status})`)
-    }
-  }, [])
+  // Title + body updates — explicit-Save model (PendingPRSummary's Edit / Save /
+  // Cancel buttons drive this), not autosave. Pessimistic: PATCH first, throw on
+  // !ok so PendingPRSummary stays in edit mode and surfaces the error rather
+  // than showing a green "saved" over a write GitHub rejected.
+  const patchPR = useCallback(
+    async (body: object) => {
+      const res = await fetch(`/api/artifacts/${artifactId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || `Save failed (${res.status})`)
+      }
+    },
+    [artifactId],
+  )
 
   const handleUpdateTitle = useCallback(
     async (title: string) => {
-      if (!prId) return
       const normalizedTitle = title.trim()
-      const p = patchPR(prId, { title: normalizedTitle })
+      const p = patchPR({ title: normalizedTitle })
       lastSavePromise.current = p
       await p
       setPR((prev) => (prev ? { ...prev, title: normalizedTitle } : prev))
     },
-    [prId, patchPR],
+    [patchPR],
   )
 
   const handleUpdateBody = useCallback(
     async (body: string) => {
-      if (!prId) return
-      const p = patchPR(prId, { body })
+      const p = patchPR({ body })
       lastSavePromise.current = p
       await p
       setPR((prev) => (prev ? { ...prev, body } : prev))
     },
-    [prId, patchPR],
+    [patchPR],
   )
 
-  // draft is the user-facing checkbox state. The submit POST sends
-  // this value; the server falls back to the row's persisted hint
-  // when the field isn't sent, but we always send so the user's
-  // explicit choice (or no-touch matching the agent's hint) is what
-  // GitHub sees.
-  const handleUpdateDraft = useCallback((next: boolean) => {
-    setDraft(next)
-  }, [])
-
   const handleSubmit = useCallback(async () => {
-    if (!prId) return
     setSubmitting(true)
+    setSubmitError(null)
     try {
-      // Wait for any in-flight save to land before POSTing. Otherwise
-      // the server would read the row in its pre-edit state and open
-      // the PR with stale title/body, dropping the user's last save.
-      // Errors during the wait are swallowed — we only care that the
-      // PATCH completed (success or failure), not that it succeeded;
-      // the submit's own error handling kicks in if the row state
-      // is wrong.
+      // Wait for any in-flight save to settle before approving, so we don't race
+      // a PATCH that's still writing to GitHub. A FAILED last save is
+      // intentionally swallowed rather than blocking approval: the user already
+      // saw its error banner in PendingPRSummary, and approve reads the live PR
+      // from GitHub — which holds the last *successfully* saved state — so the
+      // failed edit is simply dropped (the work proceeds with what actually
+      // landed on GitHub, never stale local state).
       if (lastSavePromise.current) {
         try {
           await lastSavePromise.current
         } catch {
-          /* noop */
+          /* failed save already surfaced to the user; drop it and approve live state */
         }
       }
-      const res = await fetch(`/api/pending-prs/${prId}/submit`, {
+      const res = await fetch(`/api/artifacts/${artifactId}/approve`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ draft }),
       })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
-        throw new Error(data.error || 'Submit failed')
+        throw new Error(data.error || 'Open PR failed')
       }
       onClose()
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err))
+      // Inline (not full-screen): keep the editor visible so the user can retry
+      // "Open PR" in place — a partial failure is safely re-runnable.
+      setSubmitError(err instanceof Error ? err.message : String(err))
     } finally {
       setSubmitting(false)
     }
-  }, [prId, draft, onClose])
+  }, [artifactId, onClose])
 
   // Close on Escape
   useEffect(() => {
@@ -258,11 +242,11 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
               <div className="flex items-center gap-3">
                 <div className="w-2 h-2 rounded-full bg-snooze animate-pulse" />
                 <h1 className="text-[15px] font-semibold text-text-primary tracking-tight">
-                  Pending PR
+                  Draft PR
                 </h1>
                 {pr && (
                   <span className="text-[12px] text-text-tertiary font-mono">
-                    {pr.owner}/{pr.repo}
+                    {pr.owner}/{pr.repo} #{pr.number}
                   </span>
                 )}
               </div>
@@ -300,32 +284,45 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
                   <PendingPRSummary
                     owner={pr.owner}
                     repo={pr.repo}
+                    number={pr.number}
                     headBranch={pr.head_branch}
                     baseBranch={pr.base_branch}
-                    headSHA={pr.head_sha}
+                    url={pr.url}
                     title={pr.title}
                     body={pr.body}
-                    draft={draft}
                     onUpdateTitle={handleUpdateTitle}
                     onUpdateBody={handleUpdateBody}
-                    onUpdateDraft={handleUpdateDraft}
                     onSubmit={handleSubmit}
                     onClose={onClose}
                     submitting={submitting}
                   />
 
-                  {truncationNote && (
-                    <div className="rounded-xl border border-snooze/30 bg-snooze/[0.06] px-4 py-3 text-[12px] text-text-secondary">
-                      <span className="font-semibold text-text-primary">Diff truncated:</span>{' '}
-                      {truncationNote}. Approving will still open the full PR on GitHub — the cap
-                      only limits what's rendered in this preview.
+                  {submitError && (
+                    <div className="rounded-xl border border-dismiss/30 bg-dismiss/[0.06] px-4 py-3 text-[12px] text-text-secondary">
+                      <span className="font-semibold text-text-primary">Couldn't open PR:</span>{' '}
+                      {submitError}. Your edits are saved on GitHub — you can retry Open PR.
                     </div>
                   )}
 
-                  {/* Diff files — same DiffFile component the review
-                      overlay uses; commentsByFile is always empty for
-                      pending PRs (no inline-comment surface at create
-                      time). */}
+                  {truncationNote && (
+                    <div className="rounded-xl border border-snooze/30 bg-snooze/[0.06] px-4 py-3 text-[12px] text-text-secondary">
+                      <span className="font-semibold text-text-primary">Diff truncated:</span>{' '}
+                      {truncationNote}. The full PR is on GitHub — the cap only limits what's
+                      rendered in this preview.
+                    </div>
+                  )}
+
+                  {diffError && (
+                    <div className="rounded-xl border border-dismiss/30 bg-dismiss/[0.06] px-4 py-3 text-[12px] text-text-secondary">
+                      <span className="font-semibold text-text-primary">Diff unavailable:</span>{' '}
+                      {diffError}. You can still edit and open the PR — the diff just couldn't be
+                      loaded right now.
+                    </div>
+                  )}
+
+                  {/* Diff files — same DiffFile component the review overlay uses;
+                      commentsByFile is always empty for the PR overlay (no
+                      inline-comment surface). */}
                   <div className="space-y-3">
                     {files.map((file, i) => {
                       const path = file.newPath === '/dev/null' ? file.oldPath : file.newPath
@@ -342,7 +339,7 @@ export default function PendingPROverlay({ runID, open, onClose }: Props) {
                     })}
                   </div>
 
-                  {files.length === 0 && !truncationNote && (
+                  {files.length === 0 && !truncationNote && !diffError && (
                     <div className="text-center py-12">
                       <p className="text-[13px] text-text-tertiary">No diff available</p>
                     </div>

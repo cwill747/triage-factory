@@ -62,20 +62,28 @@ type PRTopComment struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// GetPR fetches PR details including top-level comments.
-// In compact mode (verbose=false), review/comment bodies are truncated to first line.
-func (c *Client) GetPR(owner, repo string, number int, verbose bool) (*PRView, error) {
-	// Fetch PR
+// GetPRBasic fetches only the PR object itself — title, body, refs, state, URL —
+// in a single round-trip. Unlike GetPR it skips the reviews + review-comments +
+// issue-comments list calls (three extra requests), so it's the cheap read for
+// callers that need the PR's own fields and not its discussion (e.g. the artifact
+// PR handlers that read/promote title + body on every overlay load, edit, and
+// approve).
+func (c *Client) GetPRBasic(owner, repo string, number int) (*PRView, error) {
 	data, err := c.Get(fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number))
 	if err != nil {
 		return nil, err
 	}
-
 	var raw map[string]any
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, err
 	}
+	return prViewFromRaw(raw), nil
+}
 
+// prViewFromRaw maps a decoded PR JSON object into a PRView's own fields (no
+// reviews/comments). Shared by GetPR and GetPRBasic so the field mapping has a
+// single home.
+func prViewFromRaw(raw map[string]any) *PRView {
 	pr := &PRView{
 		Number:       intVal(raw, "number"),
 		Title:        strVal(raw, "title"),
@@ -109,6 +117,26 @@ func (c *Client) GetPR(owner, repo string, number int, verbose bool) (*PRView, e
 			pr.BaseSSHURL = strVal(baseRepo, "ssh_url")
 		}
 	}
+	return pr
+}
+
+// GetPR fetches PR details including reviews and top-level comments (three extra
+// list calls on top of the PR object). In compact mode (verbose=false),
+// review/comment bodies are truncated to first line. Callers that only need the
+// PR's own fields should use GetPRBasic.
+func (c *Client) GetPR(owner, repo string, number int, verbose bool) (*PRView, error) {
+	// Fetch PR
+	data, err := c.Get(fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number))
+	if err != nil {
+		return nil, err
+	}
+
+	var raw map[string]any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+
+	pr := prViewFromRaw(raw)
 
 	// Fetch reviews
 	reviewsData, err := c.Get(fmt.Sprintf("/repos/%s/%s/pulls/%d/reviews?per_page=100", owner, repo, number))
@@ -521,6 +549,22 @@ func (c *Client) UpdatePR(owner, repo string, number int, title, body string) er
 		"title": title,
 		"body":  body,
 	}
+	_, err := c.Patch(fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number), payload)
+	return liftValidationErr(err)
+}
+
+// ClosePR closes an open or draft PR without merging it via REST
+// (PATCH /repos/{o}/{r}/pulls/{n} with state=closed). The head branch is
+// untouched — closing a PR never deletes the ref — which is exactly the
+// contract the artifact-abandon path needs: the draft PR is retired but the
+// pushed branch stays, so the work is recoverable. 422 validation failures are
+// lifted to a readable message via the same liftValidationErr CreatePR/UpdatePR
+// use.
+//
+// Used by the GitHub-native PR path's abandon flow — "Return to queue" on a run
+// that opened a draft PR closes that PR and flips its artifact to state=closed.
+func (c *Client) ClosePR(owner, repo string, number int) error {
+	payload := map[string]any{"state": "closed"}
 	_, err := c.Patch(fmt.Sprintf("/repos/%s/%s/pulls/%d", owner, repo, number), payload)
 	return liftValidationErr(err)
 }
