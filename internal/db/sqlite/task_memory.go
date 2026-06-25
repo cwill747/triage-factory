@@ -99,6 +99,14 @@ func (s *taskMemoryStore) UpdateRunMemoryHumanContent(ctx context.Context, orgID
 	return nil
 }
 
+// UpdateRunMemoryHumanContentSystem is identical to UpdateRunMemoryHumanContent
+// in SQLite: local mode is single-tenant (N=1) with no RLS, so there is no
+// admin/app pool split. The method exists for parity with the Postgres store,
+// where the reconciler (no JWT-claims context) needs the admin pool. TFAC-464.
+func (s *taskMemoryStore) UpdateRunMemoryHumanContentSystem(ctx context.Context, orgID, runID, content string) error {
+	return s.UpdateRunMemoryHumanContent(ctx, orgID, runID, content)
+}
+
 func (s *taskMemoryStore) GetMemoriesForEntity(ctx context.Context, orgID, entityID string) ([]domain.TaskMemory, error) {
 	if err := assertLocalOrg(orgID); err != nil {
 		return nil, err

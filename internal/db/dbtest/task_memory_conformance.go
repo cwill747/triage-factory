@@ -196,6 +196,48 @@ func RunTaskMemoryStoreConformance(t *testing.T, mk TaskMemoryStoreFactory) {
 		}
 	})
 
+	t.Run("UpdateRunMemoryHumanContentSystem_overwrites_prior_verdict", func(t *testing.T) {
+		// The reconciler's post-run outcome capture (TFAC-464 β). human_content
+		// is the single "how reality diverged from your draft" slot; the
+		// terminal outcome supersedes any approval-time verdict. The admin-pool
+		// System variant overwrites it (the reconciler has no claims context),
+		// leaves agent_content untouched, and materializes under the post-run
+		// heading.
+		s, orgID, seed := mk(t)
+		runID, entityID := seed.Run(t, "system-overwrite")
+		if err := s.UpsertAgentMemory(ctx, orgID, runID, entityID, "", "agent narrative"); err != nil {
+			t.Fatalf("UpsertAgentMemory: %v", err)
+		}
+		if err := s.UpdateRunMemoryHumanContent(ctx, orgID, runID, "approval-time verdict"); err != nil {
+			t.Fatalf("seed verdict: %v", err)
+		}
+		if err := s.UpdateRunMemoryHumanContentSystem(ctx, orgID, runID, "**Post-run outcome** — PR merged on GitHub."); err != nil {
+			t.Fatalf("UpdateRunMemoryHumanContentSystem: %v", err)
+		}
+		mem, err := s.GetRunMemory(ctx, orgID, runID)
+		if err != nil || mem == nil {
+			t.Fatalf("GetRunMemory: mem=%v err=%v", mem, err)
+		}
+		if strings.Contains(mem.Content, "approval-time verdict") {
+			t.Errorf("System overwrite did not supersede the prior verdict: %q", mem.Content)
+		}
+		if !strings.HasPrefix(mem.Content, "agent narrative") {
+			t.Errorf("agent_content was trampled: %q", mem.Content)
+		}
+		if !strings.Contains(mem.Content, "## Human feedback (post-run)") || !strings.HasSuffix(mem.Content, "PR merged on GitHub.") {
+			t.Errorf("outcome did not materialize under the post-run heading: %q", mem.Content)
+		}
+	})
+
+	t.Run("UpdateRunMemoryHumanContentSystem_missing_row_logged_not_fatal", func(t *testing.T) {
+		// The external transition already landed on GitHub; a missing
+		// run_memory row (purged / detached run) must not error the cycle.
+		s, orgID, _ := mk(t)
+		if err := s.UpdateRunMemoryHumanContentSystem(ctx, orgID, "00000000-0000-0000-0000-0000000000fe", "**Post-run outcome** — anything"); err != nil {
+			t.Errorf("expected nil error on missing row (logged warning); got %v", err)
+		}
+	})
+
 	t.Run("GetMemoriesForEntity_orders_by_created_at_ASC", func(t *testing.T) {
 		// Materializer reads in oldest-first order so the next agent
 		// reading prior memories sees them chronologically. Insert two

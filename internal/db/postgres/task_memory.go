@@ -88,11 +88,25 @@ func upsertAgentMemory(ctx context.Context, q queryer, orgID, runID, entityID, b
 }
 
 func (s *taskMemoryStore) UpdateRunMemoryHumanContent(ctx context.Context, orgID, runID, content string) error {
+	return updateRunMemoryHumanContent(ctx, s.q, orgID, runID, content)
+}
+
+// UpdateRunMemoryHumanContentSystem overwrites human_content on the admin pool
+// (BYPASSRLS) for the artifact reconciler, which has no JWT-claims context. Same
+// body as the app-pool variant, different pool. See the interface doc + TFAC-464.
+func (s *taskMemoryStore) UpdateRunMemoryHumanContentSystem(ctx context.Context, orgID, runID, content string) error {
+	return updateRunMemoryHumanContent(ctx, s.admin, orgID, runID, content)
+}
+
+// updateRunMemoryHumanContent is the shared body for the app- and admin-pool
+// variants: a plain overwrite of human_content (empty/whitespace → NULL),
+// logged-not-fatal on a missing row.
+func updateRunMemoryHumanContent(ctx context.Context, q queryer, orgID, runID, content string) error {
 	var humanContent any
 	if strings.TrimSpace(content) != "" {
 		humanContent = content
 	}
-	res, err := s.q.ExecContext(ctx,
+	res, err := q.ExecContext(ctx,
 		`UPDATE run_memory SET human_content = $1 WHERE org_id = $2 AND run_id = $3`,
 		humanContent, orgID, runID,
 	)
@@ -106,7 +120,7 @@ func (s *taskMemoryStore) UpdateRunMemoryHumanContent(ctx context.Context, orgID
 		// precisely, so this is mostly defensive; the symmetry is
 		// what matters.
 		var exists int
-		err := s.q.QueryRowContext(ctx,
+		err := q.QueryRowContext(ctx,
 			`SELECT 1 FROM run_memory WHERE org_id = $1 AND run_id = $2 LIMIT 1`,
 			orgID, runID,
 		).Scan(&exists)

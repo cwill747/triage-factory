@@ -89,6 +89,23 @@ type TaskMemoryStore interface {
 	// handler, swipe-discard cleanup) runs under request claims.
 	UpdateRunMemoryHumanContent(ctx context.Context, orgID, runID, content string) error
 
+	// UpdateRunMemoryHumanContentSystem is the admin-pool (BYPASSRLS) variant
+	// of UpdateRunMemoryHumanContent for the artifact reconciler (TFAC-464 β),
+	// which has no JWT-claims context. It overwrites human_content with the
+	// run's post-run outcome — how the run's artifacts resolved on GitHub
+	// (merged/closed/deleted/submitted) vs. what the agent drafted — so the
+	// next agent on the entity reads the final state.
+	//
+	// Overwrite, not append: human_content is the single "how reality diverged
+	// from your draft" slot, and the terminal outcome is its most authoritative
+	// version, superseding any approval-time account. The reconciler composes
+	// the note over the run's WHOLE artifact set each time one resolves, so a
+	// branch-then-PR run accumulates correctly without an append and a repeated
+	// cycle is idempotent. Same empty→NULL + missing-row-logged-not-fatal
+	// contract as the app-pool variant. org_id stays bound as defense in depth;
+	// SQLite collapses onto the one connection.
+	UpdateRunMemoryHumanContentSystem(ctx context.Context, orgID, runID, content string) error
+
 	// GetMemoriesForEntity returns all memories across all runs on
 	// this entity (and linked entities via entity_links), oldest
 	// first. The returned TaskMemory.Content is materialized from
