@@ -140,5 +140,10 @@ func isHelp(args []string) bool {
 }
 
 func printHelp() {
+	// Only agent-facing verbs are listed. The pre-push hook's branch-capture
+	// callback is deliberately NOT an exec subcommand — it lives under the
+	// internal `triagefactory hook` namespace (see cmd/hook), off the agent's
+	// `Bash(<bin> exec *)` allowlist, so a stuck agent scanning this help can
+	// neither see nor invoke it.
 	fmt.Printf("Usage: triagefactory exec <command> [args]\n\n%s\n\n%s\n\n%s\n\nCommands print their result to stdout on success and errors to stderr. Most commands print JSON; workspace add prints a raw path.\n", gh.HelpText, jiraexec.HelpText, workspace.HelpText)
 }

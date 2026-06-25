@@ -4,6 +4,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -167,6 +168,102 @@ func TestFailingHookDoesNotFailGitOp(t *testing.T) {
 	}
 }
 
+// --- A·3 (TFAC-460): the real embedded pre-push hook --------------------
+
+// TestPrePushHook_RecordsNewAndUpdate drives the actual embedded pre-push
+// hook (written by Ensure) over a real git push and asserts it invokes the
+// record-push verb with the correct ref/sha and the new-vs-update flag. The
+// verb itself is faked by a recorder script wired in as TRIAGE_FACTORY_BIN,
+// so this stays a hermetic git-level test with no DB.
+func TestPrePushHook_RecordsNewAndUpdate(t *testing.T) {
+	requireGit(t)
+	env, recLog := setupEmbeddedHook(t, 0)
+	work := newRepoWithRemote(t, env)
+
+	// First push creates main on the remote → --new=true.
+	mustGit(t, env, work, "push", "-u", "origin", "main")
+	got := readMarker(t, recLog)
+	for _, want := range []string{"hook record-push", "--ref refs/heads/main", "--new=true"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("new-branch push: recorder log %q missing %q", got, want)
+		}
+	}
+
+	// Second push fast-forwards main → --new=false.
+	_ = os.Truncate(recLog, 0)
+	writeFile(t, filepath.Join(work, "b.txt"), "b")
+	mustGit(t, env, work, "add", ".")
+	mustGit(t, env, work, "commit", "-m", "second")
+	mustGit(t, env, work, "push", "origin", "main")
+	got = readMarker(t, recLog)
+	if !strings.Contains(got, "--new=false") {
+		t.Errorf("update push: recorder log %q missing --new=false", got)
+	}
+}
+
+// TestPrePushHook_SkipsDeletes pins that a branch deletion (all-zero local
+// sha) records nothing — there's no branch to capture.
+func TestPrePushHook_SkipsDeletes(t *testing.T) {
+	requireGit(t)
+	env, recLog := setupEmbeddedHook(t, 0)
+	work := newRepoWithRemote(t, env)
+	mustGit(t, env, work, "push", "-u", "origin", "main")
+
+	// Push then delete a throwaway branch; only the delete is observed.
+	mustGit(t, env, work, "checkout", "-b", "tmp")
+	mustGit(t, env, work, "push", "-u", "origin", "tmp")
+	_ = os.Truncate(recLog, 0)
+	mustGit(t, env, work, "push", "origin", "--delete", "tmp")
+
+	if got := readMarker(t, recLog); strings.Contains(got, "record-push") {
+		t.Errorf("delete push recorded something: %q", got)
+	}
+}
+
+// TestPrePushHook_RecordFailureDoesNotFailPush pins the best-effort
+// contract end-to-end through the real hook: the record-push verb exiting
+// non-zero must not abort the push.
+func TestPrePushHook_RecordFailureDoesNotFailPush(t *testing.T) {
+	requireGit(t)
+	env, _ := setupEmbeddedHook(t, 1) // recorder always fails
+	work := newRepoWithRemote(t, env)
+
+	if out, err := runGit(env, work, "push", "-u", "origin", "main"); err != nil {
+		t.Fatalf("push failed despite best-effort hook: %v\n%s", err, out)
+	}
+}
+
+// setupEmbeddedHook pins the state root, calls Ensure (which writes the real
+// embedded pre-push hook), and wires a recorder script as TRIAGE_FACTORY_BIN
+// that appends its argv to recLog and exits recorderExit. Returns the agent
+// git env and the recorder log path.
+func setupEmbeddedHook(t *testing.T, recorderExit int) (env []string, recLog string) {
+	t.Helper()
+	runmode.SetForTest(t, runmode.ModeLocal)
+	paths.SetForTest(t, t.TempDir())
+	if err := Ensure(); err != nil {
+		t.Fatalf("Ensure() = %v", err)
+	}
+
+	recLog = filepath.Join(t.TempDir(), "rec.log")
+	recorder := filepath.Join(t.TempDir(), "triagefactory")
+	body := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$REC_LOG\"\nexit " +
+		strconv.Itoa(recorderExit) + "\n"
+	if err := os.WriteFile(recorder, []byte(body), 0o755); err != nil {
+		t.Fatalf("write recorder: %v", err)
+	}
+
+	home := t.TempDir()
+	base := append(sanitizeEnv(os.Environ()),
+		"HOME="+home,
+		"GIT_CONFIG_NOSYSTEM=1",
+		"GIT_TERMINAL_PROMPT=0",
+		BinEnvVar+"="+recorder,
+		"REC_LOG="+recLog,
+	)
+	return DirectAgentEnv(base), recLog
+}
+
 // --- helpers -------------------------------------------------------------
 
 func requireGit(t *testing.T) {
@@ -212,12 +309,14 @@ func setupHooks(t *testing.T, prePushBody string) (env []string, marker string) 
 	return DirectAgentEnv(base), marker
 }
 
-// sanitizeEnv returns env with every GIT_*-prefixed entry and the keys
-// setupHooks overrides (HOME, TF_HOOK_MARKER) removed, so the test agent
-// env has no duplicate keys and doesn't inherit the runner's git or home
-// configuration.
+// sanitizeEnv returns env with every GIT_*-prefixed entry and the keys the
+// setup helpers override (HOME, TF_HOOK_MARKER, TRIAGE_FACTORY_BIN, REC_LOG)
+// removed, so the test agent env has no duplicate keys and doesn't inherit
+// the runner's git/home config or a stray TRIAGE_FACTORY_BIN from the
+// developer/CI shell — which, being first-wins under glibc getenv, would
+// otherwise shadow the test recorder.
 func sanitizeEnv(env []string) []string {
-	drop := map[string]struct{}{"HOME": {}, "TF_HOOK_MARKER": {}}
+	drop := map[string]struct{}{"HOME": {}, "TF_HOOK_MARKER": {}, BinEnvVar: {}, "REC_LOG": {}}
 	out := make([]string, 0, len(env))
 	for _, kv := range env {
 		if strings.HasPrefix(kv, "GIT_") {
