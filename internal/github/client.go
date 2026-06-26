@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -66,6 +67,78 @@ func (c *Client) Get(path string) ([]byte, error) {
 	return c.do("GET", path, nil)
 }
 
+// UserID resolves the numeric user-account id for a GitHub login (e.g. a bot
+// account "<slug>[bot]") via GET /users/{login}. It is the bot *user* id — the
+// account behind the App — not the App id, and it's the value the numeric-id
+// noreply commit email is built from so App-bot commits link on github.com
+// (TFAC-474).
+//
+// /users/{login} is a public endpoint that works unauthenticated, which is what
+// the App-registration path relies on (it has only the org's GitHub base URL,
+// no installation token yet). The login is url.PathEscape'd because a bot login
+// carries "[bot]" brackets that would otherwise be mangled in the path. The
+// call routes through c.baseURL like every other request, so it targets
+// github.com or the org's GHES host without hardcoding api.github.com.
+//
+// ctx cancels the request (the call goes through getCtx rather than the
+// ctx-free do() family). Returns (0, error) on a non-2xx (notably 404 when the
+// freshly-created bot account hasn't propagated yet) or a malformed/idless body,
+// so the caller can fall back to the plain "<slug>[bot]@users.noreply.github.com"
+// form. On a non-2xx the error wraps a *HTTPError, so a caller can status-
+// discriminate via errors.As (e.g. 404 vs 429) rather than only checking err != nil.
+func (c *Client) UserID(ctx context.Context, login string) (int64, error) {
+	data, err := c.getCtx(ctx, "/users/"+url.PathEscape(login))
+	if err != nil {
+		return 0, fmt.Errorf("get user %q: %w", login, err)
+	}
+	var u struct {
+		ID int64 `json:"id"`
+	}
+	if err := json.Unmarshal(data, &u); err != nil {
+		return 0, fmt.Errorf("parse user %q: %w", login, err)
+	}
+	if u.ID == 0 {
+		return 0, fmt.Errorf("user %q: response carried no id", login)
+	}
+	return u.ID, nil
+}
+
+// getCtx performs a context-aware authenticated GET (or unauthenticated, when
+// the token is empty — see setAuth) and returns the response body. It differs
+// from the do() family in two ways UserID needs and the broader API doesn't
+// (yet) provide: it honors ctx for cancellation, and it returns a typed
+// *HTTPError on a non-2xx so callers can status-discriminate via errors.As —
+// matching GetConditional / GetRaw / DownloadArtifact, which already do. It's
+// kept as its own seam rather than changing do()'s shared error type across
+// every Get/Post/… caller in this PR.
+func (c *Client) getCtx(ctx context.Context, path string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL+path, nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setAuth(req)
+	req.Header.Set("Accept", "application/vnd.github.v3+json")
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+	if resp.StatusCode >= 400 {
+		return nil, &HTTPError{
+			StatusCode: resp.StatusCode,
+			Body:       string(data),
+			msg:        fmt.Sprintf("GET %s returned %d: %s", path, resp.StatusCode, string(data)),
+		}
+	}
+	return data, nil
+}
+
 // GetConditional performs an authenticated GET that sends an If-None-Match
 // header when etag is non-empty. It surfaces the conditional-request outcome
 // the plain Get hides:
@@ -85,7 +158,7 @@ func (c *Client) GetConditional(path, etag string) (body []byte, newEtag string,
 	if err != nil {
 		return nil, "", false, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.pat)
+	c.setAuth(req)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	if etag != "" {
 		req.Header.Set("If-None-Match", etag)
@@ -171,7 +244,7 @@ func (c *Client) DownloadArtifact(ctx context.Context, path string, dst io.Write
 	if err != nil {
 		return 0, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.pat)
+	c.setAuth(req)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 
 	// Shallow copy so the long-download timeout doesn't bleed into other
@@ -225,7 +298,7 @@ func (c *Client) GetRaw(path, accept string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.pat)
+	c.setAuth(req)
 	req.Header.Set("Accept", accept)
 
 	resp, err := c.http.Do(req)
@@ -298,7 +371,7 @@ func (c *Client) PostGraphQL(body any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.pat)
+	c.setAuth(req)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.http.Do(req)
@@ -348,6 +421,26 @@ func (c *Client) PostGraphQL(body any) ([]byte, error) {
 	return data, nil
 }
 
+// setAuth applies the bearer Authorization header for an authenticated client,
+// and is the single place every request builder (do, GetConditional, GetRaw,
+// DownloadArtifact, PostGraphQL) sets it — so "empty token ⇒ unauthenticated"
+// holds uniformly across the whole client, not just one method.
+//
+// An empty token means an unauthenticated client. The App-registration path
+// builds one to read the public GET /users/{login} (UserID) before any
+// installation token exists (TFAC-474). We omit the header entirely rather than
+// send a malformed "Bearer " with no value, which GitHub rejects as bad
+// credentials (401) — strictly worse than an anonymous request, which GitHub
+// serves for public reads. Every real call site passes a non-empty token
+// (PAT or minted installation token), so this only affects the deliberate
+// unauthenticated case and never weakens an authenticated request.
+func (c *Client) setAuth(req *http.Request) {
+	if c.pat == "" {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+c.pat)
+}
+
 func (c *Client) do(method, path string, body any) ([]byte, error) {
 	url := c.baseURL + path
 
@@ -364,7 +457,7 @@ func (c *Client) do(method, path string, body any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+c.pat)
+	c.setAuth(req)
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")

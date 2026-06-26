@@ -65,6 +65,121 @@ func TestIsHTTP406_WrappedNon406(t *testing.T) {
 	}
 }
 
+// TestClient_UserID pins the bot-user-id lookup the App-registration path uses
+// to build the numeric-id noreply commit email (TFAC-474): GET /users/{login}
+// with the "[bot]" brackets URL-escaped on the wire, parsing {"id":N}; a 404 (or
+// any non-2xx) or an idless body yields 0 + error so the caller falls back to
+// the plain noreply form. It also pins that an empty-token client sends NO
+// Authorization header — the registration read is genuinely unauthenticated,
+// not a malformed "Bearer " GitHub would reject.
+func TestClient_UserID(t *testing.T) {
+	t.Run("resolves id, url-escapes [bot], unauthenticated", func(t *testing.T) {
+		var gotRequestURI, gotAuth string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotRequestURI = r.RequestURI
+			gotAuth = r.Header.Get("Authorization")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"id":424242,"login":"acme-bot[bot]"}`))
+		}))
+		defer srv.Close()
+
+		id, err := NewClient(srv.URL, "").UserID(context.Background(), "acme-bot[bot]")
+		if err != nil {
+			t.Fatalf("UserID: %v", err)
+		}
+		if id != 424242 {
+			t.Errorf("id = %d, want 424242", id)
+		}
+		// The brackets must be percent-encoded on the wire (GitHub rejects raw
+		// brackets in a path); the decoded form must NOT appear.
+		if !strings.Contains(gotRequestURI, "acme-bot%5Bbot%5D") {
+			t.Errorf("request URI = %q, want it to carry the escaped %%5Bbot%%5D", gotRequestURI)
+		}
+		if strings.Contains(gotRequestURI, "[bot]") {
+			t.Errorf("request URI = %q carried raw [bot] brackets (must be escaped)", gotRequestURI)
+		}
+		// Empty token → unauthenticated: no Authorization header at all.
+		if gotAuth != "" {
+			t.Errorf("Authorization = %q, want empty (unauthenticated registration read)", gotAuth)
+		}
+	})
+
+	t.Run("404 -> 0 + typed *HTTPError (status-discriminable)", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+		}))
+		defer srv.Close()
+
+		id, err := NewClient(srv.URL, "").UserID(context.Background(), "ghost[bot]")
+		if err == nil {
+			t.Fatal("UserID on 404 returned nil error; want an error so the caller falls back to the plain form")
+		}
+		if id != 0 {
+			t.Errorf("id = %d, want 0 on error", id)
+		}
+		// The error wraps a *HTTPError so a caller can status-discriminate
+		// (404 vs 429, …) rather than only checking err != nil.
+		var he *HTTPError
+		if !errors.As(err, &he) || he.StatusCode != http.StatusNotFound {
+			t.Errorf("error = %v, want a wrapped *HTTPError with StatusCode 404", err)
+		}
+	})
+
+	t.Run("idless body -> 0 + error", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"login":"acme-bot[bot]"}`)) // no id field
+		}))
+		defer srv.Close()
+
+		id, err := NewClient(srv.URL, "").UserID(context.Background(), "acme-bot[bot]")
+		if err == nil || id != 0 {
+			t.Fatalf("UserID on idless body = (%d, %v), want (0, error)", id, err)
+		}
+	})
+}
+
+// TestClient_EmptyToken_UnauthenticatedAcrossMethods pins the invariant behind
+// the setAuth seam (TFAC-474): an empty-token client omits the Authorization
+// header on EVERY request builder — do/Get, GetConditional, GetRaw,
+// DownloadArtifact, PostGraphQL — not just one. A regression that re-adds an
+// unconditional "Bearer " on any of them would resurface the malformed-
+// credential 401 on the unauthenticated registration read.
+func TestClient_EmptyToken_UnauthenticatedAcrossMethods(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"data":{}}`))
+	}))
+	defer srv.Close()
+	c := NewClient(srv.URL, "") // unauthenticated client
+
+	checks := []struct {
+		name string
+		call func() error
+	}{
+		{"do/Get", func() error { _, err := c.Get("/x"); return err }},
+		{"GetConditional", func() error { _, _, _, err := c.GetConditional("/x", ""); return err }},
+		{"GetRaw", func() error { _, err := c.GetRaw("/x", "application/json"); return err }},
+		{"DownloadArtifact", func() error {
+			_, err := c.DownloadArtifact(context.Background(), "/x", &strings.Builder{}, 1<<20)
+			return err
+		}},
+		{"PostGraphQL", func() error { _, err := c.PostGraphQL(map[string]any{"query": "{__typename}"}); return err }},
+	}
+	for _, ck := range checks {
+		gotAuth = "sentinel"
+		if err := ck.call(); err != nil {
+			t.Fatalf("%s: %v", ck.name, err)
+		}
+		if gotAuth != "" {
+			t.Errorf("%s sent Authorization=%q, want none (empty-token client must be unauthenticated)", ck.name, gotAuth)
+		}
+	}
+}
+
 func TestGraphQLURL(t *testing.T) {
 	tests := []struct {
 		name    string
