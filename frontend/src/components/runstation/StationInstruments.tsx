@@ -1,19 +1,23 @@
 import type { AgentMessage, AgentRun } from '../../types'
 import { formatDurationMs, formatElapsed } from '../../lib/runStatus'
 import { compactNum, tokenTotals, tint, type StationState } from './stationStyle'
+import ArtifactList from '../ArtifactList'
 
 interface Props {
   run: AgentRun
   messages: AgentMessage[]
   state: StationState
   now: number
+  /** Open an artifact's approval overlay (PR / review) — wired up the page to
+   *  RunDetail's overlay state. */
+  onOpenArtifact?: (kind: 'review' | 'pr', artifactId: string) => void
 }
 
 // TelemetryRail — the instruments etched into the machine's housing, flanking
 // the screen. Unlike the dark screen, this is part of the warm housing: light,
 // quiet, all monospace readouts and thin gauges. It carries only data the run
 // actually has — no faked context meter (that arrives with P4's telemetry).
-export function TelemetryRail({ run, messages, state, now }: Props) {
+export function TelemetryRail({ run, messages, state, now, onOpenArtifact }: Props) {
   const tok = tokenTotals(messages)
   const contextUsed = latestContextSize(messages)
   const started = run.StartedAt ? new Date(run.StartedAt) : null
@@ -61,6 +65,17 @@ export function TelemetryRail({ run, messages, state, now }: Props) {
         {run.StopReason && <Readout k="stop" v={run.StopReason} />}
         {run.Outcome && <Readout k="outcome" v={run.Outcome} accent={state.light} />}
       </Section>
+
+      {/* Artifacts — everything the run produced (branch / PR / review / issue /
+          comment); PR/review rows open their approval overlays, the rest link
+          out (TFAC-470). Gated on artifact_count (free on the run) so a run
+          that produced nothing skips both the section and its fetch — matching
+          the board card's affordance, which hides at 0. */}
+      {(run.artifact_count ?? 0) > 0 && (
+        <Section label="Artifacts">
+          <ArtifactList runId={run.ID} onOpenApproval={onOpenArtifact} />
+        </Section>
+      )}
 
       {run.Status === 'completed' && run.ResultSummary && (
         <Section label="Summary" last>

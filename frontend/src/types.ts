@@ -109,8 +109,38 @@ export interface AgentRun {
   // (pending_kind === 'review') or the draft-PR artifact (pending_kind === 'pr').
   // Both overlays are addressed by it (the artifact id), not the run id.
   pending_artifact_id?: string
+  // artifact_count is the number of artifacts this run produced (TFAC-465's
+  // runResponse projection — branch / PR / review / issue / comment, the
+  // primary gating one included). The Board card shows it as a footer
+  // affordance without a per-card fetch; 0 / undefined hides the affordance.
+  artifact_count?: number
   blueprint_run_id?: string
   blueprint_step_index?: number | null
+}
+
+// ArtifactKind is the closed set of artifact discriminators the backend emits
+// (internal/domain/artifact.go). Kept a strict union — not widened with
+// `| string`, which would collapse the whole type to `string` and erase the
+// narrowing. A server value outside this set is handled defensively at the
+// render layer (a fallback icon/label), it just isn't part of the documented
+// contract.
+export type ArtifactKind = 'branch' | 'pull_request' | 'review' | 'issue' | 'comment'
+
+// Artifact mirrors the GET /api/agent/runs/{id}/artifacts wire shape
+// (internal/server/agent.go artifactJSON, TFAC-465). One row per real external
+// object a run produced. `state` is meaningful only read with `kind` (see
+// internal/domain/artifact.go — 'pending' aliases across kinds). `details` is
+// the parsed kind-specific payload (or null when absent/unparseable).
+export interface Artifact {
+  id: string
+  kind: ArtifactKind
+  provider: string
+  state: string
+  target: string
+  external_id: string
+  url: string
+  details: unknown
+  created_at: string
 }
 
 export interface AgentMessage {
