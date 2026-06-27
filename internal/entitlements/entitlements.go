@@ -26,7 +26,10 @@
 // sandbox-fleet administration, audit export are the paid tier).
 package entitlements
 
-import "sync"
+import (
+	"slices"
+	"sync"
+)
 
 // Feature names a gated enterprise capability. The string values are the
 // stable wire identifiers that appear in a signed license token's
@@ -38,7 +41,27 @@ const (
 	// extensions: GoTrue connection management, domain verification, and
 	// enforcement. Multi-mode only.
 	FeatureSSO Feature = "sso"
+
+	// FeatureGovernance gates the Enterprise governance/audit surfaces:
+	// per-team daily spend caps, the bot-activity audit feed, and the
+	// access/credential change-log viewer. It is the first EE feature with
+	// a real frontend surface — SSO only needed backend route-mounting plus a
+	// 404-and-hide — which is why this feature also motivates the
+	// /api/entitlements probe and the useEntitlements FE hook the governance
+	// surfaces gate on.
+	FeatureGovernance Feature = "governance"
 )
+
+// allFeatures is the registry of every gated feature. Unexported + returned by
+// value through AllFeatures so a caller can't append to or blank out the
+// registry and corrupt the probe.
+var allFeatures = []Feature{FeatureSSO, FeatureGovernance}
+
+// AllFeatures returns every gated feature, for the /api/entitlements probe to
+// iterate and report the subset the active checker licenses. It returns a fresh
+// copy each call, so a new gated Feature must be added to allFeatures to show up
+// on the probe (and thus to the frontend's useEntitlements hook).
+func AllFeatures() []Feature { return slices.Clone(allFeatures) }
 
 // Checker answers whether a given enterprise feature is licensed for use
 // in this process right now. Implementations must be safe for concurrent
