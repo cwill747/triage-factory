@@ -12,6 +12,7 @@ import {
 } from 'recharts'
 import * as HintTip from '@radix-ui/react-tooltip'
 import TeamSwitch from '../components/TeamSwitch'
+import ActivityFeed from '../components/ActivityFeed'
 import { useOptionalAuth } from '../contexts/AuthContext'
 import { useEntitlements, FeatureGovernance } from '../hooks/useEntitlements'
 import { useOrgRole } from '../hooks/useOrgRole'
@@ -1033,10 +1034,13 @@ function TeamSection({
   adminTeams,
   since,
   days,
+  gov,
 }: {
   adminTeams: TeamSummary[]
   since: string
   days: number
+  /** FeatureGovernance licensed + probe resolved — gates the EE bot-activity feed. */
+  gov: boolean
 }) {
   // The picked team, validated against the teams we currently admin every
   // render — if the held id is no longer one of them (org switch, a late
@@ -1067,39 +1071,43 @@ function TeamSection({
     )
 
   return (
-    <Band
-      label="Team"
-      right={right}
-      total={total}
-      rate={total / active}
-      hasData={data !== null}
-      error={error}
-      empty={total === 0}
-    >
-      {/* By member is the wide, tall, scrollable roster (2/3); by rule rides
-          beside it, then category + throughput share the next row. */}
-      <div className="grid grid-cols-1 gap-x-10 gap-y-8 md:grid-cols-2 lg:grid-cols-3">
-        <Instrument
-          label="By member"
-          className="md:col-span-2 lg:col-span-2"
-          aside={<RosterAvg data={data?.by_user ?? []} />}
-        >
-          <UserRoster data={data?.by_user ?? []} emptyLabel="no member spend" />
-        </Instrument>
-        <Instrument label="By rule">
-          <Gauges data={ruleBars(data?.by_rule)} emptyLabel="no automated runs" />
-        </Instrument>
-        <Instrument label="Category">
-          <CategoryDonut data={data?.by_category ?? []} />
-        </Instrument>
-        <ThroughputInstrument
-          byDay={data?.by_day ?? []}
-          byModel={data?.by_model ?? []}
-          byDayModel={data?.by_day_model ?? []}
-          spanClass="md:col-span-2 lg:col-span-2"
-        />
-      </div>
-    </Band>
+    <>
+      <Band
+        label="Team"
+        right={right}
+        total={total}
+        rate={total / active}
+        hasData={data !== null}
+        error={error}
+        empty={total === 0}
+      >
+        {/* By member is the wide, tall, scrollable roster (2/3); by rule rides
+            beside it, then category + throughput share the next row. */}
+        <div className="grid grid-cols-1 gap-x-10 gap-y-8 md:grid-cols-2 lg:grid-cols-3">
+          <Instrument
+            label="By member"
+            className="md:col-span-2 lg:col-span-2"
+            aside={<RosterAvg data={data?.by_user ?? []} />}
+          >
+            <UserRoster data={data?.by_user ?? []} emptyLabel="no member spend" />
+          </Instrument>
+          <Instrument label="By rule">
+            <Gauges data={ruleBars(data?.by_rule)} emptyLabel="no automated runs" />
+          </Instrument>
+          <Instrument label="Category">
+            <CategoryDonut data={data?.by_category ?? []} />
+          </Instrument>
+          <ThroughputInstrument
+            byDay={data?.by_day ?? []}
+            byModel={data?.by_model ?? []}
+            byDayModel={data?.by_day_model ?? []}
+            spanClass="md:col-span-2 lg:col-span-2"
+          />
+        </div>
+      </Band>
+      {/* EE activity feed (Actions / Objects lenses) — team-scoped, behind FeatureGovernance. */}
+      {gov && teamId && <ActivityFeed baseUrl={`/api/usage/teams/${teamId}/activity`} />}
+    </>
   )
 }
 
@@ -1284,7 +1292,7 @@ function TeamCaps({
   )
 }
 
-function OrgSection({ since, days }: { since: string; days: number }) {
+function OrgSection({ since, days, gov }: { since: string; days: number; gov: boolean }) {
   const { data, error } = useUsageFetch<UsageOrgResponse>(withWindow('/api/usage/org', since))
   // Per-team caps are an EE/governance surface; render the editor only when the
   // active org is licensed (the OrgSection itself is already org-admin-gated). The
@@ -1292,9 +1300,11 @@ function OrgSection({ since, days }: { since: string; days: number }) {
   // lists EVERY active team (TFAC-482) via a separate governance read — fetched
   // only when licensed — so an idle team (absent from the spend rollup's by_team)
   // can still be pre-capped; each row's window spend is looked up from by_team.
-  const showCaps = useEntitlements().has(FeatureGovernance)
+  // gov (the FeatureGovernance entitlement, threaded from the parent) gates both
+  // EE org surfaces here: the per-team daily-cap editor (TFAC-482) and the
+  // activity feed (TFAC-483). The caps list is fetched only when licensed.
   const { data: caps } = useUsageFetch<UsageTeamCapsResponse>(
-    showCaps ? '/api/usage/org/team-caps' : null,
+    gov ? '/api/usage/org/team-caps' : null,
   )
   const spendByTeam = new Map<string, number>(
     (data?.by_team ?? []).map((t) => [t.team_id, t.cost] as [string, number]),
@@ -1302,46 +1312,50 @@ function OrgSection({ since, days }: { since: string; days: number }) {
   const total = data?.total_cost_usd ?? 0
   const active = activeDays(data?.by_day ?? [], days)
   return (
-    <Band
-      label="Org"
-      total={total}
-      rate={total / active}
-      hasData={data !== null}
-      error={error}
-      empty={total === 0}
-    >
-      {/* Allocation + Category as two half-width dials — larger rings with
-          scrollable, hover-linked side legends — then the wide by-user roster and
-          the full-width throughput. */}
-      <div className="grid grid-cols-1 gap-x-10 gap-y-8 md:grid-cols-2">
-        {/* Allocation — the whole org spend partitioned across teams + the org-
-            level (non-team) slices (merges the old "by team" + "org-level"). */}
-        <Instrument label="Allocation">
-          <AllocationDonut byTeam={data?.by_team ?? []} orgLevel={data?.org_level ?? []} />
-        </Instrument>
-        <Instrument label="Category">
-          <CategoryDonut data={data?.by_category ?? []} large />
-        </Instrument>
-        <Instrument
-          label="By user"
-          className="md:col-span-2"
-          aside={<RosterAvg data={data?.by_user ?? []} />}
-        >
-          <UserRoster data={data?.by_user ?? []} emptyLabel="no user spend" />
-        </Instrument>
-        {showCaps && caps && (
-          <Instrument label="Daily caps" className="md:col-span-2">
-            <TeamCaps teams={caps.teams} spendByTeam={spendByTeam} />
+    <>
+      <Band
+        label="Org"
+        total={total}
+        rate={total / active}
+        hasData={data !== null}
+        error={error}
+        empty={total === 0}
+      >
+        {/* Allocation + Category as two half-width dials — larger rings with
+            scrollable, hover-linked side legends — then the wide by-user roster, the
+            EE daily-cap editor, and the full-width throughput. */}
+        <div className="grid grid-cols-1 gap-x-10 gap-y-8 md:grid-cols-2">
+          {/* Allocation — the whole org spend partitioned across teams + the org-
+              level (non-team) slices (merges the old "by team" + "org-level"). */}
+          <Instrument label="Allocation">
+            <AllocationDonut byTeam={data?.by_team ?? []} orgLevel={data?.org_level ?? []} />
           </Instrument>
-        )}
-        <ThroughputInstrument
-          byDay={data?.by_day ?? []}
-          byModel={data?.by_model ?? []}
-          byDayModel={data?.by_day_model ?? []}
-          spanClass="md:col-span-2"
-        />
-      </div>
-    </Band>
+          <Instrument label="Category">
+            <CategoryDonut data={data?.by_category ?? []} large />
+          </Instrument>
+          <Instrument
+            label="By user"
+            className="md:col-span-2"
+            aside={<RosterAvg data={data?.by_user ?? []} />}
+          >
+            <UserRoster data={data?.by_user ?? []} emptyLabel="no user spend" />
+          </Instrument>
+          {gov && caps && (
+            <Instrument label="Daily caps" className="md:col-span-2">
+              <TeamCaps teams={caps.teams} spendByTeam={spendByTeam} />
+            </Instrument>
+          )}
+          <ThroughputInstrument
+            byDay={data?.by_day ?? []}
+            byModel={data?.by_model ?? []}
+            byDayModel={data?.by_day_model ?? []}
+            spanClass="md:col-span-2"
+          />
+        </div>
+      </Band>
+      {/* EE activity feed (Actions / Objects lenses) — org-wide (cross-team), behind FeatureGovernance. */}
+      {gov && <ActivityFeed baseUrl="/api/usage/org/activity" showTeam />}
+    </>
   )
 }
 
@@ -1658,13 +1672,14 @@ export default function Usage() {
   const { teams } = useTeams()
   const adminTeams = teams.filter((t) => t.role === 'admin')
 
-  // The access & credential change-log is the EE governance audit surface: shown
-  // to whoever sees the org rollup (org admins, and the local N=1 owner) AND only
-  // when the governance entitlement is licensed. `loaded` gates the flash before
-  // the entitlements probe resolves; an unlicensed build (every local install
-  // included) hides it, matching the backend's 404.
+  // EE governance entitlement (both surfaces gate on it, dark until the probe
+  // resolves; unlicensed builds — local mode included — keep them dark, matching
+  // the backend's 404). `gov` threads into the team/org sections for the activity
+  // feed + the daily-cap editor; `showAccessLog` additionally requires the org
+  // rollup to be visible (org admin, or the local N=1 owner).
   const { has, loaded: entLoaded } = useEntitlements()
-  const showAccessLog = showOrg && entLoaded && has(FeatureGovernance)
+  const gov = entLoaded && has(FeatureGovernance)
+  const showAccessLog = showOrg && gov
 
   const [range, setRange] = useState<RangeKey>('month')
   const since = sinceParam(range)
@@ -1690,9 +1705,9 @@ export default function Usage() {
           <>
             <PersonalSection since={since} days={days} />
             {adminTeams.length > 0 && (
-              <TeamSection adminTeams={adminTeams} since={since} days={days} />
+              <TeamSection adminTeams={adminTeams} since={since} days={days} gov={gov} />
             )}
-            {showOrg && <OrgSection since={since} days={days} />}
+            {showOrg && <OrgSection since={since} days={days} gov={gov} />}
           </>
         )}
         {/* EE governance audit — its own band below the spend console, in both

@@ -763,6 +763,12 @@ func (s *Server) routes() {
 	s.api("GET /api/usage/me", uh.handleUsageMe)
 	s.api("GET /api/usage/teams/{team_id}", uh.handleUsageTeam)
 	s.api("GET /api/usage/org", uh.handleUsageOrg)
+	// Activity feed (EE, FeatureGovernance): the team/org Actions (external-action
+	// audit log) + Objects (artifact history) lenses, selected by ?view= — same
+	// scope gates as the spend reads above, plus the entitlement (unlicensed →
+	// 404). TFAC-483.
+	s.api("GET /api/usage/teams/{team_id}/activity", uh.handleUsageTeamActivity)
+	s.api("GET /api/usage/org/activity", uh.handleUsageOrgActivity)
 	// Per-team daily spend cap (TFAC-482) — org-admin-set, EE/governance-gated
 	// (the handlers 404 when unlicensed). The GET lists every active team + its cap
 	// for the editor (so an idle team can be pre-capped); the PUT writes one cap and
