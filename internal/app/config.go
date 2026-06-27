@@ -12,8 +12,10 @@ const (
 	// DefaultHost binds to loopback only. Triage Factory is a local-first
 	// tool that holds keychain-backed credentials and an unauthenticated
 	// HTTP API; exposing it on all interfaces by default would let anyone
-	// on the same network drive delegated runs. Override with --host if
-	// you genuinely want LAN access.
+	// on the same network drive delegated runs. Override with --host if you
+	// genuinely want LAN access — but note the local-mode public-exposure
+	// guardrail (assertLocalBindSafe) then refuses to boot unless you also
+	// set TF_ALLOW_PUBLIC_LOCAL=true to acknowledge the zero-auth exposure.
 	DefaultHost = "127.0.0.1"
 )
 
@@ -46,7 +48,7 @@ func LoadConfig(args []string) (Config, error) {
 	// separately via the CLI dispatch (see cli.go).
 	fs.SetOutput(io.Discard)
 	fs.IntVar(&cfg.Port, "port", DefaultPort, "port to listen on")
-	fs.StringVar(&cfg.Host, "host", DefaultHost, "bind address (use 0.0.0.0 for LAN access)")
+	fs.StringVar(&cfg.Host, "host", DefaultHost, "bind address (use 0.0.0.0 for LAN access; in local mode a non-loopback bind requires TF_ALLOW_PUBLIC_LOCAL=true)")
 	fs.BoolVar(&cfg.NoBrowser, "no-browser", false, "do not open a browser on start")
 	if err := fs.Parse(args); err != nil {
 		return Config{}, err
