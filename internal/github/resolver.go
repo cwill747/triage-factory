@@ -57,6 +57,35 @@ type RepoIdentityResolver interface {
 	ClientForRepoWithIdentity(ctx context.Context, orgID, owner, repo string) (*Client, Identity, error)
 }
 
+// ScopedResolver is the optional extension, implemented by the production
+// resolver, that mints a per-repo down-scoped credential and probes overall
+// credential presence. Callers that need a least-privilege token narrowed to
+// one repo (the multi-mode git proxy's TokenSource) type-assert for it; an
+// implementation that doesn't satisfy it (a test fake) leaves the caller to
+// disable the per-repo path. Kept off the base Resolver so the many existing
+// Resolver fakes don't have to grow methods they never exercise.
+type ScopedResolver interface {
+	// TokenForRepoScoped mints a credential narrowed to exactly owner/repo
+	// (and, when permissions is non-empty, that permission subset). App tier
+	// only narrows — a PAT is returned unchanged (it cannot be scoped). See
+	// the impl for the tier order and the 422-fall-through to PAT.
+	TokenForRepoScoped(ctx context.Context, orgID, owner, repo string, permissions map[string]string) (githubapp.Token, error)
+	// HasAnyCredential reports whether the org has ANY usable GitHub
+	// credential (an App installation or a PAT) WITHOUT minting a repo-scoped
+	// token — the run-start probe that decides whether a run gets a git proxy
+	// at all (a Jira-only org with no GitHub credential gets none).
+	HasAnyCredential(ctx context.Context, orgID string) (bool, error)
+}
+
+// ScopedRepoResolver is the optional extension that resolves a *Client backed
+// by a per-repo down-scoped token (the multi-mode exec-gh channel). Separate
+// from ScopedResolver because the gh channel wants a ready client + identity,
+// not a raw token; a resolver that doesn't implement it falls back to the
+// unscoped ClientForRepo path.
+type ScopedRepoResolver interface {
+	ClientForRepoScoped(ctx context.Context, orgID, owner, repo string, permissions map[string]string) (*Client, Identity, error)
+}
+
 // Resolver produces an authenticated *Client for a given org + GitHub
 // target account, choosing the credential by tier:
 //
@@ -168,24 +197,32 @@ func NewResolver(secrets db.SecretStore, apps db.GitHubAppsStore, orgs db.OrgsSt
 	return &resolver{secrets: secrets, apps: apps, orgs: orgs, agents: agents, cache: cache, coverage: newRepoCoverageCache()}
 }
 
+// The production resolver implements the optional per-repo-scoping extensions
+// the multi-mode git proxy + exec-gh channel type-assert for. Pinned here so a
+// dropped method is a compile error rather than a silent runtime fall-through
+// to the unscoped path.
+var (
+	_ ScopedResolver     = (*resolver)(nil)
+	_ ScopedRepoResolver = (*resolver)(nil)
+)
+
 func (r *resolver) ClientFor(ctx context.Context, orgID, target string) (*Client, error) {
 	base, err := r.githubBaseFor(ctx, orgID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Tier 1: the org's own GitHub App installation token. Best-effort —
-	// any failure here (no App, no matching installation, mint/PEM error)
-	// falls through to PAT rather than propagating, because a working PAT is
-	// a legitimate fallback.
-	if client, ok := r.tier1AppClient(ctx, orgID, target, base); ok {
-		return client, nil
+	// App XOR PAT (see activeApp): an active App is the org's credential — mint
+	// its installation token for target or fail; never borrow a PAT.
+	if app := r.activeApp(ctx, orgID); app != nil {
+		tok, terr := r.appToken(ctx, orgID, app, target, base)
+		if terr != nil {
+			return nil, terr
+		}
+		return NewClient(base, tok.Value), nil
 	}
 
-	// Tier 2 (deployment-default shared App) is deferred to SKY-363; it
-	// slots in here between tier 1 and tier 3 without renumbering.
-
-	// Tier 3: PAT-borrow. A backend read error here propagates — there's no
+	// No active App → PAT-borrow. A backend read error propagates — there's no
 	// further fallback, so reporting "not configured" would misattribute a
 	// secret-store outage to user misconfiguration.
 	client, err := r.tier3PATClient(ctx, orgID, base)
@@ -205,52 +242,30 @@ func (r *resolver) ClientForRepo(ctx context.Context, orgID, owner, repo string)
 }
 
 // ClientForRepoWithIdentity is ClientForRepo plus the Identity of the
-// credential it resolved (see RepoIdentityResolver). The tier decision IS the
-// identity — tier 1 (App installation covering the repo) → IdentityApp, tier 3
-// (PAT-borrow) → IdentityPAT — so reporting it costs nothing extra and the
-// caller gets a client and an identity that are guaranteed to describe the same
-// credential. ClientForRepo delegates here and discards the identity.
+// credential it resolved (see RepoIdentityResolver). The credential decision IS
+// the identity — an active App covering the repo → IdentityApp, a PAT-borrow →
+// IdentityPAT — so reporting it costs nothing extra and the caller gets a client
+// and an identity guaranteed to describe the same credential. ClientForRepo
+// delegates here and discards the identity.
+//
+// App XOR PAT (see activeApp): an active App is resolved repo-aware (gated on
+// coverage) or fails; only an org with no active App reaches the PAT. So
+// IdentityApp/IdentityPAT also track which credential the org has, not a
+// per-repo fallback choice.
 func (r *resolver) ClientForRepoWithIdentity(ctx context.Context, orgID, owner, repo string) (*Client, Identity, error) {
 	base, err := r.githubBaseFor(ctx, orgID)
 	if err != nil {
 		return nil, IdentityUnknown, err
 	}
 
-	// Tier 1, repo-aware: the org's App installation for owner, but only when
-	// its grant covers owner/repo (see the ClientForRepo interface doc).
-	// Coverage is probed up front rather than via a 403-retry — 403 is
-	// ambiguous and the grant is knowable ahead of time. A single
-	// GET /repos/{owner}/{repo} on the installation token answers it (200 →
-	// covered, 404/403 → not in grant), far cheaper than paginating the whole
-	// installation repo set; a positive answer is memoized (repoCoverageTTL) so
-	// the per-card dashboard path doesn't re-probe every request. Negatives are
-	// deliberately not cached — see repoCoverageCache.
-	if client, ok := r.tier1AppClient(ctx, orgID, owner, base); ok {
-		if r.coverage.covered(orgID, owner, repo) {
-			return client, IdentityApp, nil // memoized: in the grant
-		}
-		reachable, conclusive := client.CheckRepoAccess(ctx, owner, repo)
-		if !conclusive {
-			// Indeterminate (5xx / transport error) — fail open with the minted
-			// App client (the same one owner-grain ClientFor would return) and
-			// don't cache, so a transient outage can't pin a wrong answer.
-			return client, IdentityApp, nil
-		}
-		if reachable {
-			r.coverage.markCovered(orgID, owner, repo)
-			return client, IdentityApp, nil
-		}
-		// Conclusively not covered: installed on this account but this repo
-		// isn't in the grant. Fall through to the PAT, which may still reach it.
-		ghResolverLog.Warn("app installed on account but repo not in grant; falling back to PAT",
-			"org", orgID, "owner", owner, "repo", repo)
+	// Active App → the App client for owner/repo (gated on coverage), or an
+	// error. Never a PAT.
+	if app := r.activeApp(ctx, orgID); app != nil {
+		return r.appClientForRepo(ctx, orgID, app, owner, repo, base)
 	}
 
-	// Tier 2 (deployment-default shared App) slots in here when it lands,
-	// same as in ClientFor.
-
-	// Tier 3: PAT-borrow. A backend read error propagates — same discipline
-	// as ClientFor.
+	// No active App → PAT-borrow. A backend read error propagates — same
+	// discipline as ClientFor.
 	client, err := r.tier3PATClient(ctx, orgID, base)
 	if err != nil {
 		return nil, IdentityUnknown, err
@@ -298,50 +313,106 @@ func (r *resolver) githubBaseFor(ctx context.Context, orgID string) (string, err
 	return DefaultBaseURL, nil
 }
 
-func (r *resolver) tier1AppClient(ctx context.Context, orgID, target, base string) (*Client, bool) {
-	tok, ok := r.tier1Token(ctx, orgID, target, base)
-	if !ok {
-		return nil, false
-	}
-	return NewClient(base, tok.Value), true
-}
-
-// tier1Token resolves the org's own App installation token for target, or
-// (zero, false) when there's no usable App / installation / mintable token —
-// in which case the caller falls through to the PAT tier. Shared by
-// tier1AppClient (ClientFor) and TokenFor so the API client and the host-side
-// git clone resolve identically and hit the same TokenCache.
-func (r *resolver) tier1Token(ctx context.Context, orgID, target, base string) (githubapp.Token, bool) {
+// activeApp returns the org's registered App when it is active (the org's git
+// credential is an App), else nil. A read error is treated as "no active App"
+// so resolution can still try the PAT tier — the same best-effort posture the
+// resolver has always taken on the App read.
+//
+// This is the App-XOR-PAT gate. An org's git credential is its active App OR a
+// borrowed PAT, never both stably: the migration flow deletes the PAT at App
+// cutover and tears down the App on switch-to-PAT, so "active App + usable PAT"
+// is only ever a transient anomaly (a half-finished cutover). So when an active
+// App is configured it is the ONLY credential path — every resolver entry point
+// mints from it or fails, and NONE falls through to a PAT (which for an
+// active-App org would mean a decommissioning, unscoped credential). The PAT
+// tier is reached only when there is no active App.
+func (r *resolver) activeApp(ctx context.Context, orgID string) *domain.OrgGitHubApp {
 	app, err := r.apps.GetForOrgSystem(ctx, orgID)
 	if err != nil {
-		ghResolverLog.Warn("read app registration failed; skipping tier1",
+		ghResolverLog.Warn("read app registration failed; treating org as no-active-App (PAT tier)",
 			"org", orgID, "error", err)
-		return githubapp.Token{}, false
+		return nil
 	}
 	if app == nil || !app.Active {
-		return githubapp.Token{}, false
+		return nil
 	}
-
-	inst, ok := r.installationFor(ctx, orgID, target)
-	if !ok {
-		return githubapp.Token{}, false
-	}
-
-	tok, err := r.installationToken(ctx, orgID, app, inst, base)
-	if err != nil {
-		// A mint failure on an org that HAS an App is worth a louder log —
-		// it usually means a bad/rotated PEM or a revoked installation. Fall
-		// through to PAT so the user isn't hard-blocked, but make it visible.
-		ghResolverLog.Warn("mint installation token failed; falling back to PAT",
-			"org", orgID, "target", target, "installation", inst.InstallationID, "error", err)
-		return githubapp.Token{}, false
-	}
-	ghResolverLog.Debug("resolved tier1 app installation",
-		"org", orgID, "target", target, "installation", inst.InstallationID, "account", inst.AccountLogin)
-	return tok, true
+	return app
 }
 
-// TokenFor mirrors ClientFor's tier resolution but returns the raw
+// appToken resolves the org's App installation token for target (the account
+// the work concerns), or an error — NO PAT fallback (the caller determined via
+// activeApp that the org's credential is the App). Shares the installation
+// TokenCache with ClientFor so the API client and the host-side git clone
+// resolve identically.
+func (r *resolver) appToken(ctx context.Context, orgID string, app *domain.OrgGitHubApp, target, base string) (githubapp.Token, error) {
+	inst, ok := r.installationFor(ctx, orgID, target)
+	if !ok {
+		return githubapp.Token{}, fmt.Errorf("%w: org=%s: app has no unambiguous installation for %q", ErrNoGitHubCredentials, orgID, target)
+	}
+	tok, err := r.installationToken(ctx, orgID, app, inst, base)
+	if err != nil {
+		// A mint failure on an active-App org is a hard error (no PAT to fall
+		// to) — usually a bad/rotated PEM or a revoked installation.
+		ghResolverLog.Warn("mint installation token failed",
+			"org", orgID, "target", target, "installation", inst.InstallationID, "error", err)
+		return githubapp.Token{}, err
+	}
+	return tok, nil
+}
+
+// appClientForRepo resolves the App client for owner/repo, gated on coverage —
+// or an error. No PAT fallback: a conclusive not-covered is surfaced (the App
+// is the org's credential; a repo it can't reach is a misconfiguration to fix,
+// not paper over). Coverage is probed once (a single GET /repos/{owner}/{repo}
+// on the installation token) and a positive answer memoized (repoCoverageTTL);
+// an indeterminate probe (5xx) fails open with the App client and is not cached;
+// a negative is not cached, so a repo newly added to the grant is picked up on
+// the next call.
+func (r *resolver) appClientForRepo(ctx context.Context, orgID string, app *domain.OrgGitHubApp, owner, repo, base string) (*Client, Identity, error) {
+	tok, err := r.appToken(ctx, orgID, app, owner, base)
+	if err != nil {
+		return nil, IdentityUnknown, err
+	}
+	client := NewClient(base, tok.Value)
+	if r.coverage.covered(orgID, owner, repo) {
+		return client, IdentityApp, nil // memoized: in the grant
+	}
+	reachable, conclusive := client.CheckRepoAccess(ctx, owner, repo)
+	if !conclusive {
+		return client, IdentityApp, nil // indeterminate (5xx) → fail open, don't cache
+	}
+	if reachable {
+		r.coverage.markCovered(orgID, owner, repo)
+		return client, IdentityApp, nil
+	}
+	ghResolverLog.Warn("app installed on account but repo not in its grant; no PAT fallback (app-xor-pat)",
+		"org", orgID, "owner", owner, "repo", repo)
+	return nil, IdentityUnknown, fmt.Errorf("%w: org=%s repo=%s/%s not in the app installation grant", ErrNoGitHubCredentials, orgID, owner, repo)
+}
+
+// appScopedToken mints a per-repo down-scoped App installation token, or an
+// error — NO PAT fallback (the caller determined via activeApp that the org's
+// credential is the App). Unlike appToken it bypasses the installation
+// TokenCache: that cache is keyed by installation only, so a scoped token
+// written there would later be served to an unscoped caller. A scoped mint is
+// ~once per (run, repo); the gitproxy keeps its own per-repo cache.
+func (r *resolver) appScopedToken(ctx context.Context, orgID string, app *domain.OrgGitHubApp, owner, repo, base string, permissions map[string]string) (githubapp.Token, error) {
+	inst, ok := r.installationFor(ctx, orgID, owner)
+	if !ok {
+		return githubapp.Token{}, fmt.Errorf("%w: org=%s: app has no installation for %q", ErrNoGitHubCredentials, orgID, owner)
+	}
+	minter, err := r.minterFor(ctx, orgID, app, base)
+	if err != nil {
+		return githubapp.Token{}, err
+	}
+	installID, err := strconv.ParseInt(inst.InstallationID, 10, 64)
+	if err != nil {
+		return githubapp.Token{}, fmt.Errorf("parse installation id %q: %w", inst.InstallationID, err)
+	}
+	return minter.MintScopedInstallationToken(ctx, installID, []string{repo}, permissions)
+}
+
+// TokenFor mirrors ClientFor's credential resolution but returns the raw
 // credential instead of a *Client — see the Resolver interface doc for why
 // (the host-side git clone needs the token as an HTTPS auth header).
 func (r *resolver) TokenFor(ctx context.Context, orgID, target string) (githubapp.Token, error) {
@@ -350,16 +421,16 @@ func (r *resolver) TokenFor(ctx context.Context, orgID, target string) (githubap
 		return githubapp.Token{}, err
 	}
 
-	// Tier 1: the org's own App installation token (shared cache + mint
-	// path with ClientFor). Best-effort — any failure falls through to PAT.
-	if tok, ok := r.tier1Token(ctx, orgID, target, base); ok {
-		return tok, nil
+	// App XOR PAT (see activeApp): an active App is the org's credential —
+	// resolve its installation token (shared cache + mint path with ClientFor)
+	// or fail; never fall to a PAT.
+	if app := r.activeApp(ctx, orgID); app != nil {
+		return r.appToken(ctx, orgID, app, target, base)
 	}
 
-	// Tier 2 (deployment-default shared App) is deferred to SKY-363.
-
-	// Tier 3: PAT-borrow, returned as a Token with no mint expiry. A backend
-	// read error propagates rather than being misreported as "not configured".
+	// No active App → PAT-borrow, returned as a Token with no mint expiry. A
+	// backend read error propagates rather than being misreported as "not
+	// configured".
 	pat, err := r.secrets.GetSystem(ctx, orgID, integrations.KeyGitHubPAT)
 	if err != nil {
 		return githubapp.Token{}, fmt.Errorf("resolve github pat for org %s: %w", orgID, err)
@@ -368,13 +439,87 @@ func (r *resolver) TokenFor(ctx context.Context, orgID, target string) (githubap
 		// patBorrowUser does a DB read purely to label this trace line, so
 		// skip it unless Debug is actually being emitted.
 		if ghResolverLog.Enabled(ctx, slog.LevelDebug) {
-			ghResolverLog.Debug("resolved tier3 pat",
+			ghResolverLog.Debug("resolved pat",
 				"org", orgID, "target", target, "user", r.patBorrowUser(ctx, orgID))
 		}
 		return githubapp.Token{Value: pat}, nil
 	}
 
 	return githubapp.Token{}, fmt.Errorf("%w: org=%s target=%s", ErrNoGitHubCredentials, orgID, target)
+}
+
+// TokenForRepoScoped mints a credential narrowed to owner/repo (see the
+// ScopedResolver interface doc). App XOR PAT (see activeApp): an active App
+// mints a fresh repo-scoped token or fails — NO PAT fallback (a transient mint
+// blip surfaces as an error → the gitproxy 502s and the next request retries,
+// rather than silently degrading to an unscoped, decommissioning PAT). Only an
+// org with no active App uses the PAT, returned unscoped (a PAT can't be
+// narrowed; Layers 2/3 enforce it). All-miss: ErrNoGitHubCredentials.
+func (r *resolver) TokenForRepoScoped(ctx context.Context, orgID, owner, repo string, permissions map[string]string) (githubapp.Token, error) {
+	base, err := r.githubBaseFor(ctx, orgID)
+	if err != nil {
+		return githubapp.Token{}, err
+	}
+	if app := r.activeApp(ctx, orgID); app != nil {
+		return r.appScopedToken(ctx, orgID, app, owner, repo, base, permissions)
+	}
+	pat, err := r.secrets.GetSystem(ctx, orgID, integrations.KeyGitHubPAT)
+	if err != nil {
+		return githubapp.Token{}, fmt.Errorf("resolve github pat for org %s: %w", orgID, err)
+	}
+	if pat != "" {
+		return githubapp.Token{Value: pat}, nil
+	}
+	return githubapp.Token{}, fmt.Errorf("%w: org=%s repo=%s/%s", ErrNoGitHubCredentials, orgID, owner, repo)
+}
+
+// ClientForRepoScoped resolves a *Client backed by the per-repo scoped
+// credential TokenForRepoScoped mints, plus the acting Identity (App vs PAT) —
+// so the exec-gh channel confines a jailbroken agent's API calls to the one
+// repo the run is authorized for. Same App-XOR-PAT resolution as
+// TokenForRepoScoped.
+func (r *resolver) ClientForRepoScoped(ctx context.Context, orgID, owner, repo string, permissions map[string]string) (*Client, Identity, error) {
+	base, err := r.githubBaseFor(ctx, orgID)
+	if err != nil {
+		return nil, IdentityUnknown, err
+	}
+	if app := r.activeApp(ctx, orgID); app != nil {
+		tok, terr := r.appScopedToken(ctx, orgID, app, owner, repo, base, permissions)
+		if terr != nil {
+			return nil, IdentityUnknown, terr
+		}
+		return NewClient(base, tok.Value), IdentityApp, nil
+	}
+	client, err := r.tier3PATClient(ctx, orgID, base)
+	if err != nil {
+		return nil, IdentityUnknown, err
+	}
+	if client != nil {
+		return client, IdentityPAT, nil
+	}
+	return nil, IdentityUnknown, fmt.Errorf("%w: org=%s repo=%s/%s", ErrNoGitHubCredentials, orgID, owner, repo)
+}
+
+// HasAnyCredential reports whether the org has any usable GitHub credential
+// without minting a repo-scoped token (see the ScopedResolver interface doc).
+// App XOR PAT (see activeApp): an active App's credential is usable iff it has
+// at least one installation to mint from — a present PAT is NOT a fallback for
+// an active-App org. Only a no-active-App org's usability turns on the PAT. A
+// PAT-tier read error propagates so a transient secret-store outage isn't
+// misreported as "no credential".
+func (r *resolver) HasAnyCredential(ctx context.Context, orgID string) (bool, error) {
+	if app := r.activeApp(ctx, orgID); app != nil {
+		insts, err := r.apps.ListInstallationsForOrgSystem(ctx, orgID)
+		if err != nil {
+			return false, fmt.Errorf("list installations for org %s: %w", orgID, err)
+		}
+		return len(insts) > 0, nil
+	}
+	pat, err := r.secrets.GetSystem(ctx, orgID, integrations.KeyGitHubPAT)
+	if err != nil {
+		return false, fmt.Errorf("resolve github pat for org %s: %w", orgID, err)
+	}
+	return pat != "", nil
 }
 
 // BaseURLFor exposes githubBaseFor to callers outside the package that need
@@ -475,32 +620,13 @@ func (r *resolver) installationToken(ctx context.Context, orgID string, app *dom
 		return tok, nil
 	}
 
-	pem, err := r.secrets.GetSystem(ctx, orgID, app.PEMRef)
-	if err != nil {
-		return githubapp.Token{}, fmt.Errorf("read app pem: %w", err)
-	}
-	if pem == "" {
-		return githubapp.Token{}, fmt.Errorf("app pem secret %q not found", app.PEMRef)
-	}
-	key, err := githubapp.ParsePrivateKey([]byte(pem))
+	minter, err := r.minterFor(ctx, orgID, app, base)
 	if err != nil {
 		return githubapp.Token{}, err
-	}
-	appID, err := strconv.ParseInt(app.AppID, 10, 64)
-	if err != nil {
-		return githubapp.Token{}, fmt.Errorf("parse app id %q: %w", app.AppID, err)
 	}
 	installID, err := strconv.ParseInt(inst.InstallationID, 10, 64)
 	if err != nil {
 		return githubapp.Token{}, fmt.Errorf("parse installation id %q: %w", inst.InstallationID, err)
-	}
-	minter, err := githubapp.NewMinter(githubapp.Config{
-		PrivateKey: key,
-		AppID:      appID,
-		APIBase:    APIBase(base),
-	})
-	if err != nil {
-		return githubapp.Token{}, err
 	}
 	tok, err := minter.MintInstallationToken(ctx, installID)
 	if err != nil {
@@ -508,6 +634,32 @@ func (r *resolver) installationToken(ctx context.Context, orgID string, app *dom
 	}
 	r.cache.Set(orgID, inst.InstallationID, tok)
 	return tok, nil
+}
+
+// minterFor builds a githubapp.Minter from the org's stored App PEM + App ID,
+// pinned at the org's API base. Shared by the cached full-install mint
+// (installationToken) and the uncached repo-scoped mint (mintScopedToken).
+func (r *resolver) minterFor(ctx context.Context, orgID string, app *domain.OrgGitHubApp, base string) (*githubapp.Minter, error) {
+	pem, err := r.secrets.GetSystem(ctx, orgID, app.PEMRef)
+	if err != nil {
+		return nil, fmt.Errorf("read app pem: %w", err)
+	}
+	if pem == "" {
+		return nil, fmt.Errorf("app pem secret %q not found", app.PEMRef)
+	}
+	key, err := githubapp.ParsePrivateKey([]byte(pem))
+	if err != nil {
+		return nil, err
+	}
+	appID, err := strconv.ParseInt(app.AppID, 10, 64)
+	if err != nil {
+		return nil, fmt.Errorf("parse app id %q: %w", app.AppID, err)
+	}
+	return githubapp.NewMinter(githubapp.Config{
+		PrivateKey: key,
+		AppID:      appID,
+		APIBase:    APIBase(base),
+	})
 }
 
 // tier3PATClient builds a PAT-backed client, or (nil, nil) when the org has
