@@ -763,6 +763,13 @@ func (s *Server) routes() {
 	s.api("GET /api/usage/me", uh.handleUsageMe)
 	s.api("GET /api/usage/teams/{team_id}", uh.handleUsageTeam)
 	s.api("GET /api/usage/org", uh.handleUsageOrg)
+	// Per-team daily spend cap (TFAC-482) — org-admin-set, EE/governance-gated
+	// (the handlers 404 when unlicensed). The GET lists every active team + its cap
+	// for the editor (so an idle team can be pre-capped); the PUT writes one cap and
+	// is mutating, so it runs through the CSRF + session wrap. Both write/read the
+	// admin pool: an org admin may cap a team they don't belong to.
+	s.api("GET /api/usage/org/team-caps", uh.handleUsageTeamCaps)
+	s.apiMutating("PUT /api/usage/teams/{team_id}/cap", uh.handleUsageTeamCap)
 	// EE governance audit surface (TFAC-484): the access & credential change-log
 	// viewer. Org-admin-gated AND FeatureGovernance-gated (404 unlicensed) inside
 	// the handler — the data is core, only the cross-team lens is Enterprise.
