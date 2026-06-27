@@ -17,7 +17,7 @@ import { useOptionalAuth } from '../contexts/AuthContext'
 import { useEntitlements, FeatureGovernance } from '../hooks/useEntitlements'
 import { useOrgRole } from '../hooks/useOrgRole'
 import { useTeams } from '../hooks/useTeams'
-import { readError } from '../lib/api'
+import { avatarProxyUrl, readError } from '../lib/api'
 import type {
   AccessChangeRow,
   AccessLogResponse,
@@ -531,19 +531,23 @@ function initialsOf(name: string): string {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase()
 }
 
-// Avatar is a square-ish identity chip — a real picture when we have a url, else
-// a rust monogram placeholder. A load failure (404, or — until the CSP img-src
-// allows OAuth-CDN avatars, TFAC-51 follow-up — a CSP block) flips to the
-// monogram via onError, so a blocked picture degrades gracefully instead of
-// rendering broken.
-function Avatar({ name, url }: { name: string; url?: string }) {
-  const [failed, setFailed] = useState(false)
-  if (url && !failed) {
+// Avatar is a square-ish identity chip — a real picture when the user has one,
+// else a rust monogram placeholder. The picture loads through the same-origin
+// /api/avatars proxy (TFAC-480): the raw OAuth-CDN avatar url is cross-origin,
+// which the app's `img-src 'self'` CSP blocks, so we render the proxied copy
+// instead. `avatarUrl` (the upstream url, presence + identity only — not the img
+// src) gates the attempt, so a user with no avatar renders the monogram directly
+// without a wasted request. A load failure flips to the monogram via onError;
+// the latch is keyed to `avatarUrl`, so a changed url (e.g. a poll surfaces a new
+// one) retries while a stably-broken url stays on the monogram (no retry storm).
+function Avatar({ name, userId, avatarUrl }: { name: string; userId: string; avatarUrl?: string }) {
+  const [failedUrl, setFailedUrl] = useState<string | null>(null)
+  if (avatarUrl && failedUrl !== avatarUrl) {
     return (
       <img
-        src={url}
+        src={avatarProxyUrl(userId)}
         alt=""
-        onError={() => setFailed(true)}
+        onError={() => setFailedUrl(avatarUrl)}
         className="h-7 w-7 shrink-0 rounded-[3px] object-cover"
       />
     )
@@ -587,7 +591,7 @@ function UserRoster({ data, emptyLabel = '—' }: { data: UsageUserBucket[]; emp
         const name = d.display_name || d.user_id
         return (
           <div key={d.user_id} className="flex items-center gap-2.5">
-            <Avatar name={name} url={d.avatar_url} />
+            <Avatar name={name} userId={d.user_id} avatarUrl={d.avatar_url} />
             <div className="min-w-0 flex-1">
               <div className="flex items-baseline justify-between gap-2 font-mono text-[11px]">
                 <span className="truncate text-text-secondary" title={name}>
