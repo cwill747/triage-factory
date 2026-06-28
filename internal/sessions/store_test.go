@@ -531,6 +531,88 @@ func TestStore_UpdateActiveOrg_OnRevokedReturnsNoRows(t *testing.T) {
 	}
 }
 
+// TestStore_RevokeForUserInOrg pins TFAC-487's deprovisioning revoke:
+// RevokeForUserInOrgSystem revokes only the rows matching BOTH user_id and
+// active_org_id, leaves the same user's session in another org and another
+// user's session in the same org alone, and is idempotent on already-revoked
+// rows.
+func TestStore_RevokeForUserInOrg(t *testing.T) {
+	store, h, uid := newStoreForTest(t)
+	ctx := context.Background()
+
+	orgA := seedOrg(t, h, uid, "revoke-org-a")
+	orgB := seedOrg(t, h, uid, "revoke-org-b")
+
+	// mustCreate inserts a session for user in org and asserts success, so a
+	// CreateSystem failure (schema/constraint regression) surfaces here with a
+	// clear message rather than as a confusing nil-deref later in the test.
+	mustCreate := func(user uuid.UUID, jwt string, org uuid.UUID) *Session {
+		t.Helper()
+		s, err := store.CreateSystem(ctx, user, jwt, "r",
+			time.Now().Add(1*time.Hour), time.Now().Add(24*time.Hour), "", "",
+			uuid.NullUUID{UUID: org, Valid: true})
+		if err != nil {
+			t.Fatalf("create session (user=%s org=%s): %v", user, org, err)
+		}
+		return s
+	}
+
+	// The target user's sessions: two in orgA (both should be revoked) and
+	// one in orgB (must survive — org-scoped revoke leaves other orgs alone).
+	a1 := mustCreate(uid, "a1", orgA)
+	a2 := mustCreate(uid, "a2", orgA)
+	bSess := mustCreate(uid, "b", orgB)
+
+	// Another user active in orgA — same org, different user; must survive.
+	other := seedUser(t, h)
+	if _, err := h.AdminDB.Exec(
+		`INSERT INTO org_memberships (user_id, org_id, role) VALUES ($1, $2, 'member')`,
+		other, orgA); err != nil {
+		t.Fatalf("seed other membership: %v", err)
+	}
+	otherSess := mustCreate(other, "o", orgA)
+
+	n, err := store.RevokeForUserInOrgSystem(ctx, uid, orgA)
+	if err != nil {
+		t.Fatalf("RevokeForUserInOrg: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("revoked %d rows, want 2 (uid's two orgA sessions)", n)
+	}
+
+	// The two orgA sessions are now unfindable.
+	for _, sess := range []*Session{a1, a2} {
+		got, err := store.LookupSystem(ctx, sess.ID)
+		if err != nil {
+			t.Fatalf("post-revoke Lookup: %v", err)
+		}
+		if got != nil {
+			t.Errorf("session %s still active after org-scoped revoke", sess.ID)
+		}
+	}
+	// uid's orgB session survives (org-scoped revoke).
+	if got, err := store.LookupSystem(ctx, bSess.ID); err != nil {
+		t.Fatalf("orgB Lookup: %v", err)
+	} else if got == nil {
+		t.Error("org-scoped revoke bled across orgs — uid's orgB session got revoked")
+	}
+	// Other user's orgA session survives (user-scoped).
+	if got, err := store.LookupSystem(ctx, otherSess.ID); err != nil {
+		t.Fatalf("other-user Lookup: %v", err)
+	} else if got == nil {
+		t.Error("org-scoped revoke bled across users — other user's orgA session got revoked")
+	}
+
+	// Idempotent: a second call finds nothing left to revoke.
+	n2, err := store.RevokeForUserInOrgSystem(ctx, uid, orgA)
+	if err != nil {
+		t.Fatalf("RevokeForUserInOrg #2: %v", err)
+	}
+	if n2 != 0 {
+		t.Errorf("second revoke returned %d, want 0 (idempotent)", n2)
+	}
+}
+
 // TestStore_UpdateActiveOrg_OnMissingReturnsNoRows pins the same
 // posture for a session that never existed.
 func TestStore_UpdateActiveOrg_OnMissingReturnsNoRows(t *testing.T) {

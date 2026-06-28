@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -33,6 +34,16 @@ type orgMembersHandler struct {
 	// org-scoped connections (TFAC-75) so their event stream stops at
 	// removal rather than lingering until the socket drops.
 	ws *websocket.Hub
+	// revokeUserOrgSessions revokes a removed member's auth sessions scoped
+	// to one org (TFAC-487) — deprovisioning hygiene alongside the WS-kick.
+	// It's a closure over the Server because s.authDeps.sessions is wired
+	// late (SetAuthDeps runs after routes()), so the store can't be captured
+	// at construction. routes() always wires a non-nil closure; the closure
+	// itself nil-checks authDeps for the boot race (and local mode never
+	// reaches it — handleOrgMemberRemove 404s first). The nil guard on the
+	// field is belt-and-suspenders for a future caller that constructs the
+	// handler without it (e.g. a test). Returns the count of revoked rows.
+	revokeUserOrgSessions func(ctx context.Context, userID, orgID string) (int64, error)
 }
 
 // orgMemberRow is one roster row. github_username / jira_account_id are null
@@ -221,6 +232,24 @@ func (h *orgMembersHandler) handleOrgMemberRemove(w http.ResponseWriter, r *http
 	membershipLog.Info("kicked ws connections on membership removal",
 		"user", targetID, "org", orgID,
 		"code", int(websocket.CloseMembershipChanged), "n", n)
+	// Deprovisioning hygiene (TFAC-487): revoke the removed member's auth
+	// sessions scoped to THIS org, best-effort, mirroring the WS-kick's org
+	// filter (their sessions active in other orgs are untouched). Per-request
+	// gates (RLS + role checks) already deny the org's data on the next
+	// request, so a revoke failure isn't a data hole — log and continue.
+	// routes() always wires the closure; the nil guard only matters for a
+	// handler constructed without it (a test). Local mode never reaches here
+	// — handleOrgMemberRemove 404s at the top.
+	if h.revokeUserOrgSessions != nil {
+		revoked, err := h.revokeUserOrgSessions(r.Context(), targetID, orgID)
+		if err != nil {
+			membershipLog.Warn("revoke sessions on membership removal failed",
+				"user", targetID, "org", orgID, "error", err)
+		} else {
+			membershipLog.Info("revoked sessions on membership removal",
+				"user", targetID, "org", orgID, "n", revoked)
+		}
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
