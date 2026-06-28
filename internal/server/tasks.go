@@ -627,12 +627,11 @@ func (s *Server) finalizeRequeue(r *http.Request, orgID, userID, taskID string, 
 // All failures are logged, not fatal: the calling handler has already flipped the
 // task to its new state.
 func (s *Server) teardownTaskArtifacts(ctx context.Context, orgID, userID, taskID string, outcome discardOutcome) {
-	// Artifacts captured inside the tx (state already flipped) and resolved on
-	// GitHub AFTER it commits — a network call must not hold the tx open.
-	var (
-		prArtifacts     []domain.Artifact
-		reviewArtifacts []domain.Artifact
-	)
+	// Draft PRs captured inside the tx (state already flipped) and closed on GitHub
+	// AFTER it commits — a network call must not hold the tx open. Dismissed reviews
+	// need no post-tx pass: a review is staged TF-side (TFAC-494), so the in-tx flip
+	// to dismissed is the whole resolution — there is no GitHub object to retire.
+	var prArtifacts []domain.Artifact
 	err := s.tx.WithTx(ctx, orgID, userID, func(tx db.TxStores) error {
 		runs, err := tx.AgentRuns.ListForTask(ctx, orgID, taskID)
 		if err != nil {
@@ -661,10 +660,11 @@ func (s *Server) teardownTaskArtifacts(ctx context.Context, orgID, userID, taskI
 				return fmt.Errorf("human_content write: %w", err)
 			}
 
-			// Abandon each pending review by flipping its artifact to dismissed (the
-			// GitHub pending-review delete runs after the tx). The proposed snapshot
-			// is preserved for the audit ledger — abandonment retires the GitHub
-			// review object, not the record of what the agent drafted.
+			// Abandon each pending review by flipping its artifact to dismissed. No
+			// GitHub call and no audit row: the review is staged TF-side (TFAC-494), so
+			// a dismiss is a purely local state change, not an org-credential write
+			// (external_actions records only writes). The flip is the whole teardown;
+			// the proposed snapshot is preserved on the row.
 			for j := range pendingReviews {
 				rv := pendingReviews[j]
 				dismissed := rv
@@ -672,14 +672,6 @@ func (s *Server) teardownTaskArtifacts(ctx context.Context, orgID, userID, taskI
 				if _, err := tx.Artifacts.Upsert(ctx, orgID, dismissed); err != nil {
 					return fmt.Errorf("artifacts.Upsert(dismissed): %w", err)
 				}
-				// Audit the abandon (TFAC-483), atomic with the flip: the org-App
-				// pending-review delete that follows is a human-authorized, org-executed
-				// write — run_id is the drafting run, actor is the discarder.
-				if err := tx.ExternalActions.Record(ctx, orgID,
-					githubApprovalAction(&rv, userID, domain.ActionReviewDismissed, domain.ArtifactStateReviewPending, domain.ArtifactStateReviewDismissed)); err != nil {
-					return fmt.Errorf("external_actions.Record(dismissed): %w", err)
-				}
-				reviewArtifacts = append(reviewArtifacts, rv)
 			}
 			// Abandon each draft PR by flipping its artifact to closed (the GitHub
 			// close runs after the tx). The pushed branch and the proposed snapshot
@@ -711,9 +703,8 @@ func (s *Server) teardownTaskArtifacts(ctx context.Context, orgID, userID, taskI
 	for i := range prArtifacts {
 		closeDraftPRBestEffort(ctx, s.ghResolver, orgID, &prArtifacts[i])
 	}
-	for i := range reviewArtifacts {
-		deletePendingReviewBestEffort(ctx, s.ghResolver, orgID, &reviewArtifacts[i])
-	}
+	// Dismissed reviews need no post-tx pass — they were staged TF-side and the
+	// in-tx flip is their whole resolution (TFAC-494).
 }
 
 // closeDraftPRBestEffort closes the abandoned draft PR on GitHub. Best-effort:
@@ -737,28 +728,6 @@ func closeDraftPRBestEffort(ctx context.Context, resolver ghclient.Resolver, org
 	}
 	if err := gh.ClosePR(ctx, owner, repo, number); err != nil {
 		approvalDiscardLog.Warn("close draft PR on github failed (artifact already marked closed)", "artifact", art.ID, "owner", owner, "repo", repo, "number", number, "error", err)
-	}
-}
-
-// deletePendingReviewBestEffort deletes the abandoned GitHub pending review.
-// Best-effort, mirroring closeDraftPRBestEffort: every failure is logged, never
-// returned — the artifact is already marked dismissed and the run/task already
-// resolved, so a GitHub hiccup mustn't unwind that. owner/repo/number come from
-// the artifact target; ExternalID is the review node id. A free function (taking
-// the resolver) so the teardown and the per-artifact dismiss endpoint share it.
-func deletePendingReviewBestEffort(ctx context.Context, resolver ghclient.Resolver, orgID string, art *domain.Artifact) {
-	owner, repo, number, ok := domain.ParsePRTarget(art.Target)
-	if !ok {
-		approvalDiscardLog.Warn("review artifact has a malformed target; skipping GitHub pending-review delete", "artifact", art.ID, "target", art.Target)
-		return
-	}
-	gh, err := resolver.ClientForRepo(ctx, orgID, owner, repo)
-	if err != nil {
-		approvalDiscardLog.Warn("resolve github client for pending-review delete failed", "artifact", art.ID, "owner", owner, "repo", repo, "error", err)
-		return
-	}
-	if err := gh.DeletePendingReview(ctx, owner, repo, number, art.ExternalID); err != nil {
-		approvalDiscardLog.Warn("delete pending review on github failed (artifact already marked dismissed)", "artifact", art.ID, "owner", owner, "repo", repo, "number", number, "error", err)
 	}
 }
 

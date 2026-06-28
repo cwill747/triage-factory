@@ -186,22 +186,26 @@ func TestArtifactAbandon_ClosesDraftPR(t *testing.T) {
 
 // TestArtifactTeardown_ResolvesAllArtifacts pins the task-level resolve-all
 // gesture (Return-to-queue): a task whose run holds MULTIPLE unresolved artifacts
-// — a draft PR and a pending review — has them ALL resolved (PR closed, review
-// dismissed) with nothing stranded on GitHub. Branches are kept.
+// — a draft PR and a pending review — has them ALL resolved. The draft PR is
+// closed on GitHub; the review is flipped to dismissed with NO GitHub call (it
+// was staged TF-side, TFAC-494). Branches are kept.
 func TestArtifactTeardown_ResolvesAllArtifacts(t *testing.T) {
 	keyring.MockInit()
 	srv := newTestServer(t)
-	var prClosed, reviewDeleted bool
+	var prClosed, reviewTouchedGitHub bool
 	mux := newAppAPIMux()
 	mux.HandleFunc("PATCH /api/v3/repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, r *http.Request) {
 		prClosed = true
 		_ = json.NewEncoder(w).Encode(map[string]any{"number": 7, "state": "closed"})
 	})
+	// Any review-delete call (GraphQL node lookup or REST delete) would be a
+	// regression — a staged review has no GitHub object to retire.
 	mux.HandleFunc("POST /api/graphql", func(w http.ResponseWriter, r *http.Request) {
-		_, _ = w.Write([]byte(`{"data":{"node":{"databaseId":555}}}`))
+		reviewTouchedGitHub = true
+		_, _ = w.Write([]byte(`{"data":{}}`))
 	})
 	mux.HandleFunc("DELETE /api/v3/repos/{owner}/{repo}/pulls/{number}/reviews/{rid}", func(w http.ResponseWriter, r *http.Request) {
-		reviewDeleted = true
+		reviewTouchedGitHub = true
 		_ = json.NewEncoder(w).Encode(map[string]any{})
 	})
 	stub := httptest.NewServer(mux)
@@ -209,10 +213,10 @@ func TestArtifactTeardown_ResolvesAllArtifacts(t *testing.T) {
 	seedApp(t, srv, stub, acmeInstall())
 
 	// seedClaimedPRApprovalFixture hangs a draft PR (#7) off run r_ab; add a
-	// finalized pending review on the same run so the task holds two unresolved
+	// finalized review draft on the same run so the task holds two unresolved
 	// artifacts of different kinds.
 	taskID, runID, prArtID := seedClaimedPRApprovalFixture(t, srv, "acme", "api", 7)
-	rv := domain.NewReviewArtifact("acme/api", 7, "PR_node", "PRR_1")
+	rv := domain.NewReviewArtifact("acme/api", 7, "headsha7", runID)
 	rv.RunID = runID
 	rv.OrgID = runmode.LocalDefaultOrgID
 	rv.TeamID = runmode.LocalDefaultTeamID
@@ -229,8 +233,11 @@ func TestArtifactTeardown_ResolvesAllArtifacts(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("requeue = %d, want 200; body=%s", rec.Code, rec.Body.String())
 	}
-	if !prClosed || !reviewDeleted {
-		t.Errorf("resolve-all must close the PR (got %v) AND delete the review (got %v)", prClosed, reviewDeleted)
+	if !prClosed {
+		t.Error("resolve-all must close the draft PR on GitHub")
+	}
+	if reviewTouchedGitHub {
+		t.Error("resolve-all must NOT make any GitHub call for the staged review")
 	}
 	if got := getArtifact(t, srv, prArtID).State; got != domain.ArtifactStatePRClosed {
 		t.Errorf("PR artifact state = %q, want closed", got)

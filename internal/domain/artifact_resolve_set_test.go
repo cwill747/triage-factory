@@ -3,9 +3,11 @@ package domain
 import "testing"
 
 // readyReview builds a finalized (ready-sentinel set) pending review artifact
-// with the given PR number + review node id, for the set-helper tests.
-func readyReview(number int, reviewID string) Artifact {
-	a := NewReviewArtifact("o/r", number, "n", reviewID)
+// with the given PR number + run id, for the set-helper tests. A TF-side draft
+// (TFAC-494) has no GitHub review id, so the tests key on Target/ID, not
+// ExternalID.
+func readyReview(number int, runID string) Artifact {
+	a := NewReviewArtifact("o/r", number, "headsha", runID)
 	rd, _ := ParseReviewArtifactDetails(a.DetailsJSON)
 	rd.ReviewEvent = "APPROVE"
 	a.DetailsJSON = MarshalReviewArtifactDetails(rd)
@@ -39,23 +41,23 @@ func TestAllDraftPullRequests(t *testing.T) {
 }
 
 func TestAllReadyReviews(t *testing.T) {
-	ready1 := readyReview(1, "PRR_1")
-	pendingUnfinalized := NewReviewArtifact("o/r", 2, "n", "PRR_2") // no sentinel
-	ready2 := readyReview(3, "PRR_3")
+	ready1 := readyReview(1, "run_1")
+	pendingUnfinalized := NewReviewArtifact("o/r", 2, "headsha", "run_2") // no sentinel
+	ready2 := readyReview(3, "run_3")
 
 	got := AllReadyReviews([]Artifact{ready1, pendingUnfinalized, ready2})
 	if len(got) != 2 {
 		t.Fatalf("AllReadyReviews len = %d, want 2 (only finalized)", len(got))
 	}
-	if got[0].ExternalID != "PRR_1" || got[1].ExternalID != "PRR_3" {
-		t.Errorf("AllReadyReviews = %q,%q, want PRR_1,PRR_3", got[0].ExternalID, got[1].ExternalID)
+	if got[0].Target != "o/r#1" || got[1].Target != "o/r#3" {
+		t.Errorf("AllReadyReviews = %q,%q, want o/r#1,o/r#3", got[0].Target, got[1].Target)
 	}
 }
 
 func TestAllPendingReviewArtifacts(t *testing.T) {
-	finalized := readyReview(1, "PRR_1")
-	unfinalized := NewReviewArtifact("o/r", 2, "n", "PRR_2")
-	submitted := readyReview(3, "PRR_3")
+	finalized := readyReview(1, "run_1")
+	unfinalized := NewReviewArtifact("o/r", 2, "headsha", "run_2")
+	submitted := readyReview(3, "run_3")
 	submitted.State = ArtifactStateReviewSubmitted // resolved
 
 	// All pending reviews count regardless of the ready sentinel (teardown
@@ -64,8 +66,8 @@ func TestAllPendingReviewArtifacts(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("AllPendingReviewArtifacts len = %d, want 2 (both pending, finalized or not)", len(got))
 	}
-	if got[0].ExternalID != "PRR_1" || got[1].ExternalID != "PRR_2" {
-		t.Errorf("AllPendingReviewArtifacts = %q,%q, want PRR_1,PRR_2", got[0].ExternalID, got[1].ExternalID)
+	if got[0].Target != "o/r#1" || got[1].Target != "o/r#2" {
+		t.Errorf("AllPendingReviewArtifacts = %q,%q, want o/r#1,o/r#2", got[0].Target, got[1].Target)
 	}
 }
 
