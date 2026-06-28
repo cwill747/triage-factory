@@ -421,6 +421,54 @@ func (s *agentRunStore) ListForTask(ctx context.Context, orgID, taskID string) (
 	return runs, rows.Err()
 }
 
+func (s *agentRunStore) ListForTasks(ctx context.Context, orgID string, taskIDs []string) ([]domain.AgentRun, error) {
+	if err := assertLocalOrg(orgID); err != nil {
+		return nil, err
+	}
+	if len(taskIDs) == 0 {
+		return nil, nil
+	}
+	// ?-placeholder IN list (SQLite has no array bind), mirroring
+	// artifactStore.ListByRuns, chunked to stay inside SQLite's variable
+	// limit (chunkIDs). Each task_id falls in exactly one chunk, so a task's
+	// runs are returned contiguously and newest-first among themselves
+	// (order ACROSS tasks is chunk order, not started_at) — which is all the
+	// caller, grouping by run.TaskID, relies on. Same projection as ListForTask.
+	var runs []domain.AgentRun
+	for _, chunk := range chunkIDs(taskIDs) {
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		rows, err := s.q.QueryContext(ctx, `
+			SELECT `+sqliteRunColumns+`
+			FROM runs r
+			LEFT JOIN run_memory rm ON rm.run_id = r.id
+			WHERE r.task_id IN (`+strings.Join(placeholders, ", ")+`)
+			ORDER BY r.started_at DESC
+		`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var r domain.AgentRun
+			if err := scanAgentRunRows(rows, &r); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			runs = append(runs, r)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+	}
+	return runs, nil
+}
+
 func (s *agentRunStore) PendingApprovalIDForTask(ctx context.Context, orgID, taskID string) (string, error) {
 	if err := assertLocalOrg(orgID); err != nil {
 		return "", err
@@ -747,20 +795,13 @@ func (s *agentRunStore) InsertMessage(ctx context.Context, orgID string, msg *do
 	return result.LastInsertId()
 }
 
-func (s *agentRunStore) Messages(ctx context.Context, orgID, runID string) ([]domain.AgentMessage, error) {
-	if err := assertLocalOrg(orgID); err != nil {
-		return nil, err
-	}
-	rows, err := s.q.QueryContext(ctx, `
-		SELECT id, run_id, role, content, subtype, tool_calls, tool_call_id, is_error, metadata,
-		       model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, created_at
-		FROM run_messages WHERE run_id = ? ORDER BY id ASC
-	`, runID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+const sqliteMessageColumns = `id, run_id, role, content, subtype, tool_calls, tool_call_id, is_error, metadata,
+	model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, created_at`
 
+// scanAgentMessageRows drains a run_messages result set selecting
+// sqliteMessageColumns into domain.AgentMessage values. Shared by the
+// single-run Messages and the batched MessagesForRuns.
+func scanAgentMessageRows(rows *sql.Rows) ([]domain.AgentMessage, error) {
 	var messages []domain.AgentMessage
 	for rows.Next() {
 		var m domain.AgentMessage
@@ -806,6 +847,60 @@ func (s *agentRunStore) Messages(ctx context.Context, orgID, runID string) ([]do
 		messages = append(messages, m)
 	}
 	return messages, rows.Err()
+}
+
+func (s *agentRunStore) Messages(ctx context.Context, orgID, runID string) ([]domain.AgentMessage, error) {
+	if err := assertLocalOrg(orgID); err != nil {
+		return nil, err
+	}
+	rows, err := s.q.QueryContext(ctx, `
+		SELECT `+sqliteMessageColumns+`
+		FROM run_messages WHERE run_id = ? ORDER BY id ASC
+	`, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanAgentMessageRows(rows)
+}
+
+func (s *agentRunStore) MessagesForRuns(ctx context.Context, orgID string, runIDs []string) ([]domain.AgentMessage, error) {
+	if err := assertLocalOrg(orgID); err != nil {
+		return nil, err
+	}
+	if len(runIDs) == 0 {
+		return nil, nil
+	}
+	// ?-placeholder IN list (SQLite has no array bind), mirroring
+	// artifactStore.ListByRuns, chunked to stay inside SQLite's variable
+	// limit (chunkIDs). A run_id falls in exactly one chunk, so ORDER BY
+	// (run_id, id) keeps each run's messages contiguous and in insertion
+	// order within the merged slice; the caller groups by RunID.
+	var messages []domain.AgentMessage
+	for _, chunk := range chunkIDs(runIDs) {
+		placeholders := make([]string, len(chunk))
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			placeholders[i] = "?"
+			args[i] = id
+		}
+		rows, err := s.q.QueryContext(ctx, `
+			SELECT `+sqliteMessageColumns+`
+			FROM run_messages
+			WHERE run_id IN (`+strings.Join(placeholders, ", ")+`)
+			ORDER BY run_id ASC, id ASC
+		`, args...)
+		if err != nil {
+			return nil, err
+		}
+		batch, err := scanAgentMessageRows(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, batch...)
+	}
+	return messages, nil
 }
 
 func (s *agentRunStore) TokenTotals(ctx context.Context, orgID, runID string) (*domain.TokenTotals, error) {
