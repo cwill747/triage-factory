@@ -126,14 +126,22 @@ func ParsePRArtifactDetails(detailsJSON string) (PRArtifactDetails, error) {
 	return d, nil
 }
 
+// isDraftPullRequest is the single-artifact predicate for "an unresolved draft
+// PR" — a pull_request still in state=draft. FirstDraftPullRequest and
+// UnresolvedArtifactCounts both go through it so the "unresolved PR" definition
+// lives in exactly one place.
+func isDraftPullRequest(a Artifact) bool {
+	return a.Kind == ArtifactKindPullRequest && a.State == ArtifactStatePRDraft
+}
+
 // FirstDraftPullRequest returns the first draft pull_request artifact in arts,
-// or nil if none. A run with a draft PR is what parks it in pending_approval and
-// what an abandon closes; sharing this predicate keeps every consumer (the
-// spawner park check, the run-response discriminator, the abandon path) agreeing
-// on what "the run has a pending PR" means.
+// or nil if none. A draft PR is an unresolved artifact (the derived approval
+// signal) and what an abandon closes; sharing this predicate keeps
+// every consumer (HasUnresolvedArtifacts, the abandon path) agreeing on what "the
+// run has an unresolved PR" means.
 func FirstDraftPullRequest(arts []Artifact) *Artifact {
 	for i := range arts {
-		if arts[i].Kind == ArtifactKindPullRequest && arts[i].State == ArtifactStatePRDraft {
+		if isDraftPullRequest(arts[i]) {
 			return &arts[i]
 		}
 	}
