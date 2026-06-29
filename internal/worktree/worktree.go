@@ -227,8 +227,9 @@ func gitConfigCount(env []string) int {
 type CloneOption func(*cloneConfig)
 
 type cloneConfig struct {
-	auth    CloneAuth
-	seedURL string
+	auth       CloneAuth
+	seedURL    string
+	baseBranch string
 }
 
 // WithCloneAuth attaches an HTTPS credential to the host-side git clone +
@@ -254,6 +255,17 @@ func WithCloneURL(url string) CloneOption {
 	return func(c *cloneConfig) { c.seedURL = url }
 }
 
+// WithBaseBranch names the PR's base branch (e.g. "main") so CreateForPR /
+// CreateForPRInRoot refresh its remote-tracking ref (refs/remotes/origin/<base>)
+// alongside the PR head at materialization. Only those two honor it; the PR diff
+// (cmd/exec/gh) frames against this ref, and the per-run PR fetch otherwise only
+// touches the head, leaving a clone-time-frozen base ref that misframes the diff
+// (TFAC-505). Empty is a no-op — no base refresh, and the diff path falls back to
+// the recorded base.sha / API. Other entry points ignore it.
+func WithBaseBranch(branch string) CloneOption {
+	return func(c *cloneConfig) { c.baseBranch = branch }
+}
+
 func resolveCloneOptions(opts []CloneOption) cloneConfig {
 	var c cloneConfig
 	for _, opt := range opts {
@@ -262,6 +274,14 @@ func resolveCloneOptions(opts []CloneOption) cloneConfig {
 		}
 	}
 	return c
+}
+
+// BaseBranchFromOptions resolves the base branch carried by WithBaseBranch in a
+// CloneOption set, or "" when none was supplied. Exposed so callers and tests
+// can assert which base branch they wired without reaching into the unexported
+// cloneConfig — e.g. the workspace-add path verifying it passes WithBaseBranch(pr.BaseRef).
+func BaseBranchFromOptions(opts ...CloneOption) string {
+	return resolveCloneOptions(opts).baseBranch
 }
 
 func repoDir(owner, repo string) (string, error) {
@@ -503,11 +523,23 @@ func makeWorktreeDir(runID string) (string, error) {
 // Any inherited GIT_TERMINAL_PROMPT is dropped before the =0 is appended, so a
 // parent process that preset =1 can't re-enable interactive prompts — the
 // guarantee holds regardless of how the exec layer resolves duplicate env keys.
+//
+// GIT_ASKPASS / SSH_ASKPASS are stripped for the same reason, and they matter
+// just as much: an editor-managed terminal (Cursor, VS Code) exports GIT_ASKPASS
+// pointing at a GUI credential helper, and git invokes it REGARDLESS of
+// GIT_TERMINAL_PROMPT=0 — so an unauthenticated fetch pops a graphical
+// "Username for 'https://...'" prompt and hangs forever instead of failing fast.
+// TF always injects credentials via the auth header / git proxy and never wants
+// an interactive prompt, so the inherited askpass helpers are dropped from every
+// child env. (Headless servers have neither set, so this is inert there; it's
+// the local-dev path — and its test suite — that would otherwise hang.)
 func gitBaseEnv() []string {
 	parent := os.Environ()
 	out := make([]string, 0, len(parent)+1)
 	for _, kv := range parent {
-		if strings.HasPrefix(kv, "GIT_TERMINAL_PROMPT=") {
+		if strings.HasPrefix(kv, "GIT_TERMINAL_PROMPT=") ||
+			strings.HasPrefix(kv, "GIT_ASKPASS=") ||
+			strings.HasPrefix(kv, "SSH_ASKPASS=") {
 			continue
 		}
 		out = append(out, kv)
