@@ -264,9 +264,9 @@ func parsePRLocalBranch(branch string) (runID string, prNumber int, ok bool) {
 // prPushRemoteName returns the bare-config remote name a PR worktree pushes
 // through. Per (run, PR) — not per-PR — so two concurrent runs on the same PR
 // each own their own remote: inline cleanup of one run can then reclaim its
-// remote without yanking it out from under the other (a shared head-<N> remote
-// would break the surviving run). The runID/pr namespace is flattened (remote
-// names can't contain '/'). Derivable from the per-run branch alone via
+// remote without yanking it out from under the other (a single shared per-PR
+// remote would break the surviving run). The runID/pr namespace is flattened
+// (remote names can't contain '/'). Derivable from the per-run branch alone via
 // parsePRLocalBranch, so the bootstrap sweep can reconstruct it for orphans.
 func prPushRemoteName(runID string, prNumber int) string {
 	return fmt.Sprintf("tfpush-%s-%d", runID, prNumber)
@@ -280,13 +280,13 @@ func PRRefSlug(prNumber int) string {
 }
 
 // trackedBranchMarkerKey is the per-branch config key that marks a
-// branch as triagefactory-managed. We write it from both
-// configureForkPRTracking and configureOwnRepoPRTracking; the sweep
-// reads it via `git config --get-regexp` to identify orphaned
-// branches that need cleanup, including own-repo branches the
-// fork-only sweep would otherwise miss after a run's worktree is
-// removed. The value is the PR number — preserved as the source
-// of truth for the head-<n> remote name when one exists.
+// branch as triagefactory-managed. configurePRPushTracking writes it on
+// every per-run PR branch (triagefactory/<runID>/pr-<n>, fork and
+// own-repo alike); the sweep reads it via `git config --get-regexp` to
+// find orphaned branches that need cleanup after a run's worktree is
+// gone. The value is the PR number — preserved as the source of truth
+// for reconstructing the per-run push remote (tfpush-<runID>-<n>) during
+// reclamation.
 //
 // Git lower-cases config variable names internally, so the regex
 // in the sweep matches against `tfprnumber` even though we set
@@ -378,11 +378,10 @@ func removePRConfigLocked(ctx context.Context, bareDir, localBranch string, prNu
 }
 
 // SweepStaleForkPRConfig walks every branch the bare has marked as
-// triagefactory-managed (via the trackedBranchMarkerKey config we
-// write from configureForkPRTracking and configureOwnRepoPRTracking)
-// and removes any whose branch isn't currently checked out by a
-// live worktree. Backstop for the cases where inline CleanupPRConfig
-// in the runAgent defer doesn't fire:
+// triagefactory-managed (via the trackedBranchMarkerKey config
+// configurePRPushTracking writes) and removes any whose branch isn't
+// currently checked out by a live worktree. Backstop for the cases where
+// inline CleanupPRConfig in the runAgent defer doesn't fire:
 //
 //   - Run was cancelled at a layer above the runAgent defer (rare):
 //     inline cleanup never runs.
