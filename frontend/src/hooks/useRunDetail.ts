@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import type { AgentMessage, AgentRun, Task, WSEvent } from '../types'
+import type { AgentMessage, AgentRun, Artifact, Task, WSEvent } from '../types'
 import { readError } from '../lib/api'
 import { isPermissionTerminalStatus } from '../lib/runStatus'
 import { useWebSocket } from './useWebSocket'
@@ -15,6 +15,13 @@ export interface RunDetailState {
   run: AgentRun | null
   task: Task | null
   messages: AgentMessage[]
+  /** Every artifact this run produced (branch / PR / review / issue / comment),
+   *  newest first — the same set GET /api/agent/runs/{id}/artifacts returns.
+   *  Kept live alongside `run` so the approval list + resolve-all confirmation
+   *  repaint when an approve/dismiss in another tab changes the set (TFAC-384 §6).
+   *  Cross-reference run.pending_artifact_ids to get the *unresolved* subset
+   *  (the ready-review predicate needs the run projection, not just artifact.state). */
+  artifacts: Artifact[]
   loading: boolean
   notFound: boolean
   error: string | null
@@ -26,6 +33,11 @@ export interface RunDetailState {
    *  promise settles when the POST round-trip finishes — callers may await
    *  it (e.g. to disable buttons) or fire-and-forget. */
   resolvePermission: (requestID: string, decision: PermissionDecisionInput) => Promise<void>
+  /** Silently re-pull the run row + its artifact set (no loading flash, unlike
+   *  refetch). Used after a per-item approve/dismiss so the derived approval
+   *  surface (has_unresolved_artifacts + the list) updates in place without
+   *  blanking the whole station to a spinner mid-resolve. */
+  softRefresh: () => void
 }
 
 // useRunDetail loads a single agent run, its messages, and the parent
@@ -37,6 +49,7 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
   const [run, setRun] = useState<AgentRun | null>(null)
   const [task, setTask] = useState<Task | null>(null)
   const [messages, setMessages] = useState<AgentMessage[]>([])
+  const [artifacts, setArtifacts] = useState<Artifact[]>([])
   const [loading, setLoading] = useState(true)
   const [notFound, setNotFound] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -46,8 +59,41 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
 
   // Track the runID the current state belongs to so we can distinguish a
   // same-run refetch (merge messages) from a navigation to a different
-  // run (reset, otherwise message IDs from two runs would interleave).
+  // run (reset, otherwise message IDs from two runs would interleave). It also
+  // gates the async setters below so a fetch for the previous run can't land
+  // after navigation and overwrite the new run's state.
   const lastRunIDRef = useRef<string | undefined>(runID)
+
+  // Pull the run's artifact set fresh. Shared by the initial load, the WS
+  // handlers, and the reconcile poll so an approve/dismiss anywhere (this tab or
+  // another) repaints the approval list. Best-effort: a transient failure leaves
+  // the prior set in place rather than blanking the surface mid-resolve. Guards
+  // on lastRunIDRef so a slow fetch for a since-navigated-away run is discarded
+  // rather than clobbering the current run's artifacts.
+  const refetchArtifacts = useCallback((id: string) => {
+    fetch(`/api/agent/runs/${id}/artifacts`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: Artifact[] | null) => {
+        if (data && id === lastRunIDRef.current) setArtifacts(data)
+      })
+      .catch(() => {})
+  }, [])
+
+  // softRefresh re-pulls the run row + artifact set without the loading toggle
+  // (refetch sets loading=true → the full-screen spinner). A per-item resolve
+  // must update the derived approval surface in place, not flash the station.
+  // Same stale-navigation guard as refetchArtifacts.
+  const softRefresh = useCallback(() => {
+    if (!runID) return
+    const id = runID
+    fetch(`/api/agent/runs/${id}`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((data: AgentRun | null) => {
+        if (data && id === lastRunIDRef.current) setRun(data)
+      })
+      .catch(() => {})
+    refetchArtifacts(id)
+  }, [runID, refetchArtifacts])
 
   // Permission prompts run through the shared queue core (the same one the
   // board uses), filtered to this single run so the two surfaces can't diverge
@@ -73,6 +119,7 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
       setRun(null)
       setTask(null)
       setMessages([])
+      setArtifacts([])
       // A new run starts with no prompts; drop the prior run's queue + timers.
       if (prevRunID) dropRun(prevRunID)
     }
@@ -102,6 +149,9 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
         const runData = (await runRes.json()) as AgentRun
         if (cancelled) return
         setRun(runData)
+        // The artifact set drives the approval list; pull it in the same load so
+        // the cards are ready when the run paints (best-effort, non-blocking).
+        refetchArtifacts(runID)
 
         // Parallel: messages + task.
         const [msgsRes, taskRes] = await Promise.all([
@@ -144,7 +194,7 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
     return () => {
       cancelled = true
     }
-  }, [runID, refetchTick, dropRun])
+  }, [runID, refetchTick, dropRun, refetchArtifacts])
 
   // Tier-2 artifact reconciliation (TFAC-464): while the run view is open, poll
   // the run-scoped refresh endpoint so externally-changed artifacts (a PR
@@ -162,14 +212,16 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
         .then((r) => (r.ok ? r.json() : null))
         .then((data: { updated?: number } | null) => {
           if (cancelled || !data?.updated) return
-          // A transition landed — pull the run row fresh in case the websocket
-          // broadcast was missed (the WS handler does the same on its event).
+          // A transition landed — pull the run row + its artifact set fresh in
+          // case the websocket broadcast was missed (the WS handler does the same
+          // on its event), so the derived approval surface can't go stale.
           fetch(`/api/agent/runs/${runID}`)
             .then((r) => (r.ok ? r.json() : null))
             .then((run: AgentRun | null) => {
               if (!cancelled && run) setRun(run)
             })
             .catch(() => {})
+          if (!cancelled) refetchArtifacts(runID)
         })
         .catch(() => {})
     }
@@ -178,7 +230,7 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
       cancelled = true
       clearInterval(id)
     }
-  }, [runID])
+  }, [runID, refetchArtifacts])
 
   // Live updates. agent_message appends; agent_run_update refetches the
   // run row so status/duration/cost flip without a full reload. Permission
@@ -207,21 +259,29 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
           fetch(`/api/agent/runs/${runID}`)
             .then((r) => (r.ok ? r.json() : null))
             .then((data: AgentRun | null) => {
-              if (data) setRun(data)
+              // Guard the async write against a navigation that landed while the
+              // fetch was in flight (same guard refetchArtifacts uses), so an
+              // old run's row can't clobber the new run's state.
+              if (data && runID === lastRunIDRef.current) setRun(data)
             })
             .catch(() => {})
+          // A status flip can resolve the last artifact (terminal-on-last) or
+          // surface a freshly-staged one — pull the set so the list repaints.
+          refetchArtifacts(runID)
         }
         if (event.type === 'artifact_updated' && event.run_id === runID) {
           // Reconciler (TFAC-464): an artifact this run produced changed state
-          // on GitHub. Refetch the run so its artifact-derived surface (pending
-          // kind / approval overlay) updates. The run's own status is unchanged,
-          // so no permission-queue drop here.
+          // on GitHub (or another tab approved/dismissed it). Refetch the run so
+          // its derived approval signal (has_unresolved_artifacts + counts)
+          // updates, and the artifact set so the approval list repaints. The
+          // run's own status is unchanged, so no permission-queue drop here.
           fetch(`/api/agent/runs/${runID}`)
             .then((r) => (r.ok ? r.json() : null))
             .then((data: AgentRun | null) => {
-              if (data) setRun(data)
+              if (data && runID === lastRunIDRef.current) setRun(data)
             })
             .catch(() => {})
+          refetchArtifacts(runID)
         }
         if (event.type === 'permission_request' && event.run_id === runID) {
           ingest(event)
@@ -230,7 +290,7 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
           forget(event)
         }
       },
-      [runID, ingest, forget, dropRun],
+      [runID, ingest, forget, dropRun, refetchArtifacts],
     ),
   )
 
@@ -238,11 +298,13 @@ export function useRunDetail(runID: string | undefined): RunDetailState {
     run,
     task,
     messages,
+    artifacts,
     loading,
     notFound,
     error,
     refetch,
     pendingPermissions,
     resolvePermission,
+    softRefresh,
   }
 }
