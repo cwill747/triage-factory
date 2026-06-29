@@ -35,6 +35,7 @@ type PRView struct {
 	HeadRef      string            `json:"head_ref"`
 	BaseRef      string            `json:"base_ref"`
 	HeadSHA      string            `json:"head_sha"`
+	BaseSHA      string            `json:"base_sha"`
 	HTMLURL      string            `json:"html_url"`
 	CloneURL     string            `json:"clone_url"`
 	BaseCloneURL string            `json:"base_clone_url"`
@@ -115,6 +116,7 @@ func prViewFromRaw(raw map[string]any) *PRView {
 	}
 	if base, ok := raw["base"].(map[string]any); ok {
 		pr.BaseRef = strVal(base, "ref")
+		pr.BaseSHA = strVal(base, "sha")
 		if baseRepo, ok := base["repo"].(map[string]any); ok {
 			pr.BaseCloneURL = strVal(baseRepo, "clone_url")
 			pr.BaseSSHURL = strVal(baseRepo, "ssh_url")
@@ -247,14 +249,7 @@ func (c *Client) GetPRFiles(ctx context.Context, owner, repo string, number int)
 		}
 
 		for _, f := range rawFiles {
-			files = append(files, PRFile{
-				Filename:         strVal(f, "filename"),
-				Status:           strVal(f, "status"),
-				PreviousFilename: strVal(f, "previous_filename"),
-				Additions:        intVal(f, "additions"),
-				Deletions:        intVal(f, "deletions"),
-				Patch:            strVal(f, "patch"),
-			})
+			files = append(files, prFileFromRaw(f))
 		}
 
 		if len(rawFiles) < 100 || len(files) >= MaxPRFiles {
@@ -262,6 +257,20 @@ func (c *Client) GetPRFiles(ctx context.Context, owner, repo string, number int)
 		}
 	}
 	return files, nil
+}
+
+// prFileFromRaw maps one decoded changed-file JSON object (from /pulls/{n}/files
+// or /compare) into a PRFile. Shared by GetPRFiles, GetCompareFiles, and
+// CompareCommits so the field mapping has a single home.
+func prFileFromRaw(f map[string]any) PRFile {
+	return PRFile{
+		Filename:         strVal(f, "filename"),
+		Status:           strVal(f, "status"),
+		PreviousFilename: strVal(f, "previous_filename"),
+		Additions:        intVal(f, "additions"),
+		Deletions:        intVal(f, "deletions"),
+		Patch:            strVal(f, "patch"),
+	}
 }
 
 // GetPRDiff fetches the raw diff for a PR, optionally filtered to a single file.
@@ -279,13 +288,23 @@ func (c *Client) GetPRDiff(ctx context.Context, owner, repo string, number int, 
 	return filterDiffByFile(string(diff), file), nil
 }
 
+// comparePath builds the compare endpoint path for base...head. base and head
+// are URL-escaped so a ref name containing "/" (e.g. "feature/foo") isn't split
+// into extra path segments and break the route; SHAs and slash-free refs pass
+// through unchanged. The "..." separator is left literal (it's the merge-base
+// operator, not data). owner/repo follow the rest of this file's convention of
+// being interpolated raw (they carry no slashes).
+func comparePath(owner, repo, base, head string) string {
+	return fmt.Sprintf("/repos/%s/%s/compare/%s...%s", owner, repo, url.PathEscape(base), url.PathEscape(head))
+}
+
 // GetCompareDiff fetches the unified diff for base...head — the three-dot
 // (merge-base) form GitHub uses for a PR's own diff. Used to validate and
 // anchor a review comment against a specific commit (the agent's worktree HEAD)
 // rather than the live PR head, so the comment lands on the line the agent
 // actually read. base and head may be refs or SHAs.
 func (c *Client) GetCompareDiff(ctx context.Context, owner, repo, base, head string) (string, error) {
-	diff, err := c.GetRaw(ctx, fmt.Sprintf("/repos/%s/%s/compare/%s...%s", owner, repo, base, head), "application/vnd.github.v3.diff")
+	diff, err := c.GetRaw(ctx, comparePath(owner, repo, base, head), "application/vnd.github.v3.diff")
 	if err != nil {
 		return "", err
 	}
@@ -297,7 +316,7 @@ func (c *Client) GetCompareDiff(ctx context.Context, owner, repo, base, head str
 // (HTTP 406, "diff too large"). Returns the first page only — parity with the
 // PR-diff fallback, which also doesn't paginate the reassembly source.
 func (c *Client) GetCompareFiles(ctx context.Context, owner, repo, base, head string) ([]PRFile, error) {
-	data, err := c.Get(ctx, fmt.Sprintf("/repos/%s/%s/compare/%s...%s", owner, repo, base, head))
+	data, err := c.Get(ctx, comparePath(owner, repo, base, head))
 	if err != nil {
 		return nil, err
 	}
@@ -309,16 +328,52 @@ func (c *Client) GetCompareFiles(ctx context.Context, owner, repo, base, head st
 	}
 	files := make([]PRFile, 0, len(raw.Files))
 	for _, f := range raw.Files {
-		files = append(files, PRFile{
-			Filename:         strVal(f, "filename"),
-			Status:           strVal(f, "status"),
-			PreviousFilename: strVal(f, "previous_filename"),
-			Additions:        intVal(f, "additions"),
-			Deletions:        intVal(f, "deletions"),
-			Patch:            strVal(f, "patch"),
-		})
+		files = append(files, prFileFromRaw(f))
 	}
 	return files, nil
+}
+
+// CommitComparison is the slice of GitHub's "compare two commits" response the
+// human-facing review-freshness check (TFAC-500) consumes:
+//
+//   - AheadBy: how many commits Head is ahead of Base — the commits-since-finalize
+//     count when Base is the finalize-time head and Head is the live PR head.
+//   - Files: the per-file patches for Base...Head, ready for
+//     ParseLineMapFromPatches to forward-map each staged comment's anchored line
+//     onto Head's frame.
+//
+// One JSON round-trip yields both. The diff media type (GetCompareDiff) omits
+// ahead_by, so the freshness path deliberately uses the compare JSON form — the
+// same per-file patches the finalize gate's 406 fallback already parses, so the
+// human-facing badge and the agent-facing gate agree on what "outdated" means.
+type CommitComparison struct {
+	AheadBy int
+	Files   []PRFile
+}
+
+// CompareCommits fetches base...head via the compare API's JSON form and returns
+// the freshness-relevant slice (ahead_by + per-file patches). base and head may
+// be refs or SHAs (ref names with "/" are escaped by comparePath). Unlike
+// GetCompareDiff there is no 406 fallback: this IS the JSON form, so an oversized
+// diff degrades to patch-less file entries (which ParseLineMapFromPatches maps
+// conservatively to "outdated") rather than erroring.
+func (c *Client) CompareCommits(ctx context.Context, owner, repo, base, head string) (*CommitComparison, error) {
+	data, err := c.Get(ctx, comparePath(owner, repo, base, head))
+	if err != nil {
+		return nil, err
+	}
+	var raw struct {
+		AheadBy int              `json:"ahead_by"`
+		Files   []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, err
+	}
+	files := make([]PRFile, 0, len(raw.Files))
+	for _, f := range raw.Files {
+		files = append(files, prFileFromRaw(f))
+	}
+	return &CommitComparison{AheadBy: raw.AheadBy, Files: files}, nil
 }
 
 // CommentThread is a top-level comment with its replies.

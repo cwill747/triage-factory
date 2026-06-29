@@ -8,9 +8,11 @@ import ReviewSummary from './ReviewSummary'
 
 // ReviewArtifact mirrors internal/server/reviews_artifact_handler.go's
 // reviewArtifactJSON. review_body / review_event are the STAGED values (applied
-// to GitHub only on approval); comments are the LIVE GitHub pending-review
-// comments, each with its severity parsed back out of the comment body (chip) and
-// the clean body shown. The review is a real GitHub pending review now, edited 1:1.
+// to GitHub only on approval); the comments are staged TF-side (TFAC-494), each
+// with its severity parsed back out of the body (chip) and the clean body shown.
+// commits_since_finalize + per-comment freshness are computed against the live PR
+// head at GET time (TFAC-500) so the human sees how far the PR has drifted since
+// the agent wrote the review.
 interface ReviewArtifact {
   id: string
   run_id?: string
@@ -21,6 +23,9 @@ interface ReviewArtifact {
   review_body: string
   review_event: string
   state: string
+  // null when it couldn't be computed (live head unreachable); 0 means the PR
+  // hasn't advanced since finalize.
+  commits_since_finalize: number | null
   comments: {
     id: string
     path: string
@@ -28,6 +33,11 @@ interface ReviewArtifact {
     start_line?: number
     body: string
     severity?: string
+    // 'current' | 'moved' | 'outdated' | 'unknown' (TFAC-500).
+    freshness?: string
+    // New-side position on the live head when freshness is 'moved'.
+    mapped_line?: number
+    mapped_path?: string
   }[]
 }
 
@@ -60,6 +70,12 @@ export default function ReviewOverlay({ artifactId, open, onClose }: Props) {
   // submitError is the approve (submit-to-GitHub) failure, shown inline so the
   // user can retry in place rather than close-and-reopen.
   const [submitError, setSubmitError] = useState<string | null>(null)
+  // refreshing/refreshError back the Refresh action (TFAC-500): re-reconcile the
+  // staged comments to the live head. reloadKey re-triggers the load effect after
+  // a successful refresh so the overlay re-renders the new finalize frame.
+  const [refreshing, setRefreshing] = useState(false)
+  const [refreshError, setRefreshError] = useState<string | null>(null)
+  const [reloadKey, setReloadKey] = useState(0)
 
   // Fetch the review artifact (blocking), then the diff (isolated).
   useEffect(() => {
@@ -111,7 +127,7 @@ export default function ReviewOverlay({ artifactId, open, onClose }: Props) {
     return () => {
       cancelled = true
     }
-  }, [open, artifactId])
+  }, [open, artifactId, reloadKey])
 
   // Pessimistic comment ops on the live GitHub pending review: await the request,
   // throw on !ok so the child (ReviewComment) surfaces the error and stays in edit
@@ -226,7 +242,42 @@ export default function ReviewOverlay({ artifactId, open, onClose }: Props) {
     }
   }, [artifactId, onClose])
 
-  // Group comments by file path for the diff renderer.
+  // Re-reconcile the staged comments to the PR's live head (TFAC-500): survivors
+  // are remapped, outdated comments dropped, the finalize frame re-pinned. On
+  // success, re-trigger the load effect so the overlay re-renders the new frame
+  // (count resets to 0, badges to current).
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true)
+    setRefreshError(null)
+    try {
+      const res = await fetch(`/api/artifacts/${artifactId}/review/refresh`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      })
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}))
+        throw new Error(e.error || `Refresh failed (${res.status})`)
+      }
+      setReloadKey((k) => k + 1)
+    } catch (err) {
+      setRefreshError(err instanceof Error ? err.message : String(err))
+      // Re-throw so ReviewSummary keeps the confirm panel open — that panel is the
+      // only place refreshError renders, so closing it would hide the message.
+      throw err
+    } finally {
+      setRefreshing(false)
+    }
+  }, [artifactId])
+
+  // Per-verdict counts for the Refresh confirmation (computed from the freshness
+  // the GET already returned — no extra round-trip): how many comments would be
+  // remapped vs. dropped as outdated.
+  const movedCount = (review?.comments ?? []).filter((c) => c.freshness === 'moved').length
+  const outdatedCount = (review?.comments ?? []).filter((c) => c.freshness === 'outdated').length
+
+  // Group comments by file path for the diff renderer. The overlay renders the
+  // finalize-time frame, so a comment anchors by the path + line it was written
+  // against (TFAC-500); freshness + mappedLine ride along for the badge only.
   const commentsByFile = (review?.comments ?? []).reduce<Record<string, FileComment[]>>(
     (acc, c) => {
       ;(acc[c.path] ??= []).push({
@@ -236,6 +287,8 @@ export default function ReviewOverlay({ artifactId, open, onClose }: Props) {
         startLine: c.start_line,
         body: c.body,
         severity: c.severity,
+        freshness: c.freshness,
+        mappedLine: c.mapped_line,
       })
       return acc
     },
@@ -326,6 +379,12 @@ export default function ReviewOverlay({ artifactId, open, onClose }: Props) {
                     reviewEvent={review.review_event}
                     reviewBody={review.review_body}
                     commentCount={review.comments.length}
+                    commitsSinceFinalize={review.commits_since_finalize}
+                    movedCount={movedCount}
+                    outdatedCount={outdatedCount}
+                    onRefresh={handleRefresh}
+                    refreshing={refreshing}
+                    refreshError={refreshError}
                     onUpdateBody={handleUpdateBody}
                     onUpdateEvent={handleUpdateEvent}
                     onSubmit={handleSubmit}

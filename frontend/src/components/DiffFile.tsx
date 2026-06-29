@@ -11,6 +11,10 @@ export interface FileComment {
   startLine?: number
   body: string
   severity?: string
+  // Per-comment freshness vs. the live PR head (TFAC-500): 'current' | 'moved' |
+  // 'outdated' | 'unknown'. mappedLine is the new-side line when 'moved'.
+  freshness?: string
+  mappedLine?: number
 }
 
 interface Props {
@@ -32,16 +36,23 @@ export default function DiffFile({
 }: Props) {
   const [collapsed, setCollapsed] = useState(defaultCollapsed)
 
-  // Build the widgets map: changeKey → ReactNode
-  const widgets = useMemo(() => {
+  // Build the widgets map (changeKey → ReactNode) and collect comments that can't
+  // be anchored to a line shown in the diff. The overlay renders the FINALIZE-TIME
+  // frame (TFAC-500), so a staged comment anchors at the line it was written
+  // against (comment.line) — its freshness badge separately conveys how it relates
+  // to the live head. The rare comment that still doesn't match a shown line (its
+  // code became identical to base, or its patch was omitted from a truncated diff)
+  // falls through to the unanchored block below rather than vanishing.
+  const { widgets, unanchored } = useMemo(() => {
     const map: Record<string, React.ReactNode> = {}
+    const placed = new Set<string>()
 
     for (const comment of comments) {
-      // Find the change in any hunk that matches this comment's line number
+      // Find the change in any hunk that matches this comment's line
       for (const hunk of file.hunks) {
+        let done = false
         for (const change of hunk.changes) {
-          const lineNum = getLineNumber(change)
-          if (lineNum === comment.line) {
+          if (getLineNumber(change) === comment.line) {
             const key = getChangeKey(change)
             // Stack multiple comments on the same line
             const existing = map[key]
@@ -55,18 +66,23 @@ export default function DiffFile({
                   line={comment.line}
                   body={comment.body}
                   severity={comment.severity}
+                  freshness={comment.freshness}
+                  mappedLine={comment.mappedLine}
                   onUpdate={onUpdateComment}
                   onDelete={onDeleteComment}
                 />
               </>
             )
+            placed.add(comment.id)
+            done = true
             break
           }
         }
+        if (done) break
       }
     }
 
-    return map
+    return { widgets: map, unanchored: comments.filter((c) => !placed.has(c.id)) }
   }, [comments, file.hunks, onUpdateComment, onDeleteComment])
 
   // Tokenize with syntax highlighting + word-level edit marks
@@ -183,6 +199,31 @@ export default function DiffFile({
             </Diff>
           </div>
         ))}
+
+      {/* Safety net: comments that couldn't be anchored to a shown line (their
+          code became identical to base, or the patch was omitted from a truncated
+          diff). Kept visible — with their badge — rather than silently dropped. */}
+      {!collapsed && unanchored.length > 0 && (
+        <div className="border-t border-border-subtle px-3 py-2">
+          <p className="px-1 pb-1 text-[10px] text-text-tertiary">
+            {unanchored.length} comment{unanchored.length !== 1 ? 's' : ''} not shown in this diff
+          </p>
+          {unanchored.map((c) => (
+            <ReviewComment
+              key={c.id}
+              id={c.id}
+              path={c.path}
+              line={c.line}
+              body={c.body}
+              severity={c.severity}
+              freshness={c.freshness}
+              mappedLine={c.mappedLine}
+              onUpdate={onUpdateComment}
+              onDelete={onDeleteComment}
+            />
+          ))}
+        </div>
+      )}
     </div>
   )
 }
