@@ -312,12 +312,12 @@ func (s *Server) dispatch(ctx context.Context, method string, rawArgs json.RawMe
 		}
 		return teamTracksRepoResult{Tracks: tracks}, nil
 
-	case methodGetRunWorktreeByRepo:
-		var a runWorktreeByRepoArgs
+	case methodGetRunWorktreeByRepoRef:
+		var a runWorktreeByRepoRefArgs
 		if err := dec(&a); err != nil {
 			return nil, err
 		}
-		w, err := client.GetRunWorktreeByRepo(ctx, a.RepoID)
+		w, err := client.GetRunWorktreeByRepoRef(ctx, a.RepoID, a.Ref)
 		if err != nil {
 			return nil, err
 		}
@@ -341,12 +341,12 @@ func (s *Server) dispatch(ctx context.Context, method string, rawArgs json.RawMe
 		}
 		return insertRunWorktreeResult{Inserted: inserted, WinningPath: winningPath}, nil
 
-	case methodDeleteRunWorktreeByRepo:
-		var a deleteRunWorktreeByRepoArgs
+	case methodDeleteRunWorktreeByRepoRef:
+		var a deleteRunWorktreeByRepoRefArgs
 		if err := dec(&a); err != nil {
 			return nil, err
 		}
-		return emptyResult{}, client.DeleteRunWorktreeByRepo(ctx, a.RepoID)
+		return emptyResult{}, client.DeleteRunWorktreeByRepoRef(ctx, a.RepoID, a.Ref)
 
 	case methodBuildAgentRunFooter:
 		var a buildAgentRunFooterArgs

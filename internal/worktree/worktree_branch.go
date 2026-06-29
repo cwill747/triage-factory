@@ -30,7 +30,13 @@ func CreateForBranch(ctx context.Context, owner, repo, cloneURL, baseBranch, fea
 //
 // Other than the path, behavior matches CreateForBranch — same per-repo
 // lock, same bare-clone reuse, same branch-exists reattach, same excludes
-// rollback. The Jira `workspace add` CLI is the sole caller in production.
+// rollback.
+//
+// No live production caller: `workspace add` routes to CreateForCheckoutInRoot
+// (the detached default/--ref path, TFAC-498), not here. Retained as the
+// prescribed-feature-branch variant — exercised by curator_test — for a future
+// caller that needs a named branch checked out up front rather than a detached
+// checkout the agent branches from itself.
 func CreateForBranchInRoot(ctx context.Context, owner, repo, cloneURL, baseBranch, featureBranch, runID, runRoot string) (string, error) {
 	if runRoot == "" {
 		return "", fmt.Errorf("CreateForBranchInRoot: runRoot is required")
@@ -47,15 +53,49 @@ func CreateForBranchInRoot(ctx context.Context, owner, repo, cloneURL, baseBranc
 	return createBranchWorktreeAt(ctx, owner, repo, cloneURL, baseBranch, featureBranch, runID, wtDir, CloneAuth{})
 }
 
+// CheckoutRefSlug is the run_worktrees ref (PK discriminator) AND the
+// worktree-subdir name for a default/--ref checkout. It MUST be a single
+// filesystem-safe path segment that is injective over valid refs (distinct refs
+// → distinct slugs) and disjoint from the reserved "pr-<N>" and "@default"
+// forms. Otherwise one run would treat two different `workspace add --ref`
+// targets — or a branch literally named "pr-42" and PR #42 — as the same
+// worktree: the idempotent re-add hands back the wrong checkout, and the
+// detached worktree the agent branches/pushes from is the wrong one.
+//
+//   - ""         → "@default"      ("@" is disallowed in a validated --ref, so
+//     the default form can't collide with a branch)
+//   - "<branch>" → "ref-<branch>"  with every '/' replaced by '~'
+//
+// Two properties make this collision-free:
+//
+//   - The "ref-" namespace keeps branch slugs disjoint from "pr-<N>" (a "ref-"
+//     slug never starts with "pr-") and "@default".
+//   - A validated --ref's alphabet is [A-Za-z0-9._/-] (see validateGitRef), so
+//     '/' is the only path-unsafe byte AND '~' can never appear literally in the
+//     input. Replacing only '/' → '~' is therefore injective: "feature/foo" →
+//     "ref-feature~foo" and "feature-foo" → "ref-feature-foo" stay distinct
+//     (the old fold-everything-to-'-' scheme collapsed both to "feature-foo").
+//
+// The slug is never handed to git (the fetch uses the raw ref); it is only the
+// PK + on-disk subdir + `workspace list` display. Exported so the workspace CLI
+// reserves the run_worktrees row and computes the worktree path with the same
+// slug CreateForCheckoutInRoot lands the worktree at.
+func CheckoutRefSlug(ref string) string {
+	if ref == "" {
+		return "@default"
+	}
+	return "ref-" + strings.ReplaceAll(ref, "/", "~")
+}
+
 // CreateForCheckoutInRoot materializes a worktree at filepath.Join(runRoot,
-// owner, repo) checked out — in DETACHED HEAD — at the fresh tip of an existing
-// branch on origin. When ref is empty the repo's default branch is detected and
-// used. This is the generalized `workspace add` / `workspace add --ref <branch>`
-// path (TFAC-498): unlike CreateForBranchInRoot it does NOT mint a prescribed
-// feature branch — it hands back a checkout of the named branch as-is and lets
-// the agent create its own working branch (`git checkout -b ...`) before
-// pushing. The push gate then authorizes whatever branch the worktree lands on
-// (its live current branch), not a prescribed name.
+// owner, repo, ref-slug) checked out — in DETACHED HEAD — at the fresh tip of
+// an existing branch on origin. When ref is empty the repo's default branch is
+// detected and used (slug "@default"). This is the generalized `workspace add`
+// / `workspace add --ref <branch>` path (TFAC-498): unlike CreateForBranchInRoot
+// it does NOT mint a prescribed feature branch — it hands back a checkout of the
+// named branch as-is and lets the agent create its own working branch (`git
+// checkout -b ...`) before pushing. The push gate then authorizes whatever
+// branch the worktree lands on (its live current branch), not a prescribed name.
 //
 // Detached (rather than a local branch) is deliberate: many runs default to the
 // same repo's default branch, and git refuses to check out one local branch ref
@@ -64,15 +104,16 @@ func CreateForBranchInRoot(ctx context.Context, owner, repo, cloneURL, baseBranc
 // yields no live branch, so the push gate authorizes nothing until the agent
 // has created its own branch — exactly the intended flow.
 //
+// The ref-slug subdir lets one run hold several checkouts in one repo (TFAC-502).
 // The run-root must already exist (created by MakeRunRoot in the spawner); the
-// owner-level subdir is created here.
+// owner/repo subdirs are created here.
 func CreateForCheckoutInRoot(ctx context.Context, owner, repo, cloneURL, ref, runID, runRoot string) (string, error) {
 	if runRoot == "" {
 		return "", fmt.Errorf("CreateForCheckoutInRoot: runRoot is required")
 	}
-	wtDir := filepath.Join(runRoot, owner, repo)
+	wtDir := filepath.Join(runRoot, owner, repo, CheckoutRefSlug(ref))
 	if err := os.MkdirAll(filepath.Dir(wtDir), 0755); err != nil {
-		return "", fmt.Errorf("mkdir owner subdir: %w", err)
+		return "", fmt.Errorf("mkdir repo subdir: %w", err)
 	}
 	// No CloneAuth here for the same reason as CreateForBranchInRoot: this is
 	// the in-sandbox `workspace add` path; in-sandbox git credentials are
