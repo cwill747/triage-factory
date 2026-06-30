@@ -39,10 +39,11 @@ func emitCI(router *Router, entityID, author string) {
 }
 
 // seedSystemRule seeds a system-source (shipped-style) match-all rule for the
-// given event type on teamID. A system rule gates creation but — unlike a
-// user-authored rule — never grants visibility on its own, so on its own it
-// can't surface a task for a non-owner. The id/slug embed the event so several
-// types can be seeded per team.
+// given event type on teamID. It ships applies_to_unowned=false (the default),
+// so it gates creation but — unlike an applies_to_unowned ("watch") rule —
+// never grants visibility on its own, so on its own it can't surface a task for
+// a non-owner. The id/slug embed the event so several types can be seeded per
+// team.
 func seedSystemRule(t *testing.T, database *sql.DB, teamID, eventType string) {
 	t.Helper()
 	key := teamID[:8] + "-" + eventType[len(eventType)-6:]
@@ -323,17 +324,19 @@ func TestAuthorCentric_ReviewFirstTrap_CIFallsToAuthor(t *testing.T) {
 	}
 }
 
-// TestAuthorCentric_ExternalAuthor_WatchRuleSurfaces: an external/dependabot
-// author resolves to no team, but an explicit user-authored watch rule on team
-// C still surfaces the task (owner NULL, C in the visibility set) — the opt-in
-// that brings external CI onto a team's board.
+// TestAuthorCentric_ExternalAuthor_WatchRuleSurfaces is the flag-ON case
+// (TFAC-517): an external/dependabot author resolves to no team, but a rule with
+// applies_to_unowned=true on team C still surfaces the task (owner NULL, C in
+// the visibility set) — the explicit opt-in that brings external CI onto a
+// team's board. The flag-OFF mirror (no task) is
+// TestAuthorCentric_ExternalAuthor_FlagOff_NoTask.
 func TestAuthorCentric_ExternalAuthor_WatchRuleSurfaces(t *testing.T) {
 	database := newTestDB(t)
 	seedHandlerFKTargets(t, database)
 	setReviewHost(t, database)
 
 	teamC := seedTeam(t, database, "watch-team")
-	seedMatchAllCIRule(t, database, teamC) // user-authored watch rule
+	seedMatchAllCIRule(t, database, teamC) // applies_to_unowned=true watch rule
 
 	entityID := reviewEntity(t, database, "owner/repo#dependabot")
 	emitCI(reviewRouter(database), entityID, "dependabot[bot]") // not a TF user
@@ -347,6 +350,84 @@ func TestAuthorCentric_ExternalAuthor_WatchRuleSurfaces(t *testing.T) {
 	}
 	if vis := visTeamsOf(t, database, active[0].ID); len(vis) != 1 || vis[0] != teamC {
 		t.Errorf("visibility = %v, want [%s] (the watching team)", vis, teamC)
+	}
+}
+
+// seedFlagOffCIRule inserts a user-source match-all ci_check_failed rule with
+// applies_to_unowned=false (the TFAC-517 default) on teamID. Unlike
+// seedMatchAllCIRule (flag on), it contributes visibility ONLY when the
+// owning-team ladder resolves teamID as owner — it never broadens to unowned
+// entities. The "user" source proves the broadening is gated on the flag, not
+// on provenance (the heuristic TFAC-517 removed).
+func seedFlagOffCIRule(t *testing.T, database *sql.DB, teamID string) {
+	t.Helper()
+	if _, err := database.Exec(`
+		INSERT INTO event_handlers
+			(id, org_id, team_id, creator_user_id, kind, event_type,
+			 scope_predicate_json, enabled, source, applies_to_unowned, name, default_priority, sort_order,
+			 created_at, updated_at)
+		VALUES (?, ?, ?, ?, 'rule', ?, NULL, 1, 'user', 0, ?, 0.7, 100, ?, ?)
+	`, "flagoff-"+teamID[:8], runmode.LocalDefaultOrgID, teamID, runmode.LocalDefaultUserID,
+		domain.EventGitHubPRCICheckFailed, "flag-off CI rule "+teamID[:8], time.Now(), time.Now()); err != nil {
+		t.Fatalf("seed flag-off CI rule for team %s: %v", teamID, err)
+	}
+}
+
+// TestAuthorCentric_ExternalAuthor_FlagOff_NoTask is the headline default-flip
+// (TFAC-517): the SAME match-all user rule as the watch test, but with
+// applies_to_unowned=false (the new default). An external author resolves to no
+// team and a flag-off rule grants no visibility on its own, so the event is
+// recorded but mints NO task for the would-be watcher. This is the behavior the
+// flag restores: a rule no longer broadens by accident.
+func TestAuthorCentric_ExternalAuthor_FlagOff_NoTask(t *testing.T) {
+	database := newTestDB(t)
+	seedHandlerFKTargets(t, database)
+	setReviewHost(t, database)
+
+	teamC := seedTeam(t, database, "watch-team")
+	seedFlagOffCIRule(t, database, teamC) // user rule, applies_to_unowned=false
+
+	entityID := reviewEntity(t, database, "owner/repo#dependabot-off")
+	emitCI(reviewRouter(database), entityID, "dependabot[bot]") // not a TF user
+
+	active, err := testTaskStore(database).FindActiveByEntity(context.Background(), runmode.LocalDefaultOrgID, entityID)
+	if err != nil {
+		t.Fatalf("list tasks: %v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("expected no task (flag off → no broadening), got %d", len(active))
+	}
+}
+
+// TestAuthorCentric_OwnedEntity_FlagOff_VisibleToTeam is the owned-entity half
+// of the default-flip (TFAC-517): with the flag OFF, a rule still surfaces a
+// task to its team when the team OWNS the entity — visibility rides ownership,
+// not the flag. The author is on teamA (the owner); a flag-off rule on teamA
+// surfaces the task, while a flag-off rule on the non-owning teamB does NOT pull
+// teamB into visibility (proving flag-off never broadens).
+func TestAuthorCentric_OwnedEntity_FlagOff_VisibleToTeam(t *testing.T) {
+	database := newTestDB(t)
+	seedHandlerFKTargets(t, database)
+	setReviewHost(t, database)
+
+	teamA := seedTeam(t, database, "team-a")
+	teamB := seedTeam(t, database, "team-b")
+	seedUserOnTeam(t, database, teamA, "aidan") // author owns via teamA
+	seedFlagOffCIRule(t, database, teamA)       // owner's rule, flag off
+	seedFlagOffCIRule(t, database, teamB)       // non-owner's rule, flag off → no broadening
+
+	entityID := reviewEntity(t, database, "owner/repo#owned-flagoff")
+	emitCI(reviewRouter(database), entityID, "aidan")
+
+	active, err := testTaskStore(database).FindActiveByEntity(context.Background(), runmode.LocalDefaultOrgID, entityID)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("expected 1 task on the owned entity, got %d (err=%v)", len(active), err)
+	}
+	if teamIDValue(&active[0]) != teamA {
+		t.Errorf("owner = %q, want teamA %q", teamIDValue(&active[0]), teamA)
+	}
+	if vis := visTeamsOf(t, database, active[0].ID); len(vis) != 1 || vis[0] != teamA {
+		t.Errorf("visibility = %v, want [%s] only (teamB's flag-off rule must not broaden)", vis, teamA)
 	}
 }
 
@@ -470,7 +551,7 @@ func TestOwnerLadderRouting_AmbiguousOwner_OrdersByPriorityThenID(t *testing.T) 
 		{TeamID: "team-z", Source: domain.EventHandlerSourceUser, DefaultPriority: hi},
 		{TeamID: "team-a", Source: domain.EventHandlerSourceUser, DefaultPriority: lo},
 	}
-	vis, owner, ordered, _, ok := ownerLadderRouting("", []string{"team-a", "team-z"}, rules)
+	vis, owner, ordered, _, ok := ownerLadderRouting("", []string{"team-a", "team-z"}, rules, nil)
 	if !ok {
 		t.Fatal("ownerLadderRouting ok=false, want a routable task")
 	}
@@ -489,54 +570,194 @@ func TestOwnerLadderRouting_AmbiguousOwner_OrdersByPriorityThenID(t *testing.T) 
 		{TeamID: "team-z", Source: domain.EventHandlerSourceUser, DefaultPriority: lo},
 		{TeamID: "team-a", Source: domain.EventHandlerSourceUser, DefaultPriority: lo},
 	}
-	_, _, tieOrdered, _, _ := ownerLadderRouting("", []string{"team-a", "team-z"}, tie)
+	_, _, tieOrdered, _, _ := ownerLadderRouting("", []string{"team-a", "team-z"}, tie, nil)
 	if len(tieOrdered) != 2 || tieOrdered[0] != "team-a" || tieOrdered[1] != "team-z" {
 		t.Errorf("tie orderedTeams = %v, want [team-a team-z] (equal priority → lowest team id)", tieOrdered)
 	}
 
 	// Resolved (unambiguous) owner: orderedTeams is exactly the owner — watcher
 	// teams get visibility but never firing rights.
-	_, _, resolvedOrdered, _, _ := ownerLadderRouting("team-a", []string{"team-a"}, rules)
+	_, _, resolvedOrdered, _, _ := ownerLadderRouting("team-a", []string{"team-a"}, rules, nil)
 	if len(resolvedOrdered) != 1 || resolvedOrdered[0] != "team-a" {
 		t.Errorf("resolved-owner orderedTeams = %v, want [team-a] only", resolvedOrdered)
 	}
 }
 
-// TestAuthorCentric_ExternalAuthor_WatchTriggerDoesNotFire pins the firing
-// boundary for watcher teams: a team that surfaces an external/dependabot PR via
-// an explicit user watch rule gets visibility but NOT firing rights. Even with
-// an enabled ci-fix trigger and auto-delegation on, the bot must not auto-act on
-// a PR no member owns — the task stays NULL-owned for a human claim.
-func TestAuthorCentric_ExternalAuthor_WatchTriggerDoesNotFire(t *testing.T) {
+// TestOwnerLadderRouting_ExternalAuthor_WatchersFireRanked is the unit-level
+// guard for the TFAC-517 external branch: when no member owns the entity
+// (ownerSet empty — a truly external author), the opted-in watcher teams become
+// the firing candidates, ranked the same way (priority desc, then lowest team
+// id). The task is still created NULL-owned; the first watcher to win the claim
+// consolidates ownership. This is the branch that supersedes 514's "external
+// never fires."
+func TestOwnerLadderRouting_ExternalAuthor_WatchersFireRanked(t *testing.T) {
+	hi, lo := floatPtr(0.9), floatPtr(0.5)
+	// Two opted-in watcher teams, no member owner (ownerSet empty). team-w1
+	// carries the higher priority but the later-or-equal id, so priority orders.
+	watchers := []domain.EventHandler{
+		{TeamID: "team-w2", AppliesToUnowned: true, DefaultPriority: lo},
+		{TeamID: "team-w1", AppliesToUnowned: true, DefaultPriority: hi},
+	}
+	vis, owner, ordered, _, ok := ownerLadderRouting("", nil, watchers, nil)
+	if !ok {
+		t.Fatal("ownerLadderRouting ok=false, want a routable task (the watchers surface it)")
+	}
+	if owner != "" {
+		t.Errorf("ownerTeam = %q, want \"\" (NULL at creation; the fire consolidates ownership)", owner)
+	}
+	if len(vis) != 2 {
+		t.Errorf("visibleTeams = %v, want both watcher teams", vis)
+	}
+	if len(ordered) != 2 || ordered[0] != "team-w1" || ordered[1] != "team-w2" {
+		t.Errorf("orderedTeams = %v, want [team-w1 team-w2] (watchers fire, ranked by priority desc)", ordered)
+	}
+
+	// A flag-off rule contributes neither visibility nor firing for an external
+	// author: ownerSet empty + no opted-in watcher → no task at all.
+	flagOff := []domain.EventHandler{{TeamID: "team-x", DefaultPriority: hi}}
+	if _, _, _, _, ok2 := ownerLadderRouting("", nil, flagOff, nil); ok2 {
+		t.Error("ownerLadderRouting ok=true for an external author with only a flag-off rule; want no task")
+	}
+
+	// Per-handler reach (TFAC-517 option 1): the opt-in can live on a TRIGGER,
+	// not just a rule — a team configures orphan reach + auto-delegation entirely
+	// on the prompts page. A flag-on trigger (in matchedTriggers, no rule) makes
+	// the team a watcher → visible AND in the firing order. Triggers carry no
+	// DefaultPriority, so the team ranks at the 0.5 fallback.
+	trigOnly := []domain.EventHandler{
+		{TeamID: "team-trig", Kind: domain.EventHandlerKindTrigger, AppliesToUnowned: true},
+	}
+	tvis, _, tordered, _, tok := ownerLadderRouting("", nil, nil, trigOnly)
+	if !tok {
+		t.Fatal("ownerLadderRouting ok=false for a trigger-only watcher; want a routable task")
+	}
+	if len(tvis) != 1 || tvis[0] != "team-trig" {
+		t.Errorf("visibleTeams = %v, want [team-trig] (the flag-on trigger's team)", tvis)
+	}
+	if len(tordered) != 1 || tordered[0] != "team-trig" {
+		t.Errorf("orderedTeams = %v, want [team-trig] (a flag-on trigger fires on orphans)", tordered)
+	}
+
+	// A flag-off trigger (no rule) does NOT reach an orphan — preserves the
+	// over-spawn fix: a plain match-all trigger must not fire on every PR.
+	trigOff := []domain.EventHandler{
+		{TeamID: "team-trig", Kind: domain.EventHandlerKindTrigger},
+	}
+	if _, _, _, _, ok3 := ownerLadderRouting("", nil, nil, trigOff); ok3 {
+		t.Error("ownerLadderRouting ok=true for an external author with only a flag-off trigger; want no task")
+	}
+}
+
+// TestAuthorCentric_ExternalAuthor_WatchTriggerFires pins the TFAC-517 firing
+// behavior for an opted-in watcher: an external/dependabot PR is owned by no
+// member, so the team that explicitly opted into reaching unowned entities
+// (applies_to_unowned rule) AND has a configured, enabled auto-delegation may
+// now fire on it — the deliberate, eyes-open behavior that supersedes the
+// TFAC-514 blanket "external never fires." The fire consolidates ownership onto
+// the watcher (delegation.go SetOwnerTeamSystem). The no-steal invariant — a
+// watcher never beats a MEMBER team — is unaffected and covered by
+// TestAuthorCentric_TwoTeams_WatcherDoesNotStealOwnership.
+func TestAuthorCentric_ExternalAuthor_WatchTriggerFires(t *testing.T) {
 	database := newTestDB(t)
 	seedHandlerFKTargets(t, database)
 	setReviewHost(t, database)
 
 	teamC := seedTeam(t, database, "watch-team")
-	seedMatchAllCIRule(t, database, teamC) // user-authored watch rule → visibility
+	seedMatchAllCIRule(t, database, teamC) // applies_to_unowned watch rule → reach
 	enableTeamAutoDelegate(t, database, teamC)
 	seedImmediateTrigger(t, database, teamC, domain.EventGitHubPRCICheckFailed, "ci-c")
 
 	entityID := reviewEntity(t, database, "owner/repo#extwatch")
 	stub := &stubDelegator{db: database}
 	router := firingRouter(database, stub)
-	emitCI(router, entityID, "dependabot[bot]") // external, not a TF user
+	emitCI(router, entityID, "dependabot[bot]") // external — no member owns it
 
 	active, err := testTaskStore(database).FindActiveByEntity(context.Background(), runmode.LocalDefaultOrgID, entityID)
 	if err != nil || len(active) != 1 {
 		t.Fatalf("expected 1 task from the watch rule, got %d (err=%v)", len(active), err)
 	}
-	if active[0].TeamID != nil {
-		t.Errorf("owner = %v, want nil (external author; watcher confers no ownership)", *active[0].TeamID)
+	// The opted-in watcher fired and consolidated ownership onto itself: nobody
+	// else owns the orphan PR and team C accepted the risk eyes-open.
+	if stub.calls != 1 {
+		t.Fatalf("expected exactly 1 fire (opted-in watcher acts on the orphan PR), got %d", stub.calls)
 	}
-	if stub.calls != 0 {
-		t.Errorf("Delegate called %d times; a watcher team must not auto-fire on a PR no member owns", stub.calls)
+	if teamIDValue(&active[0]) != teamC {
+		t.Errorf("owner = %q after fire, want the watcher team %q (the fire consolidates ownership)", teamIDValue(&active[0]), teamC)
 	}
-	if active[0].ClaimedByAgentID != "" {
-		t.Errorf("task was bot-claimed (%q); a watcher must not claim an unowned PR", active[0].ClaimedByAgentID)
+	if active[0].ClaimedByAgentID == "" {
+		t.Error("task should be bot-claimed by the firing watcher team")
 	}
 	if vis := visTeamsOf(t, database, active[0].ID); len(vis) != 1 || vis[0] != teamC {
-		t.Errorf("visibility = %v, want [%s] (the watching team still sees it)", vis, teamC)
+		t.Errorf("visibility = %v, want [%s] (the watching team)", vis, teamC)
+	}
+}
+
+// TestAuthorCentric_ExternalAuthor_WatchTriggerOnly_Fires is the per-handler
+// reach path (TFAC-517 option 1): team C opts into orphan reach with a flag-on
+// TRIGGER and NO companion task rule — the "configure it all on the prompts
+// page" experience. On an external/dependabot PR (no member owner) the trigger
+// both surfaces the task and fires, consolidating ownership onto C. Proves the
+// reach flag is honored on triggers, not just rules.
+func TestAuthorCentric_ExternalAuthor_WatchTriggerOnly_Fires(t *testing.T) {
+	database := newTestDB(t)
+	seedHandlerFKTargets(t, database)
+	setReviewHost(t, database)
+
+	teamC := seedTeam(t, database, "watch-team")
+	enableTeamAutoDelegate(t, database, teamC)
+	// Flag-on trigger, NO rule — the trigger alone is the team's opt-in.
+	seedImmediateWatchTrigger(t, database, teamC, domain.EventGitHubPRCICheckFailed, "ci-c")
+
+	entityID := reviewEntity(t, database, "owner/repo#trigonly")
+	stub := &stubDelegator{db: database}
+	router := firingRouter(database, stub)
+	emitCI(router, entityID, "dependabot[bot]") // external — no member owns it
+
+	active, err := testTaskStore(database).FindActiveByEntity(context.Background(), runmode.LocalDefaultOrgID, entityID)
+	if err != nil || len(active) != 1 {
+		t.Fatalf("expected 1 task from the watch trigger, got %d (err=%v)", len(active), err)
+	}
+	if stub.calls != 1 {
+		t.Fatalf("expected exactly 1 fire (the flag-on trigger acts on the orphan PR), got %d", stub.calls)
+	}
+	if teamIDValue(&active[0]) != teamC {
+		t.Errorf("owner = %q after fire, want the watcher team %q (fire consolidates ownership)", teamIDValue(&active[0]), teamC)
+	}
+	if active[0].ClaimedByAgentID == "" {
+		t.Error("task should be bot-claimed by the firing watcher team")
+	}
+	if vis := visTeamsOf(t, database, active[0].ID); len(vis) != 1 || vis[0] != teamC {
+		t.Errorf("visibility = %v, want [%s] (the watching team)", vis, teamC)
+	}
+}
+
+// TestAuthorCentric_ExternalAuthor_PlainTriggerNoReach guards the over-spawn
+// fix under option 1: a team with a plain (flag-off) trigger and no watch
+// handler must NOT reach an external PR — no task, no fire. Only the explicit
+// applies_to_unowned opt-in grants orphan reach.
+func TestAuthorCentric_ExternalAuthor_PlainTriggerNoReach(t *testing.T) {
+	database := newTestDB(t)
+	seedHandlerFKTargets(t, database)
+	setReviewHost(t, database)
+
+	teamC := seedTeam(t, database, "no-reach-team")
+	enableTeamAutoDelegate(t, database, teamC)
+	seedImmediateTrigger(t, database, teamC, domain.EventGitHubPRCICheckFailed, "ci-c") // flag OFF
+
+	entityID := reviewEntity(t, database, "owner/repo#plaintrig")
+	stub := &stubDelegator{db: database}
+	router := firingRouter(database, stub)
+	emitCI(router, entityID, "dependabot[bot]") // external, not a TF user
+
+	active, err := testTaskStore(database).FindActiveByEntity(context.Background(), runmode.LocalDefaultOrgID, entityID)
+	if err != nil {
+		t.Fatalf("list tasks: %v", err)
+	}
+	if len(active) != 0 {
+		t.Fatalf("expected no task (plain trigger has no orphan reach), got %d", len(active))
+	}
+	if stub.calls != 0 {
+		t.Errorf("Delegate called %d times; a flag-off trigger must not fire on an external PR", stub.calls)
 	}
 }
 
@@ -556,9 +777,9 @@ func TestAuthorCentric_TwoTeams_WatcherDoesNotStealOwnership(t *testing.T) {
 	seedUserOnTeam(t, database, teamA, "aidan")
 	seedUserOnTeam(t, database, teamB, "aidan") // author on A and B → ambiguous
 
-	// teamC is a pure watcher: a high-priority user rule (would sort FIRST if it
-	// were in the firing order) plus an enabled trigger.
-	seedMatchAllCIRule(t, database, teamC) // priority 0.7, source=user
+	// teamC is a pure watcher: a high-priority applies_to_unowned rule (would
+	// sort FIRST if it were in the firing order) plus an enabled trigger.
+	seedMatchAllCIRule(t, database, teamC) // priority 0.7, applies_to_unowned=true
 	enableTeamAutoDelegate(t, database, teamA, teamB, teamC)
 	seedImmediateTrigger(t, database, teamA, domain.EventGitHubPRCICheckFailed, "ci-a")
 	seedImmediateTrigger(t, database, teamB, domain.EventGitHubPRCICheckFailed, "ci-b")
@@ -637,6 +858,25 @@ func seedImmediateTrigger(t *testing.T, database *sql.DB, teamID, eventType, idS
 		VALUES (?, ?, ?, ?, 'trigger', ?, NULL, 1, 'user', ?, 4, 0, datetime('now'), datetime('now'))
 	`, "trig-"+idSuffix, runmode.LocalDefaultOrgID, teamID, runmode.LocalDefaultUserID, eventType, bp); err != nil {
 		t.Fatalf("seed trigger %s for %s: %v", idSuffix, teamID, err)
+	}
+}
+
+// seedImmediateWatchTrigger is seedImmediateTrigger with applies_to_unowned=1 —
+// a trigger that opts its team into reaching unowned entities (TFAC-517 option
+// 1). With no companion rule, this alone makes the team a watcher that fires on
+// orphan PRs, the "configure it all on the prompts page" path.
+func seedImmediateWatchTrigger(t *testing.T, database *sql.DB, teamID, eventType, idSuffix string) {
+	t.Helper()
+	pid := "p-" + idSuffix
+	insertPromptForTeam(t, database, pid, teamID)
+	bp := insertBlueprintForTeam(t, database, "bp-"+idSuffix, pid, teamID)
+	if _, err := database.Exec(`
+		INSERT INTO event_handlers
+			(id, org_id, team_id, creator_user_id, kind, event_type,
+			 scope_predicate_json, enabled, source, applies_to_unowned, blueprint_id, breaker_threshold, min_autonomy_suitability, created_at, updated_at)
+		VALUES (?, ?, ?, ?, 'trigger', ?, NULL, 1, 'user', 1, ?, 4, 0, datetime('now'), datetime('now'))
+	`, "trig-"+idSuffix, runmode.LocalDefaultOrgID, teamID, runmode.LocalDefaultUserID, eventType, bp); err != nil {
+		t.Fatalf("seed watch trigger %s for %s: %v", idSuffix, teamID, err)
 	}
 }
 
