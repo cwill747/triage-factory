@@ -46,7 +46,7 @@ import { inputClass } from '../primitives'
 import JiraAccessGroup from '../JiraAccessGroup'
 import AtlassianOAuthAppCard from '../AtlassianOAuthAppCard'
 import TeamManagementSection from '../../../components/TeamManagementSection'
-import { saveOrgConfig, type OrgConfigForm } from '../orgConfig'
+import { dailyCapError, saveOrgConfig, type OrgConfigForm } from '../orgConfig'
 import { connectJira, JIRA_DEPLOYMENT_OPTIONS } from '../jiraConnect'
 import { connectAnthropic, CLAUDE_SOURCE_OPTIONS } from '../anthropicConnect'
 import { ClaudeProviderCards, AnthropicKeyField } from '../../setup/ClaudeStep'
@@ -213,6 +213,9 @@ export default function OrgSettings({
     baseline.org.max_daily_cost_usd.trim() !== '' && dailyCapValue > 0
       ? `Cap at $${dailyCapValue.toLocaleString()} / day`
       : 'No cap'
+  // Frontend input-layer validation: a typed cap must be a positive number
+  // (blank = no cap). Gates the section's Save and surfaces an inline message.
+  const dailyCapErr = dailyCapError(draft.org.max_daily_cost_usd)
 
   // ── Claude credentials ── Captured via the validated connectAnthropic
   // endpoint (never the bulk org POST). Local shows the system-vs-BYOK source
@@ -532,6 +535,7 @@ export default function OrgSettings({
         summary={dailyCapSummary}
         dirty={draft.org.max_daily_cost_usd !== baseline.org.max_daily_cost_usd}
         saving={isSaving('daily-cap')}
+        saveDisabled={dailyCapErr !== null}
         onSave={() =>
           commitOrgSlice(
             'daily-cap',
@@ -562,17 +566,29 @@ export default function OrgSettings({
               </span>
               <input
                 type="number"
-                min="0"
+                // Smallest valid positive cap (step is 0.01); aligns the native
+                // spinner/validity with dailyCapError so the arrows can't land on
+                // 0 — a value Save then rejects. Blank ("no cap") is still allowed.
+                min="0.01"
                 step="0.01"
                 inputMode="decimal"
                 placeholder="No cap"
+                aria-invalid={dailyCapErr !== null}
+                aria-describedby={dailyCapErr !== null ? 'daily-cap-error' : undefined}
                 value={draft.org.max_daily_cost_usd}
                 onChange={(e) =>
                   patch({ org: { ...draft.org, max_daily_cost_usd: e.target.value } })
                 }
-                className={`${inputClass} pl-7`}
+                className={`${inputClass} pl-7 ${
+                  dailyCapErr !== null ? 'border-dismiss/60 focus:border-dismiss/60' : ''
+                }`}
               />
             </div>
+            {dailyCapErr !== null && (
+              <span id="daily-cap-error" className="mt-1.5 block text-[11px] text-dismiss">
+                {dailyCapErr}
+              </span>
+            )}
           </label>
         </div>
       </SettingsSection>
