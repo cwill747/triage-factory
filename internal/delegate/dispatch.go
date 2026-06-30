@@ -434,7 +434,7 @@ func (s *Spawner) reactToStepTerminal(orgID string, br *domain.BlueprintRun, ste
 		if err := s.blueprints.SetRunCurrentStepSystem(context.Background(), orgID, br.ID, next); err != nil {
 			dispatchLog.Warn("set current_step_index for blueprint_run failed", "blueprint_run", br.ID, "error", err)
 		}
-		if err := s.enqueueBlueprintStep(context.Background(), orgID, br.ID, *task, plan[next].Step(br.BlueprintID), stepModelOrInherit(plan[next].Model, stepRun.Model), triggerType, creatorUserID); err != nil {
+		if err := s.enqueueBlueprintStep(context.Background(), orgID, br.ID, *task, plan[next].Step(br.BlueprintID), stepModelOrInherit(plan[next].Model, stepRun.Model), triggerType, creatorUserID, br.ActorAgentID); err != nil {
 			s.terminateBlueprint(orgID, br.ID, br.TaskID, triggerType, creatorUserID, startTime, cfg,
 				domain.BlueprintRunStatusFailed, fmt.Sprintf("enqueue step %d: %v", next, err), &stepIdx, false)
 			return
@@ -488,7 +488,11 @@ func stepModelOrInherit(stepModel, inherited string) string {
 
 // enqueueBlueprintStep mints a queued runs row for step stepIndex of a
 // blueprint_run. Shared by Delegate (step 0) and the reactor (every advance).
-func (s *Spawner) enqueueBlueprintStep(ctx context.Context, orgID, blueprintRunID string, task domain.Task, step domain.BlueprintStep, model, triggerType, creatorUserID string) error {
+// actorAgentID is the executing bot, frozen on the blueprint_run at mint and
+// passed through here so every step inherits the same runs.actor_agent_id —
+// resolved once at the delegation entry point, never re-derived from the task
+// claim (which is empty at step 0 on the event path and cleared by a takeover).
+func (s *Spawner) enqueueBlueprintStep(ctx context.Context, orgID, blueprintRunID string, task domain.Task, step domain.BlueprintStep, model, triggerType, creatorUserID, actorAgentID string) error {
 	stepIdx := step.StepIndex
 	return s.runQueue.EnqueueRun(ctx, orgID, domain.AgentRun{
 		ID:                 uuid.New().String(),
@@ -498,6 +502,7 @@ func (s *Spawner) enqueueBlueprintStep(ctx context.Context, orgID, blueprintRunI
 		Model:              model,
 		TriggerType:        triggerType,
 		CreatorUserID:      creatorUserID,
+		ActorAgentID:       actorAgentID,
 		BlueprintRunID:     blueprintRunID,
 		BlueprintStepIndex: &stepIdx,
 	})

@@ -247,6 +247,84 @@ func TestBlueprintStore_SQLite_StepPlanRoundTrip(t *testing.T) {
 	}
 }
 
+// TestBlueprintStore_SQLite_ActorAgentRoundTrip pins that the executing-bot
+// actor freezes on the blueprint_run at CreateRun and reads back on GetRun (the
+// reactor relies on this to inherit it onto each step run). The fenced event
+// insert carries it too, and an empty actor round-trips as empty.
+func TestBlueprintStore_SQLite_ActorAgentRoundTrip(t *testing.T) {
+	conn := openSQLiteForTest(t)
+	stores := sqlitestore.New(conn)
+	ctx := context.Background()
+	org := runmode.LocalDefaultOrgID
+
+	agentID, err := stores.Agents.Create(ctx, org, domain.Agent{DisplayName: "Bot"})
+	if err != nil {
+		t.Fatalf("Agents.Create: %v", err)
+	}
+	task := seedEntityEventTask(t, conn, "actor-rt")
+	insertBlueprintForTest(t, conn, "actor-bp", "Actor BP")
+
+	// Manual CreateRun freezes + reads back the actor.
+	if _, err := stores.Blueprints.CreateRun(ctx, org, domain.BlueprintRun{
+		ID: "actor-bpr", BlueprintID: "actor-bp", TaskID: task.ID,
+		TriggerType: domain.BlueprintTriggerManual, Status: domain.BlueprintRunStatusRunning,
+		WorktreePath: "/tmp/wt-actor", ActorAgentID: agentID,
+	}); err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	got, err := stores.Blueprints.GetRun(ctx, org, "actor-bpr")
+	if err != nil || got == nil {
+		t.Fatalf("GetRun = (%v, %v)", got, err)
+	}
+	if got.ActorAgentID != agentID {
+		t.Errorf("manual actor round-trip = %q, want %q", got.ActorAgentID, agentID)
+	}
+
+	// Fenced event insert (CreateRunIfNotFiredSystem — the auto-fire hot path)
+	// carries the actor too. Needs a real triggering_event_id (the task's event)
+	// and trigger_id (an event_handler) for the fence FKs.
+	var eventID string
+	if err := conn.QueryRow(`SELECT primary_event_id FROM tasks WHERE id = ?`, task.ID).Scan(&eventID); err != nil {
+		t.Fatalf("read task event id: %v", err)
+	}
+	if _, err := conn.Exec(`
+		INSERT INTO event_handlers (id, kind, event_type, blueprint_id, breaker_threshold, min_autonomy_suitability, enabled, source, creator_user_id, team_id)
+		VALUES ('actor-trig', 'trigger', ?, 'actor-bp', 4, 0, 1, 'user', ?, ?)
+	`, domain.EventGitHubPRCICheckFailed, runmode.LocalDefaultUserID, runmode.LocalDefaultTeamID); err != nil {
+		t.Fatalf("seed trigger: %v", err)
+	}
+	if inserted, err := stores.Blueprints.CreateRunIfNotFiredSystem(ctx, org, domain.BlueprintRun{
+		ID: "actor-bpr-ev", BlueprintID: "actor-bp", TaskID: task.ID,
+		TriggerType: domain.BlueprintTriggerEvent, TriggerID: "actor-trig", TriggeringEventID: eventID,
+		Status: domain.BlueprintRunStatusRunning, WorktreePath: "/tmp/wt-actor-ev", ActorAgentID: agentID,
+	}); err != nil || !inserted {
+		t.Fatalf("CreateRunIfNotFiredSystem = (%v, %v), want (true, nil)", inserted, err)
+	}
+	ev, err := stores.Blueprints.GetRun(ctx, org, "actor-bpr-ev")
+	if err != nil || ev == nil {
+		t.Fatalf("GetRun (event) = (%v, %v)", ev, err)
+	}
+	if ev.ActorAgentID != agentID {
+		t.Errorf("event (fenced) actor round-trip = %q, want %q", ev.ActorAgentID, agentID)
+	}
+
+	// No actor → empty, not an error.
+	if _, err := stores.Blueprints.CreateRun(ctx, org, domain.BlueprintRun{
+		ID: "actor-bpr-none", BlueprintID: "actor-bp", TaskID: task.ID,
+		TriggerType: domain.BlueprintTriggerManual, Status: domain.BlueprintRunStatusRunning,
+		WorktreePath: "/tmp/wt-actor-none",
+	}); err != nil {
+		t.Fatalf("CreateRun (no actor): %v", err)
+	}
+	none, err := stores.Blueprints.GetRun(ctx, org, "actor-bpr-none")
+	if err != nil || none == nil {
+		t.Fatalf("GetRun (no actor) = (%v, %v)", none, err)
+	}
+	if none.ActorAgentID != "" {
+		t.Errorf("no-actor round-trip = %q, want empty", none.ActorAgentID)
+	}
+}
+
 // TestBlueprintStore_SQLite_RunsForBlueprint_SurfacesOutcome pins the channel
 // that replaced the old per-step verdict: a step run's terminal runs.outcome
 // (and outcome_reason) round-trips through RunsForBlueprint, which is what the
