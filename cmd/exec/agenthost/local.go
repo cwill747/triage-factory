@@ -826,6 +826,8 @@ func (c *LocalClient) upsertJiraArtifact(ctx context.Context, a domain.Artifact,
 		agenthostLog.Warn("jira artifact recording failed (action already applied)",
 			"run", c.info.RunID, "kind", a.Kind, "target", a.Target, "error", err)
 	}
+	// Resolve the touched entity outside the audit write (TFAC-513 §2).
+	c.recordTouch(ctx, act)
 }
 
 // jiraSiteBase returns the org's configured Jira site URL, trailing slash
@@ -1707,6 +1709,8 @@ func (c *LocalClient) upsertGithubArtifact(ctx context.Context, a domain.Artifac
 		agenthostLog.Warn("github artifact recording failed (action already applied)",
 			"run", c.info.RunID, "kind", a.Kind, "target", a.Target, "error", err)
 	}
+	// Resolve the touched entity outside the audit write (TFAC-513 §2).
+	c.recordTouch(ctx, act)
 }
 
 // --- external-action recording (TFAC-483) ---
@@ -1766,6 +1770,89 @@ func (c *LocalClient) recordBotAction(ctx context.Context, act *domain.ExternalA
 	if err != nil {
 		agenthostLog.Warn("external-action recording failed (github write already applied)",
 			"run", c.info.RunID, "action", act.Action, "target", act.Target, "error", err)
+	}
+	// Resolve the touched entity outside the audit write (TFAC-513 §2).
+	c.recordTouch(ctx, act)
+}
+
+// --- touched-entity resolution (TFAC-513 §2) ---
+//
+// Every org-credential write the bot makes lands on an external object — a PR, a
+// Jira issue. resolveTouchedEntity turns that object's (provider, target) into an
+// entities row, returning an existing entity or a freshly-minted snapshot-less
+// stub. The returned id is the foundation the run's touched-set is built on
+// (TFAC-507 captures it per run); this ticket lands the resolver + the durable
+// entity it guarantees exists, the shared dependency exec-touch and Slack build
+// on.
+//
+// The key vocabulary is shared with the tracker, so no translation is needed:
+// ExternalAction.Provider is already the entity source ("github"/"jira") and
+// ExternalAction.Target is already the entity source_id ("owner/repo#N" /
+// "SKY-123"). A bare "owner/repo" GitHub target (no '#') is a repo-level action,
+// not an entity — skipped. That target-shape skip is also what drops a branch
+// push: branchPushAction stamps Provider="github" with a repo-level Target, so it
+// falls out here, not on the provider. Any provider we don't map to an entity
+// grain (the default arm below) likewise resolves to nothing.
+//
+// Writes route System (admin pool / BYPASSRLS), mirroring the tracker's entity
+// writes: the host records actions outside any user's RLS claims on the event
+// path, and an entity is org-wide bookkeeping that must not ride one user's tx.
+// A stub created here carries no snapshot_json; the next poll cycle enriches it
+// (TFAC-513 §3 ensures Phase-2 no longer skips a node-id-less entity). Returns
+// ("", nil) when the target isn't an entity — a normal skip, not an error.
+func (c *LocalClient) resolveTouchedEntity(ctx context.Context, act *domain.ExternalAction) (string, error) {
+	if act == nil || c.stores.Entities == nil {
+		return "", nil
+	}
+	var kind string
+	switch act.Provider {
+	case domain.ArtifactProviderGitHub:
+		// owner/repo#N is a PR entity; bare owner/repo is a repo-level action.
+		// NOTE: this assumes every github target is a PR (kind="pr"). Exec only
+		// writes PRs/reviews today, so that holds — but a GitHub *issue* shares
+		// the "owner/repo#N" shape, and the poller's resolveStubNodeID would then
+		// 404 against /pulls/{n} every cycle. GitHub issue support must branch on
+		// kind here (and give the poller an issue-aware enrichment path).
+		if _, _, _, ok := domain.ParsePRTarget(act.Target); !ok {
+			return "", nil
+		}
+		kind = "pr"
+	case domain.ArtifactProviderJira:
+		if act.Target == "" {
+			return "", nil
+		}
+		kind = "issue"
+	default:
+		return "", nil
+	}
+	// title is left empty — ExternalAction carries no human title, and the poll
+	// cycle seeds it from the upstream snapshot. url rides through when present.
+	entity, _, err := c.stores.Entities.FindOrCreateSystem(ctx, c.info.OrgID, act.Provider, act.Target, kind, "", act.URL)
+	if err != nil {
+		return "", err
+	}
+	return entity.ID, nil
+}
+
+// recordTouch resolves-or-creates the touched entity as a best-effort side step
+// in the recording funnels: a failure is logged and swallowed so it never fails
+// the agent's already-applied write (the entity self-heals on a later touch or
+// poll). It MUST run outside the audit tx — local mode holds the single SQLite
+// connection for the life of a synthetic-claims tx, so a System write inside
+// that closure would deadlock; every caller invokes this only after withWrite
+// returns.
+func (c *LocalClient) recordTouch(ctx context.Context, act *domain.ExternalAction) {
+	if act == nil {
+		return
+	}
+	id, err := c.resolveTouchedEntity(ctx, act)
+	if err != nil {
+		agenthostLog.Warn("touched-entity resolve failed (will retry on next poll)",
+			"run", c.info.RunID, "target", act.Target, "error", err)
+		return
+	}
+	if id != "" {
+		agenthostLog.Debug("resolved touched entity", "run", c.info.RunID, "entity", id, "target", act.Target)
 	}
 }
 
