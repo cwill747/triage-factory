@@ -3,7 +3,7 @@ import { motion, AnimatePresence } from 'motion/react'
 import * as Switch from '@radix-ui/react-switch'
 import * as Tooltip from '@radix-ui/react-tooltip'
 import { Info } from 'lucide-react'
-import type { TriggerHandler } from '../types'
+import type { TriggerHandler, EventType } from '../types'
 import EventBadge from './EventBadge'
 import PredicateEditor from './PredicateEditor'
 import Slider from './Slider'
@@ -49,6 +49,32 @@ export default function TriggerConfigPanel({
   const [promptName, setPromptName] = useState('')
   const [saving, setSaving] = useState(false)
   const [confirmDelete, setConfirmDelete] = useState(false)
+  // Event-type catalog, fetched once per panel open (not per trigger). Used to
+  // decide whether the applies_to_unowned toggle is meaningful for this event.
+  const [eventTypes, setEventTypes] = useState<EventType[]>([])
+
+  // Fetch the catalog once when the panel opens — it's session-static, so there's
+  // no need to re-fetch on every trigger selection. Skipped in template scope
+  // (the toggle is hidden there regardless).
+  useEffect(() => {
+    if (!open || templateScope) return
+    let cancelled = false
+    fetch('/api/event-types')
+      .then((r) => (r.ok ? r.json() : []))
+      .then((data) => {
+        if (!cancelled && Array.isArray(data)) setEventTypes(data)
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [open, templateScope])
+
+  // Hide the watch toggle only when the catalog EXPLICITLY marks this event inert
+  // (pool / requested-party). Fail-open: an unloaded/failed catalog leaves the
+  // lookup undefined, so the toggle stays available on a valid owner-ladder event.
+  const eventWatchInert =
+    eventTypes.find((et) => et.id === trigger?.event_type)?.supports_watch === false
 
   // Initialize state when trigger changes
   useEffect(() => {
@@ -269,8 +295,9 @@ export default function TriggerConfigPanel({
                     the whole orphan auto-delegation is configured here. Off by
                     default; carries an eyes-open warning. Hidden in org-template
                     scope — the flag is a team-routing concept the template doesn't
-                    carry (mirrors TaskRuleEditor). */}
-                {!templateScope && (
+                    carry (mirrors TaskRuleEditor). Also hidden for events the catalog
+                    marks inert (pool / requested-party — supports_watch=false). */}
+                {!templateScope && !eventWatchInert && (
                   <>
                     <div className="border-t border-border-subtle" />
                     <div>
