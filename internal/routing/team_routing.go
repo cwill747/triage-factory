@@ -464,11 +464,16 @@ func (r *Router) assigneeTeams(orgID string, evt domain.Event) []string {
 //     never grant visibility on their own; a team widens visibility beyond
 //     ownership only by opting in with its own rule (the deliberate watch);
 //   - ownerTeam is "" when the identity maps to multiple teams (or to none with
-//     a watch rule): the owner is unresolved, stored as NULL — the auto-fire
-//     gate for free, resolving on the first human claim;
-//   - only the owner's automation fires. A resolved owner fires its own matched
-//     triggers (acting = owner); a NULL owner fires nothing (the empty-team
-//     gate), so the bot never claims an unowned task.
+//     a watch rule): the owner is unresolved, stored as NULL — resolving on the
+//     fire or the first human claim;
+//   - firing rights belong to the IDENTITY's teams only, never to watcher teams.
+//     A resolved owner fires its own matched triggers (orderedTeams = {owner}).
+//     An ambiguous owner (identity on multiple teams) fires those teams in
+//     deterministic priority order (orderedTeams = ownerSet ranked), and the
+//     first exclusive claim consolidates the NULL owner onto the winner. An
+//     unowned identity (ownerSet empty — external author surfaced only by a
+//     watch rule) fires nothing: watcher teams get visibility but no firing
+//     rights, so the bot never auto-acts on a PR no member owns.
 //
 // ok=false means the visibility set is empty (external identity, no watching
 // rule) → no task; the caller returns without creating one.
@@ -484,9 +489,72 @@ func ownerLadderRouting(owner string, ownerSet []string, matchedRules []domain.E
 		return nil, "", nil, 0, false
 	}
 	if owner != "" {
+		// Unambiguous owner: only the owner's automation fires. Watcher teams
+		// (in vis via an explicit user rule) see the card but don't fire.
 		orderedTeams = []string{owner}
+	} else {
+		// Ambiguous owner (identity maps to multiple teams): fire
+		// deterministically rather than not at all — but only among the
+		// IDENTITY's teams (ownerSet), NOT the full visibility set. Watcher teams
+		// (in vis via an explicit user rule, but not in ownerSet) keep visibility
+		// without firing rights, same as the resolved-owner branch — otherwise a
+		// pure watcher could win the claim and consolidate itself as owner of a
+		// PR it doesn't own. Order ownerSet by the same signal the handler-team
+		// path uses — max matched-rule DefaultPriority desc, then lowest team id —
+		// so the first team to win the exclusive claim is deterministic and the
+		// fire consolidates the NULL owner onto it (delegation.go
+		// SetOwnerTeamSystem). When ownerSet is empty (external author surfaced
+		// only by a watch rule) this is empty → nothing fires; the task stays
+		// NULL-owned for the first human claim.
+		orderedTeams = orderTeamsByRulePriority(setOf(ownerSet), matchedRules)
 	}
 	return sortedKeys(vis), owner, orderedTeams, maxRuleDefaultPriority(matchedRules), true
+}
+
+// teamRulePriorityScores computes, for each team in vis, the per-team ranking
+// signal for the deterministic firing order: the max DefaultPriority across that
+// team's matched rules, falling back to the 0.5 trigger-default when the team
+// contributed only triggers (no rule carries a priority). Built in a SINGLE pass
+// over matchedRules so handlerTeamID — which logs a warning on a legacy/fixture
+// empty team_id — runs once per rule, never once per sort comparison (a
+// comparator calling it would log O(n log n) times per event). Shared by the
+// handler-team path (resolveTeamRouting) and the ambiguous owner-ladder path
+// (orderTeamsByRulePriority) so both rank teams the same way.
+func teamRulePriorityScores(vis map[string]struct{}, matchedRules []domain.EventHandler) map[string]float64 {
+	scores := make(map[string]float64, len(vis))
+	for t := range vis {
+		scores[t] = 0.5
+	}
+	for _, rule := range matchedRules {
+		tid := handlerTeamID(rule)
+		if cur, ok := scores[tid]; ok && rule.DefaultPriority != nil && *rule.DefaultPriority > cur {
+			scores[tid] = *rule.DefaultPriority
+		}
+	}
+	return scores
+}
+
+// orderTeamsByScores sorts teams into the deterministic firing order from a
+// precomputed score map: priority desc, ties broken by lowest team id. The sort
+// reads only the map, so it does no per-comparison work beyond a lookup.
+func orderTeamsByScores(teams []string, scores map[string]float64) []string {
+	sort.SliceStable(teams, func(i, j int) bool {
+		if scores[teams[i]] != scores[teams[j]] {
+			return scores[teams[i]] > scores[teams[j]]
+		}
+		return teams[i] < teams[j]
+	})
+	return teams
+}
+
+// orderTeamsByRulePriority orders a visibility set into the deterministic firing
+// order (max matched-rule DefaultPriority desc, ties broken by lowest team id).
+// It mirrors the handler-team path's ranking (resolveTeamRouting) so an
+// ambiguous owner-ladder task (NULL owner, multiple visible teams) fires in the
+// same order a multi-team handler-team task would — the first team wins the
+// exclusive claim and consolidates the owner via the fire.
+func orderTeamsByRulePriority(vis map[string]struct{}, matchedRules []domain.EventHandler) []string {
+	return orderTeamsByScores(sortedKeys(vis), teamRulePriorityScores(vis, matchedRules))
 }
 
 // latestActiveOwnedTaskTeam returns the owning team of the most recently
@@ -527,6 +595,16 @@ func explicitUserRuleTeams(matchedRules []domain.EventHandler) map[string]struct
 		if h.Source == domain.EventHandlerSourceUser {
 			out[handlerTeamID(h)] = struct{}{}
 		}
+	}
+	return out
+}
+
+// setOf collects a slice into a set, dropping duplicates. Used to turn the
+// ladder's ownerSet slice into the keyed form orderTeamsByRulePriority consumes.
+func setOf(items []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		out[it] = struct{}{}
 	}
 	return out
 }
