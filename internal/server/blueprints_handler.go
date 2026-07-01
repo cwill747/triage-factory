@@ -13,6 +13,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/delegate"
 	"github.com/sky-ai-eng/triage-factory/internal/domain"
+	"github.com/sky-ai-eng/triage-factory/internal/entitlements"
 	"github.com/sky-ai-eng/triage-factory/internal/server/authz"
 	"github.com/sky-ai-eng/triage-factory/internal/server/prompts"
 	"github.com/sky-ai-eng/triage-factory/internal/server/teamscope"
@@ -65,9 +66,40 @@ func (bh *blueprintsHandler) handleBlueprintsList(w http.ResponseWriter, r *http
 	teamID := teamscope.SingleParam(r)
 	var blueprints []domain.Blueprint
 	if err := bh.tx.WithTx(r.Context(), orgID, userID, func(tx db.TxStores) error {
-		var e error
-		blueprints, e = tx.Blueprints.List(r.Context(), orgID, teamID)
-		return e
+		listed, e := tx.Blueprints.List(r.Context(), orgID, teamID)
+		if e != nil {
+			return e
+		}
+		// One query for every trigger visible at this scope, grouped by
+		// blueprint_id, instead of a per-blueprint ListForBlueprint call
+		// (TFAC-524 code review: avoids N+1 / a longer-held tx as the
+		// blueprint count grows). Safe to scope by the same teamID as the
+		// blueprint list: a trigger's team_id is pinned to its blueprint's
+		// team_id by the (blueprint_id, team_id) composite FK, so this set
+		// is exactly what per-blueprint ListForBlueprint calls would have
+		// returned.
+		triggers, e := tx.EventHandlers.List(r.Context(), orgID, domain.EventHandlerKindTrigger, teamID)
+		if e != nil {
+			return e
+		}
+		triggersByBlueprint := make(map[string][]domain.EventHandler, len(triggers))
+		for _, tr := range triggers {
+			triggersByBlueprint[tr.BlueprintID] = append(triggersByBlueprint[tr.BlueprintID], tr)
+		}
+		// Hide a blueprint iff it has ≥1 attached trigger AND every one of its
+		// triggers' EventType fails EventTypeAllowed (TFAC-524). A blueprint
+		// with at least one allowed trigger stays (it has live non-gated
+		// behavior); a trigger-less blueprint stays (unrelated to gating).
+		// Rows persist — visibility only.
+		visible := make([]domain.Blueprint, 0, len(listed))
+		for _, bp := range listed {
+			if blueprintGatedOff(orgID, triggersByBlueprint[bp.ID]) {
+				continue
+			}
+			visible = append(visible, bp)
+		}
+		blueprints = visible
+		return nil
 	}); err != nil {
 		internalError(w, "blueprints", err)
 		return
@@ -76,6 +108,22 @@ func (bh *blueprintsHandler) handleBlueprintsList(w http.ResponseWriter, r *http
 		blueprints = []domain.Blueprint{}
 	}
 	writeJSON(w, http.StatusOK, blueprints)
+}
+
+// blueprintGatedOff reports whether every one of triggers' event types fails
+// EventTypeAllowed for orgID. A trigger-less blueprint (len(triggers) == 0)
+// is never gated off by this check — that's the pre-existing orphaned/
+// trigger-less state, unrelated to entitlement gating.
+func blueprintGatedOff(orgID string, triggers []domain.EventHandler) bool {
+	if len(triggers) == 0 {
+		return false
+	}
+	for _, tr := range triggers {
+		if entitlements.EventTypeAllowed(orgID, tr.EventType) {
+			return false
+		}
+	}
+	return true
 }
 
 // firstPromptInput is the optional inline prompt the canvas's "New Prompt"
