@@ -82,9 +82,68 @@ func (community) Has(Feature) bool { return false }
 // baseline explicitly.
 func Community() Checker { return community{} }
 
+// Limit names a quota key (per-seat/tier billing, later). The type is
+// defined here so provider implementations have a stable key type to code
+// against; no constants exist yet — they land with billing.
+type Limit string
+
+// Entitlements is an immutable snapshot of what one org is entitled to. It
+// GROWS BY FIELDS — a quota added later touches nothing structural. The
+// zero value denies every feature and reports every limit as unset.
+type Entitlements struct {
+	features map[Feature]struct{}
+	limits   map[Limit]int
+}
+
+// Has reports whether the snapshot grants f.
+func (e Entitlements) Has(f Feature) bool { _, ok := e.features[f]; return ok }
+
+// Limit returns the quota value for l, or (0, false) if l is absent — absent
+// means unlimited/unset, not zero.
+func (e Entitlements) Limit(l Limit) (int, bool) { v, ok := e.limits[l]; return v, ok }
+
+// New builds an Entitlements snapshot from a feature list and a limits map.
+// Both are copied into fresh maps so the returned value is a true immutable
+// snapshot — a caller that mutates (or keeps mutating) the slice/map it
+// passed in, or reuses one map across multiple For(orgID) results, can never
+// reach back into a live Entitlements. That copy is also what makes
+// concurrent Has/Limit reads across goroutines safe: nothing outside this
+// package ever holds a reference to the backing maps. Exported so ee/
+// providers can construct one — the struct's fields stay unexported so only
+// this package can shape the invariants.
+func New(features []Feature, limits map[Limit]int) Entitlements {
+	fs := make(map[Feature]struct{}, len(features))
+	for _, f := range features {
+		fs[f] = struct{}{}
+	}
+	ls := make(map[Limit]int, len(limits))
+	for k, v := range limits {
+		ls[k] = v
+	}
+	return Entitlements{features: fs, limits: ls}
+}
+
+// Provider resolves the Entitlements snapshot for one org. Implementations
+// GROW BY IMPLEMENTATIONS (Static, the ee license provider, later an ee
+// Stripe provider) — per-org only, no deployment-scope accessor.
+type Provider interface {
+	For(orgID string) Entitlements
+}
+
+// staticProvider yields the same Entitlements for every org.
+type staticProvider struct{ ent Entitlements }
+
+func (s staticProvider) For(string) Entitlements { return s.ent }
+
+// Static returns a Provider that grants features (no limits) to every org
+// alike. Static() with no arguments is the community default: nothing
+// entitled, for any org.
+func Static(features ...Feature) Provider { return staticProvider{ent: New(features, nil)} }
+
 var (
-	mu     sync.RWMutex
-	active Checker = community{}
+	mu       sync.RWMutex
+	active   Checker  = community{} // LEGACY: only the SSO mount-gate reads this; removed by the SSO ticket
+	provider Provider = Static()    // per-org default: everything off
 )
 
 // Active returns the registered checker, or the community checker if none
@@ -110,10 +169,34 @@ func Register(c Checker) {
 	active = c
 }
 
+// RegisterProvider installs the process-wide per-org Provider. Called once,
+// from package main via ee.Install, after a license token has been verified.
+// A nil provider is ignored, mirroring Register's nil-guard.
+func RegisterProvider(p Provider) {
+	if p == nil {
+		return
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	provider = p
+}
+
+// For returns the entitlements snapshot for orgID from the registered
+// Provider, or the Static (everything off) default if none has been
+// registered. Safe to call from any goroutine, including during boot before
+// ee.Install runs.
+func For(orgID string) Entitlements {
+	mu.RLock()
+	p := provider
+	mu.RUnlock()
+	return p.For(orgID)
+}
+
 // Reset restores the community default. Intended for tests that register
 // a stub checker and need to avoid leaking it into sibling tests.
 func Reset() {
 	mu.Lock()
 	defer mu.Unlock()
 	active = community{}
+	provider = Static()
 }
