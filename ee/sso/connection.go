@@ -24,6 +24,7 @@ import (
 
 	ssostore "github.com/sky-ai-eng/triage-factory/ee/sso/store"
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/entitlements"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/server/authz"
 	"github.com/sky-ai-eng/triage-factory/internal/server/httpx"
@@ -142,8 +143,8 @@ func (h *ssoConnectionHandler) currentConnection(ctx context.Context, orgID, use
 }
 
 // adminGate resolves the active org + caller and confirms org-admin. On any
-// failure it has already written the response (404 for local/non-admin,
-// etc.). The shared preamble for all three handlers.
+// failure it has already written the response (404 for local/unlicensed-org/
+// non-admin, etc.). The shared preamble for all three handlers.
 func (h *ssoConnectionHandler) adminGate(w http.ResponseWriter, r *http.Request) (orgID, userID string, ok bool) {
 	if runmode.Current() == runmode.ModeLocal {
 		http.NotFound(w, r)
@@ -151,6 +152,10 @@ func (h *ssoConnectionHandler) adminGate(w http.ResponseWriter, r *http.Request)
 	}
 	orgID, ok = httpx.RequireOrg(w, r)
 	if !ok {
+		return "", "", false
+	}
+	if !entitlements.For(orgID).Has(entitlements.FeatureSSO) {
+		http.NotFound(w, r)
 		return "", "", false
 	}
 	userID = httpx.ClaimsFrom(r.Context()).Subject
