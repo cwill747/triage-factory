@@ -46,9 +46,10 @@ func (r *Router) handlerScopeMatchesEvent(evt domain.Event, h domain.EventHandle
 }
 
 // teamTracksEventScope dispatches the tracking lookup on the event's
-// source: github: → team↔repo (SKY-375), jira: → team↔project (SKY-376).
-// Each branch fails open when its store is unwired so the gate degrades
-// to "no drop" in pre-ticket / test wiring; any other source is ungated.
+// source: github: → team↔repo (SKY-375), jira: → team↔project (SKY-376), a
+// registered event source (e.g. ee/slack) → its TracksScope hook. Each
+// branch fails open when its store is unwired so the gate degrades to "no
+// drop" in pre-ticket / test wiring; any other source is ungated.
 func (r *Router) teamTracksEventScope(evt domain.Event, teamID string) bool {
 	switch {
 	case strings.HasPrefix(evt.EventType, "github:"):
@@ -62,6 +63,9 @@ func (r *Router) teamTracksEventScope(evt domain.Event, teamID string) bool {
 		}
 		return r.teamTracksEventProject(evt, teamID)
 	default:
+		if hooks, ok := sourceHooksFor(evt.EventType); ok {
+			return hooks.TracksScope(context.Background(), evt, teamID)
+		}
 		return true
 	}
 }
