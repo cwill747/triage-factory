@@ -672,7 +672,7 @@ func newDirectCommand(runCtx context.Context, opts RunOptions, nodeArgs []string
 	}
 	if piEnabled() {
 		if len(creds) != 0 || opts.ClaudeAIConnectors {
-			return nil, errors.New("Pi runtime uses Pi credentials, not stored Claude credentials or claude.ai connectors")
+			return nil, errors.New("pi runtime uses Pi credentials, not stored Claude credentials or claude.ai connectors")
 		}
 	}
 	var auth operatorAuth

@@ -27,7 +27,7 @@ func runtimeWrapper(ctx context.Context) (string, error) {
 			return "", err
 		}
 		if _, err := os.Stat(filepath.Join(root, "dist", "index.js")); err != nil {
-			return "", fmt.Errorf("Pi SDK at %s: %w", root, err)
+			return "", fmt.Errorf("pi SDK at %s: %w", root, err)
 		}
 		dir := paths.SDKDir()
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -45,13 +45,15 @@ func runtimeWrapper(ctx context.Context) (string, error) {
 func piAgentDir() (string, error) {
 	dir := strings.TrimSpace(os.Getenv("PI_CODING_AGENT_DIR"))
 	if dir == "" {
-		home, err := os.UserHomeDir()
+		// Pi's operator-owned config is outside TF's persistent state paths.
+		home, err := os.UserHomeDir() //nolint:forbidigo
 		if err != nil {
 			return "", err
 		}
 		dir = filepath.Join(home, ".pi", "agent")
 	} else if dir == "~" || strings.HasPrefix(dir, "~/") {
-		home, err := os.UserHomeDir()
+		// Pi's operator-owned config is outside TF's persistent state paths.
+		home, err := os.UserHomeDir() //nolint:forbidigo
 		if err != nil {
 			return "", err
 		}
@@ -83,7 +85,7 @@ func piPackageRoot() (string, error) {
 	}
 	bin, err := exec.LookPath("pi")
 	if err != nil {
-		return "", fmt.Errorf("Pi not found: install @earendil-works/pi-coding-agent or set TF_PI_SDK_PATH to its package directory")
+		return "", fmt.Errorf("pi not found: install @earendil-works/pi-coding-agent or set TF_PI_SDK_PATH to its package directory")
 	}
 	bin, err = filepath.EvalSymlinks(bin)
 	if err != nil {
