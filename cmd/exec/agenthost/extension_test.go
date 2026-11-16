@@ -21,6 +21,30 @@ import (
 // internal/routing/source_registry_test.go).
 const fakeExtensionFeature = entitlements.Feature("test-fake-extension")
 
+func TestCoreExtensionNeedsNoEntitlement(t *testing.T) {
+	t.Cleanup(ResetExtensions)
+	t.Cleanup(entitlements.Reset)
+	entitlements.Reset()
+	ran := false
+	RegisterExtension("core-test", "", func(context.Context, ExtensionRuntime, string, json.RawMessage) (json.RawMessage, error) {
+		ran = true
+		return json.RawMessage(`{}`), nil
+	})
+	for _, feature := range RegisteredExtensionFeatures() {
+		if feature == "" {
+			t.Fatal("core extension registered an empty entitlement")
+		}
+	}
+	stores, _ := newTestDB(t)
+	client := NewLocal(stores, ConversationInfo{OrgID: runmode.LocalDefaultOrgID, ConversationID: "conv-1"})
+	if _, err := client.CallExtension(t.Context(), "core-test", "do", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !ran {
+		t.Fatal("core handler did not run")
+	}
+}
+
 func noopExtensionHandler(context.Context, ExtensionRuntime, string, json.RawMessage) (json.RawMessage, error) {
 	return nil, nil
 }

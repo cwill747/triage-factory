@@ -64,8 +64,9 @@ type TeamActivitySource struct {
 
 // TeamActivityTracked is one unit of the team's tracked set and its flow over
 // the window: a GitHub repository (UnitID is its registry row id), a Jira
-// project (its jira_projects row id) or a Linear team (its Linear UUID) —
-// the ids the source pages key their rows on. A tracked unit that was quiet
+// project (its jira_projects row id), a Linear team (its Linear UUID), or a
+// Vikunja project (its installation URL followed by /projects/<id>).
+// A tracked unit that was quiet
 // in the window is a row of zeros; a unit the team does not track has no row.
 // Slack has no tracked set, so it has no rows.
 //

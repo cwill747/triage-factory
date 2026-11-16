@@ -457,8 +457,9 @@ const (
 	CredentialJiraOrg   = "jira_org"
 	// CredentialLinearOrg is the org's Linear service identity: the app user
 	// of a workspace install, or the human whose API key the org bound.
-	CredentialLinearOrg = "linear_org"
-	CredentialSlackBot  = "slack_bot"
+	CredentialLinearOrg  = "linear_org"
+	CredentialVikunjaOrg = "vikunja_org"
+	CredentialSlackBot   = "slack_bot"
 	// CredentialNone is the honest value for an action that spent no credential
 	// at all: the sandbox egress denial, where nothing left the box and no
 	// external system was ever reached. The column is NOT NULL, so a refused

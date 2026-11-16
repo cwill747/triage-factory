@@ -74,6 +74,12 @@ func stampScopeInfo(ctx context.Context, stores db.Stores, orgID string, a *doma
 	}
 	if act != nil {
 		act.Scope = domain.ExternalObjectScope(act.Provider, settings)
+		if act.Provider == domain.ProviderVikunja {
+			act.Scope, err = entityscope.Of(ctx, stores, orgID, act.Provider)
+			if err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

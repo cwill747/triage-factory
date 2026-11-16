@@ -77,6 +77,7 @@ export const SOURCE_OPTIONS: { value: SourceFilter; label: string }[] = [
   { value: 'all', label: 'All' },
   { value: 'github', label: 'GitHub' },
   { value: 'jira', label: 'Jira' },
+  { value: 'vikunja', label: 'Vikunja' },
   { value: 'slack', label: 'Slack' },
 ]
 

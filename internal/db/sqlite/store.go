@@ -196,6 +196,7 @@ func New(conn *sql.DB) db.Stores {
 		// OrgEventSources is split-pool in Postgres; SQLite collapses to the
 		// one connection (N=1, no RLS) and asserts the local org instead.
 		OrgEventSources: newOrgEventSourceStore(conn),
+		VikunjaProjects: newVikunjaProjectStore(conn, conn),
 		// RateLimitReadings is split-pool in Postgres; SQLite collapses to
 		// the one connection (N=1, no RLS) and asserts the local org instead.
 		RateLimitReadings: newRateLimitReadingStore(conn),
