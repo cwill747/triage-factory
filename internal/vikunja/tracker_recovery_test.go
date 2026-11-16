@@ -73,6 +73,79 @@ func TestTrackerDiscoversUninitializedEntities(t *testing.T) {
 	}
 }
 
+func TestTrackerUnchangedPollPreservesTerminalFence(t *testing.T) {
+	for _, terminalType := range []string{domain.EventVikunjaTaskCompleted, domain.EventSystemEntityCloseOwed} {
+		t.Run(terminalType, func(t *testing.T) {
+			h, api := regressionTracker(t)
+			ctx := t.Context()
+			org := runmode.LocalDefaultOrgID
+			c := Connection{BaseURL: "https://tasks.example"}
+			task := Task{ID: 42, ProjectID: 7, Title: "task"}
+			if err := h.observe(ctx, org, c, task); err != nil {
+				t.Fatal(err)
+			}
+			available := api.published[0]
+			work, _, err := api.stores.Tasks.FindOrCreateAtSystem(ctx, org, runmode.LocalDefaultTeamID, *available.EntityID, available.EventType, "", available.ID, 0.5, time.Now().UTC())
+			if err != nil || work == nil {
+				t.Fatalf("seed task = %+v, %v", work, err)
+			}
+			if terminalType == domain.EventSystemEntityCloseOwed {
+				if _, err := api.stores.Entities.ClearSnapshotsForSourceSystem(ctx, org, "vikunja"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			task.Done = true
+			if err := h.observe(ctx, org, c, task); err != nil {
+				t.Fatal(err)
+			}
+			if len(api.published) != 2 || api.published[1].EventType != terminalType {
+				t.Fatalf("terminal event = %v", api.published)
+			}
+			terminal := api.published[1]
+			entity, err := api.stores.Entities.GetSystem(ctx, org, *terminal.EntityID)
+			if err != nil || entity == nil {
+				t.Fatalf("entity = %+v, %v", entity, err)
+			}
+			fence := entity.PollSeq
+			for i := 0; i < 3; i++ {
+				if err := h.observe(ctx, org, c, task); err != nil {
+					t.Fatal(err)
+				}
+			}
+			entity, err = api.stores.Entities.GetSystem(ctx, org, entity.ID)
+			if err != nil || entity == nil || entity.PollSeq != fence || entity.LastPolledAt == nil {
+				t.Fatalf("no-op poll moved the fence: %+v, %v; want %d", entity, err, fence)
+			}
+			if len(api.published) != 2 {
+				t.Fatalf("no-op poll emitted another event: %v", api.published)
+			}
+			queued, err := api.stores.EventQueue.ListForEntity(ctx, org, entity.ID)
+			if err != nil || len(queued) != 2 {
+				t.Fatalf("queue = %+v, %v", queued, err)
+			}
+			var judgedAt *int64
+			for _, row := range queued {
+				if row.EventType == terminalType {
+					judgedAt = row.EntityPollSeq
+				}
+			}
+			if judgedAt == nil || *judgedAt != fence {
+				t.Fatal("terminal row lost its snapshot fence")
+			}
+			// Exercise the same guarded close used by the queue worker, rather
+			// than a direct HandleEvent call that carries no poll version.
+			closed, err := api.stores.Entities.CloseTerminalSystem(ctx, org, entity.ID, judgedAt, []string{domain.EventVikunjaTaskAvailable}, "entity_closed", terminalType, terminal.ID)
+			if err != nil || !closed.Closed {
+				t.Fatalf("queued close was made stale: %+v, %v", closed, err)
+			}
+			work, err = api.stores.Tasks.GetSystem(ctx, org, work.ID)
+			if err != nil || work == nil || work.Status != "done" {
+				t.Fatalf("work stayed open: %+v, %v", work, err)
+			}
+		})
+	}
+}
+
 type closeOnlyDelegator struct {
 	routing.Delegator
 	closed []string

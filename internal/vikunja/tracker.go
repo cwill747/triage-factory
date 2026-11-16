@@ -97,32 +97,44 @@ func (h *integration) observe(ctx context.Context, org string, c Connection, tas
 		et = ""
 	}
 	if et == "" && current.Done {
-		// Retry a lost close via the shared durable close obligation. The outbox
-		// coalesces it while an earlier terminal transition is still unsettled.
-		et = domain.EventSystemEntityCloseOwed
-	}
-	var batch []domain.Event
-	if et != "" {
-		var metadata any = events.VikunjaTaskMetadata{TaskID: task.ID, ProjectID: task.ProjectID, Title: task.Title, Done: task.Done, Priority: task.Priority}
-		if et == domain.EventSystemEntityCloseOwed {
-			metadata = events.SystemEntityCloseOwedMetadata{Reason: events.SystemEntityCloseOwedReasonTerminalSnapshot}
-		}
-		meta, err := json.Marshal(metadata)
+		unsettled, err := s.EventQueue.UnsettledCloseExistsSystem(ctx, org, entity.ID)
 		if err != nil {
 			return err
 		}
-		batch = []domain.Event{{OrgID: org, EntityID: &entity.ID, EventType: et, MetadataJSON: string(meta)}}
-	}
-	won, ids, err := s.EventQueue.EnqueueBatchWithSnapshotCAS(ctx, org, entity.ID, string(encoded), entity.PollSeq, batch, nil)
-	if err != nil || !won {
-		return err
-	}
-	for i := range batch {
-		if ids[i] == "" {
-			continue
+		if !unsettled {
+			et = domain.EventSystemEntityCloseOwed
 		}
-		batch[i].ID = ids[i]
-		h.api.PublishPreEnqueued(ctx, batch[i])
+	}
+	// A no-op refresh must not invalidate the fence of a completion or repair
+	// still waiting in the queue. Display enrichment remains retryable below.
+	if et == "" && previous != nil && *previous == current {
+		if err := s.Entities.MarkPolledSystem(ctx, org, entity.ID); err != nil {
+			return err
+		}
+	} else {
+		var batch []domain.Event
+		if et != "" {
+			var metadata any = events.VikunjaTaskMetadata{TaskID: task.ID, ProjectID: task.ProjectID, Title: task.Title, Done: task.Done, Priority: task.Priority}
+			if et == domain.EventSystemEntityCloseOwed {
+				metadata = events.SystemEntityCloseOwedMetadata{Reason: events.SystemEntityCloseOwedReasonTerminalSnapshot}
+			}
+			meta, err := json.Marshal(metadata)
+			if err != nil {
+				return err
+			}
+			batch = []domain.Event{{OrgID: org, EntityID: &entity.ID, EventType: et, MetadataJSON: string(meta)}}
+		}
+		won, ids, err := s.EventQueue.EnqueueBatchWithSnapshotCAS(ctx, org, entity.ID, string(encoded), entity.PollSeq, batch, nil)
+		if err != nil || !won {
+			return err
+		}
+		for i := range batch {
+			if ids[i] == "" {
+				continue
+			}
+			batch[i].ID = ids[i]
+			h.api.PublishPreEnqueued(ctx, batch[i])
+		}
 	}
 	// Display fields are retryable enrichment, not transition consumption.
 	if _, err := s.Entities.UpdateTitleSystem(ctx, org, entity.ID, task.Title); err != nil {
