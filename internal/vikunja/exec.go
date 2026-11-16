@@ -73,7 +73,7 @@ func teamRoutes(ctx context.Context, stores db.Stores, org, teamID string) (Conn
 		return Connection{}, err
 	}
 	if team == nil || team.DeletedAt != nil {
-		return Connection{}, fmt.Errorf("Vikunja: an active team is required")
+		return Connection{}, fmt.Errorf("vikunja: an active team is required")
 	}
 	var projects []ProjectRoute
 	for _, p := range c.Projects {
@@ -110,7 +110,7 @@ func authorizeProject(ctx context.Context, stores db.Stores, info agenthost.Conv
 			return projectAuthorization{BaseURL: c.BaseURL, CredentialID: credentialID(c.Token)}, nil
 		}
 	}
-	return nil, fmt.Errorf("Vikunja project is not routed to this team")
+	return nil, fmt.Errorf("vikunja project is not routed to this team")
 }
 
 func handleExec(ctx context.Context, rt agenthost.ExtensionRuntime, method string, raw json.RawMessage) (json.RawMessage, error) {
@@ -131,7 +131,7 @@ func handleExec(ctx context.Context, rt agenthost.ExtensionRuntime, method strin
 		return nil, fmt.Errorf("unknown Vikunja method %q", method)
 	}
 	if method == "edit" || method == "create" {
-		if err := a.TaskPatch.validate(method == "create"); err != nil {
+		if err := a.validate(method == "create"); err != nil {
 			return nil, err
 		}
 	}
@@ -144,7 +144,7 @@ func handleExec(ctx context.Context, rt agenthost.ExtensionRuntime, method strin
 	}
 	var c Connection
 	if err := json.Unmarshal(credential, &c); err != nil || c.Token == "" {
-		return nil, fmt.Errorf("Vikunja is not configured for this run")
+		return nil, fmt.Errorf("vikunja is not configured for this run")
 	}
 	client, err := NewClient(c.BaseURL, c.Token)
 	if err != nil {
@@ -157,7 +157,7 @@ func handleExec(ctx context.Context, rt agenthost.ExtensionRuntime, method strin
 		return nil, err
 	}
 	if current.BaseURL != c.BaseURL || current.CredentialID != credentialID(c.Token) {
-		return nil, fmt.Errorf("Vikunja connection changed; start a new run")
+		return nil, fmt.Errorf("vikunja connection changed; start a new run")
 	}
 	var task Task
 	var document json.RawMessage
@@ -177,14 +177,14 @@ func handleExec(ctx context.Context, rt agenthost.ExtensionRuntime, method strin
 		}
 	}
 	if !sealed {
-		return nil, fmt.Errorf("Vikunja project is outside this run's credential scope")
+		return nil, fmt.Errorf("vikunja project is outside this run's credential scope")
 	}
 	var auth projectAuthorization
 	if err := rt.Relay(ctx, "vikunja", "authorize_project", execArgs{ProjectID: a.ProjectID}, &auth); err != nil {
 		return nil, err
 	}
 	if auth.BaseURL != c.BaseURL || auth.CredentialID != credentialID(c.Token) {
-		return nil, fmt.Errorf("Vikunja installation changed; start a new run")
+		return nil, fmt.Errorf("vikunja installation changed; start a new run")
 	}
 	if method == "list" {
 		tasks, err := client.Tasks(ctx, a.ProjectID)

@@ -1,11 +1,12 @@
 package postgres_test
 
 import (
+	"testing"
+
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/db/dbtest"
 	"github.com/sky-ai-eng/triage-factory/internal/db/pgtest"
 	pgstore "github.com/sky-ai-eng/triage-factory/internal/db/postgres"
-	"testing"
 )
 
 func TestVikunjaProjectStore_Postgres_Conformance(t *testing.T) {

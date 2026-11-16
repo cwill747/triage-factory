@@ -72,9 +72,9 @@ func (h *integration) observe(ctx context.Context, org string, c Connection, tas
 			return fmt.Errorf("invalid Vikunja task snapshot: %w", err)
 		}
 	}
-	// Initial state is a quiet baseline, as on the existing issue trackers:
-	// discovery of an already-done task must not create historical work.
-	if previous == nil && current.Done {
+	// A task first discovered as done has no work to close. An existing row
+	// may have open tasks even with no snapshot, so it must use the outbox.
+	if created && current.Done {
 		_, err := s.Entities.CloseWithSnapshotCASSystem(ctx, org, entity.ID, string(encoded), entity.PollSeq)
 		return err
 	}
@@ -90,9 +90,10 @@ func (h *integration) observe(ctx context.Context, org string, c Connection, tas
 		return nil
 	}
 	et := transition(previous, current)
-	// A cleared snapshot belongs to an existing entity, not new discovery.
-	// Seed it quietly so resuming a paused source cannot replay old work.
-	if previous == nil && !created {
+	// The project identity is written atomically with the first snapshot and
+	// survives a pause. Unlike row existence, it distinguishes a cleared
+	// baseline from a stub or a discovery whose enqueue failed.
+	if previous == nil && entity.VikunjaProjectID != 0 {
 		et = ""
 	}
 	if et == "" && current.Done {
@@ -102,7 +103,11 @@ func (h *integration) observe(ctx context.Context, org string, c Connection, tas
 	}
 	var batch []domain.Event
 	if et != "" {
-		meta, err := json.Marshal(events.VikunjaTaskMetadata{TaskID: task.ID, ProjectID: task.ProjectID, Title: task.Title, Done: task.Done, Priority: task.Priority})
+		var metadata any = events.VikunjaTaskMetadata{TaskID: task.ID, ProjectID: task.ProjectID, Title: task.Title, Done: task.Done, Priority: task.Priority}
+		if et == domain.EventSystemEntityCloseOwed {
+			metadata = events.SystemEntityCloseOwedMetadata{Reason: events.SystemEntityCloseOwedReasonTerminalSnapshot}
+		}
+		meta, err := json.Marshal(metadata)
 		if err != nil {
 			return err
 		}

@@ -91,7 +91,7 @@ func (c *Client) request(ctx context.Context, method, path string, payload any, 
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("Vikunja request failed: %w", err)
+		return nil, fmt.Errorf("vikunja request failed: %w", err)
 	}
 	defer resp.Body.Close()
 	// Do not echo response bodies: reverse proxies can include credentials.
@@ -99,14 +99,14 @@ func (c *Client) request(ctx context.Context, method, path string, payload any, 
 		return resp.Header, nil
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("Vikunja returned HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("vikunja returned HTTP %d", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20+1))
 	if err != nil {
 		return nil, err
 	}
 	if len(body) > 8<<20 {
-		return nil, fmt.Errorf("Vikunja response exceeds 8 MiB")
+		return nil, fmt.Errorf("vikunja response exceeds 8 MiB")
 	}
 	if err := json.Unmarshal(body, out); err != nil {
 		return nil, fmt.Errorf("invalid Vikunja JSON response")
@@ -118,7 +118,7 @@ func (c *Client) Project(ctx context.Context, id int64) (Project, error) {
 	var p Project
 	_, err := c.get(ctx, "/projects/"+strconv.FormatInt(id, 10), &p)
 	if err == nil && p.ID != id {
-		err = fmt.Errorf("Vikunja returned a different project")
+		err = fmt.Errorf("vikunja returned a different project")
 	}
 	return p, err
 }
@@ -127,7 +127,7 @@ func (c *Client) Task(ctx context.Context, id int64) (Task, error) {
 	var t Task
 	_, err := c.get(ctx, "/tasks/"+strconv.FormatInt(id, 10), &t)
 	if err == nil && t.ID != id {
-		err = fmt.Errorf("Vikunja returned a different task")
+		err = fmt.Errorf("vikunja returned a different task")
 	}
 	return t, err
 }
@@ -143,10 +143,10 @@ func (c *Client) Tasks(ctx context.Context, projectID int64) ([]Task, error) {
 		}
 		for _, t := range batch.Items {
 			if t.ID <= 0 || t.ProjectID != projectID {
-				return nil, fmt.Errorf("Vikunja returned a task outside the requested project")
+				return nil, fmt.Errorf("vikunja returned a task outside the requested project")
 			}
 			if seen[t.ID] {
-				return nil, fmt.Errorf("Vikunja pagination repeated a task; retry on the next poll")
+				return nil, fmt.Errorf("vikunja pagination repeated a task; retry on the next poll")
 			}
 			seen[t.ID] = true
 			tasks = append(tasks, t)
@@ -155,5 +155,5 @@ func (c *Client) Tasks(ctx context.Context, projectID int64) ([]Task, error) {
 			return tasks, nil
 		}
 	}
-	return nil, fmt.Errorf("Vikunja pagination limit exceeded")
+	return nil, fmt.Errorf("vikunja pagination limit exceeded")
 }

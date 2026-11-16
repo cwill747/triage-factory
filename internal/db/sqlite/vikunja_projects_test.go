@@ -1,11 +1,12 @@
 package sqlite_test
 
 import (
+	"testing"
+
 	"github.com/sky-ai-eng/triage-factory/internal/db"
 	"github.com/sky-ai-eng/triage-factory/internal/db/dbtest"
 	sqlitestore "github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
-	"testing"
 )
 
 func TestVikunjaProjectStore_SQLite_Conformance(t *testing.T) {

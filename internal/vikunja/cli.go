@@ -65,9 +65,10 @@ func parseCLI(args []string) (string, execArgs, error) {
 			return "", a, fmt.Errorf("use a positive numeric task ID")
 		}
 		a.ID, rest = id, rest[1:]
-		if method == "edit" {
+		switch method {
+		case "edit":
 			allowed = map[string]bool{"--title": true, "--description": true, "--priority": true}
-		} else if method == "comment" {
+		case "comment":
 			allowed["--body"] = true
 		}
 	default:
@@ -107,7 +108,7 @@ func parseCLI(args []string) (string, execArgs, error) {
 		return "", a, fmt.Errorf("--project is required")
 	}
 	if method == "create" || method == "edit" {
-		if err := a.TaskPatch.validate(method == "create"); err != nil {
+		if err := a.validate(method == "create"); err != nil {
 			return "", a, err
 		}
 	}

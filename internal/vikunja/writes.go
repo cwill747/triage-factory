@@ -47,7 +47,7 @@ func (c *Client) createTask(ctx context.Context, project int64, patch TaskPatch)
 	var result Task
 	_, err := c.request(ctx, http.MethodPost, "/projects/"+strconv.FormatInt(project, 10)+"/tasks", patch, &result)
 	if err == nil && (result.ID <= 0 || result.ProjectID != project) {
-		err = fmt.Errorf("Vikunja create returned an unexpected identity; verify the project before retrying")
+		err = fmt.Errorf("vikunja create returned an unexpected identity; verify the project before retrying")
 	}
 	return result, err
 }
@@ -56,7 +56,7 @@ func (c *Client) updateTask(ctx context.Context, task Task, patch TaskPatch) (Ta
 	var result Task
 	_, err := c.request(ctx, http.MethodPatch, "/tasks/"+strconv.FormatInt(task.ID, 10), patch, &result)
 	if err == nil && (result.ID != task.ID || result.ProjectID != task.ProjectID) {
-		err = fmt.Errorf("Vikunja update returned an unexpected identity; verify the task before retrying")
+		err = fmt.Errorf("vikunja update returned an unexpected identity; verify the task before retrying")
 	}
 	return result, err
 }
@@ -85,14 +85,14 @@ func (c *Client) comments(ctx context.Context, id int64) ([]Comment, error) {
 			return result, nil
 		}
 	}
-	return nil, fmt.Errorf("Vikunja comment pagination limit exceeded")
+	return nil, fmt.Errorf("vikunja comment pagination limit exceeded")
 }
 
 func (c *Client) comment(ctx context.Context, id int64, body string) (Comment, error) {
 	var result Comment
 	_, err := c.request(ctx, http.MethodPost, "/tasks/"+strconv.FormatInt(id, 10)+"/comments", map[string]string{"comment": body}, &result)
 	if err == nil && result.ID <= 0 {
-		err = fmt.Errorf("Vikunja comment returned no identity; verify comments before retrying")
+		err = fmt.Errorf("vikunja comment returned no identity; verify comments before retrying")
 	}
 	return result, err
 }

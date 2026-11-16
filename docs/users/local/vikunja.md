@@ -41,8 +41,10 @@ continue to be refreshed so their eventual completion can close existing work.
 Missing tasks or failed reads never imply completion. Turning the Vikunja event
 source off suspends polling and agent access while retaining configuration.
 Re-enabling establishes a quiet baseline for previously known tasks; changes
-made during the pause do not trigger new work. A failed task or project read
-does not prevent other tasks and projects from being refreshed.
+made during the pause do not trigger new work. Tasks completed during the pause
+still close their existing Triage Factory tasks without triggering completion
+automation. A failed task or project read does not prevent other tasks and
+projects from being refreshed.
 
 ## Agent commands
 

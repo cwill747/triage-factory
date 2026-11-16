@@ -60,8 +60,12 @@ func TestTrackerPauseReseedsExistingEntities(t *testing.T) {
 			}
 			task.Title, task.Done = "during pause", done
 			observe()
-			if len(api.published) != 1 {
-				t.Fatalf("resuming replayed work: %v", api.published)
+			wantEvents := 1
+			if done {
+				wantEvents = 2
+			}
+			if len(api.published) != wantEvents || done && api.published[1].EventType != domain.EventSystemEntityCloseOwed {
+				t.Fatalf("resuming replayed automation or lost the close obligation: %v", api.published)
 			}
 			entity, err := api.stores.Entities.GetBySourceSystem(t.Context(), org, "vikunja", c.BaseURL, "42")
 			if err != nil || entity == nil || entity.SnapshotJSON == "" || entity.VikunjaProjectID != 7 {
