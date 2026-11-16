@@ -206,7 +206,7 @@ func TestMemoryBackedFS(t *testing.T) {
 // with. The stand-in forks its "sandbox", a child whose argv carries boot,
 // after a pause; the score here is a raise, which needs no privilege.
 func TestLowerOOMScoreOnceBooted_WaitsForTheSandbox(t *testing.T) {
-	cmd := exec.Command("sh", "-c", `sleep 0.5; sh -c 'sleep 30' boot & wait`)
+	cmd := exec.Command("sh", "-c", `sleep 0.5; sh -c 'sleep 30 & wait' boot & wait`)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

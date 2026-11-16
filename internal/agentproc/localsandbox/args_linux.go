@@ -40,6 +40,9 @@ func Args(spec Spec, host Host) ([]string, error) {
 	if spec.AllowedSignersFile != "" {
 		paths = append(paths, spec.AllowedSignersFile)
 	}
+	if spec.PiAuthFile != "" {
+		paths = append(paths, spec.PiAuthFile)
+	}
 	for _, p := range paths {
 		if !filepath.IsAbs(p) {
 			return nil, fmt.Errorf("localsandbox: %q is not an absolute path (the mount plan binds every path at its real location)", p)
@@ -117,8 +120,11 @@ func Args(spec Spec, host Host) ([]string, error) {
 	// this run's transcript directory, both rw. The rest of ~/.claude is
 	// whatever Claude Code creates on the home tmpfs during the run, so
 	// nothing else the run writes there reaches the host.
-	args = appendBindTry(args, "--bind-try", filepath.Join(host.ClaudeDir, claudeCredentialsFile))
-	args = append(args, "--bind", spec.ClaudeProjectDir, spec.ClaudeProjectDir)
+	if !spec.SkipClaude {
+		args = appendBindTry(args, "--bind-try", filepath.Join(host.ClaudeDir, claudeCredentialsFile))
+		args = append(args, "--bind", spec.ClaudeProjectDir, spec.ClaudeProjectDir)
+	}
+	args = appendBindTry(args, "--bind-try", spec.PiAuthFile)
 	args = appendBindTry(args, "--ro-bind-try", host.HooksDir, host.GHBinDir)
 	args = appendBindTry(args, "--bind-try", spec.GHChannelDir)
 	args = append(args, "--bind", spec.RunRoot, spec.RunRoot)
@@ -141,6 +147,9 @@ func Args(spec Spec, host Host) ([]string, error) {
 		args = append(args, "--bind", dir, dir)
 	}
 
+	if host.Path != "" {
+		args = append(args, "--setenv", "PATH", host.Path)
+	}
 	args = append(args,
 		"--die-with-parent",
 		"--chdir", host.Cwd,
@@ -196,8 +205,10 @@ func Preflight(spec Spec, host Host) error {
 	if err := checkClaudeProjectDir(spec, host); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(spec.ClaudeProjectDir, 0o700); err != nil {
-		return fmt.Errorf("localsandbox: create %s: %w", spec.ClaudeProjectDir, err)
+	if !spec.SkipClaude {
+		if err := os.MkdirAll(spec.ClaudeProjectDir, 0o700); err != nil {
+			return fmt.Errorf("localsandbox: create %s: %w", spec.ClaudeProjectDir, err)
+		}
 	}
 	if err := mustExist(spec.RunRoot, "run root"); err != nil {
 		return err
@@ -226,6 +237,9 @@ func Preflight(spec Spec, host Host) error {
 // path the operator's own sessions read. Preflight checks it too, because
 // Preflight creates the directory and runs before Args.
 func checkClaudeProjectDir(spec Spec, host Host) error {
+	if spec.SkipClaude {
+		return nil
+	}
 	if host.ClaudeDir == "" {
 		return errors.New("localsandbox: Host.ClaudeDir is required")
 	}

@@ -560,7 +560,7 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	// "Node not on PATH" — surface them to the caller so the run lands
 	// in failed state with a clear message rather than spawning a
 	// broken subprocess.
-	wrapperPath, err := ensureSDKTraced(runCtx)
+	wrapperPath, err := runtimeWrapper(runCtx)
 	if err != nil {
 		return nil, fmt.Errorf("agent runtime: %w", err)
 	}
@@ -582,12 +582,14 @@ func Run(ctx context.Context, opts RunOptions, sink Sink) (*Outcome, error) {
 	// TF_CLAUDE_BINARY override: point the SDK at a specific Claude binary.
 	// Validated here so a bad path fails the spawn with a clear message
 	// rather than an opaque SDK exec error.
-	bin, berr := claudeBinaryOverride()
-	if berr != nil {
-		return nil, berr
-	}
-	if bin != "" {
-		nodeArgs = append(nodeArgs, "--claude-bin", bin)
+	if !piEnabled() {
+		bin, berr := claudeBinaryOverride()
+		if berr != nil {
+			return nil, berr
+		}
+		if bin != "" {
+			nodeArgs = append(nodeArgs, "--claude-bin", bin)
+		}
 	}
 	directCmd, derr := newDirectCommand(runCtx, opts, nodeArgs)
 	if derr != nil {
@@ -668,8 +670,13 @@ func newDirectCommand(runCtx context.Context, opts RunOptions, nodeArgs []string
 	if err != nil {
 		return nil, fmt.Errorf("resolve credentials for org %q: %w", opts.OrgID, err)
 	}
+	if piEnabled() {
+		if len(creds) != 0 || opts.ClaudeAIConnectors {
+			return nil, errors.New("Pi runtime uses Pi credentials, not stored Claude credentials or claude.ai connectors")
+		}
+	}
 	var auth operatorAuth
-	if len(creds) == 0 {
+	if len(creds) == 0 && !piEnabled() {
 		auth = loadOperatorAuth()
 	}
 	if auth.settings != "" {
@@ -766,6 +773,22 @@ func newDirectCommand(runCtx context.Context, opts RunOptions, nodeArgs []string
 	// resolved.
 	parentEnv = append(parentEnv, auth.env...)
 	cmd.Env = githooks.DirectAgentEnv(mergeEnv(parentEnv, hookEnv, creds), identityPairs...)
+	if opts.LocalSandbox != nil {
+		// NixOS's nix-ld defaults live under the masked /run profile.
+		// Resolve the loader and library paths, never bind the whole profile.
+		for _, key := range []string{"NIX_LD", "NIX_LD_LIBRARY_PATH"} {
+			if value := os.Getenv(key); value != "" {
+				cmd.Env = append(filterEnv(cmd.Env, []string{key}), key+"="+localsandbox.VisiblePath(value))
+			}
+		}
+	}
+	if piEnabled() {
+		root, err := piPackageRoot()
+		if err != nil {
+			return nil, err
+		}
+		cmd.Env = append(filterEnv(cmd.Env, []string{"TF_PI_SDK_PATH"}), "TF_PI_SDK_PATH="+root)
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		// Process is non-nil here because the watcher only fires after

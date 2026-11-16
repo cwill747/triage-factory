@@ -164,6 +164,13 @@ type Spec struct {
 	// must sit directly under Host.ClaudeDir/projects.
 	ClaudeProjectDir string
 
+	// SkipClaude leaves Claude credentials and transcripts masked for other runtimes.
+	SkipClaude bool
+
+	// PiAuthFile is the single Pi credential file, bound rw for OAuth refresh.
+	// Its parent stays private; settings and extensions are never bound back.
+	PiAuthFile string
+
 	// AgentHostSocket is the host path of this run's agenthost socket, bound
 	// at AgentHostSocketDest. Empty leaves the run with no exec-verb daemon,
 	// which the jailed CLI reports as a launch wiring bug rather than
@@ -249,4 +256,7 @@ type Host struct {
 	// directory it derives from it — is the same one the host sees.
 	// Required.
 	Cwd string
+
+	// Path, when set, replaces PATH inside the namespace (see VisiblePath).
+	Path string
 }

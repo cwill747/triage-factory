@@ -513,6 +513,14 @@ func applyPatch(ctx context.Context, wtDir, patchPath string) error {
 // ResolveClaudeProjectCwd) because Claude Code keys the dir name off the
 // resolved cwd.
 func ClaudeSessionPath(resolvedCwd, sessionID string) (string, error) {
+	// Pi transcripts live in the run tree and are also carried by the scratch
+	// snapshot. Keep the resume coordinate relative so a rebuilt root works.
+	if name, ok := strings.CutPrefix(sessionID, "pi:"); ok {
+		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\\`) || !strings.HasSuffix(name, ".jsonl") {
+			return "", fmt.Errorf("pi session path: invalid session id")
+		}
+		return filepath.Join(resolvedCwd, "_tfac", "pi", "sessions", name), nil
+	}
 	if sessionID == "" {
 		return "", fmt.Errorf("claude session path: empty session id")
 	}
