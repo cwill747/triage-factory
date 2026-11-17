@@ -20,12 +20,15 @@ env:
 jobs:
   cla:
     runs-on: ubuntu-latest
+    # The App and signature store belong to upstream, not forks.
     if: |
-      (github.event_name == 'pull_request_target') ||
-      (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request != null &&
-       (github.event.comment.body == 'recheck' ||
-        contains(github.event.comment.body, 'I have read the CLA Document and I hereby sign the CLA')))
+      github.repository == 'sky-ai-eng/triage-factory' &&
+      ((github.event_name == 'pull_request_target') ||
+       (github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request != null &&
+        (github.event.comment.body == 'recheck' ||
+         contains(github.event.comment.body,
+           'I have read the CLA Document and I hereby sign the CLA'))))
     steps:
       - name: Generate App Token
         id: app-token
