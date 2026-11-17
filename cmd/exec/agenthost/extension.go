@@ -43,6 +43,7 @@ var reservedExtensionNamespaces = map[string]bool{
 	"gh": true, "jira": true, "workspace": true, "memory": true,
 }
 
+// An empty feature registers a core extension with no enterprise gate.
 // RegisterExtension registers a handler for a verb namespace (the exec
 // subcommand name, e.g. "slack"), gated by feature. Called from an ee
 // package's init() or extension install() — a handler that needs db.Stores
@@ -80,7 +81,9 @@ func ResetExtensions() {
 func RegisteredExtensionFeatures() []entitlements.Feature {
 	seen := map[entitlements.Feature]struct{}{}
 	for _, reg := range extensionRegistry {
-		seen[reg.feature] = struct{}{}
+		if reg.feature != "" {
+			seen[reg.feature] = struct{}{}
+		}
 	}
 	out := make([]entitlements.Feature, 0, len(seen))
 	for f := range seen {
@@ -95,10 +98,9 @@ func RegisteredExtensionFeatures() []entitlements.Feature {
 // author cannot forget the entitlement gate or the source-pause gate: unknown
 // namespace → error; feature not held by the run's org → error; namespace's
 // event source turned off by an org admin → error; otherwise the handler runs
-// with the run's identity. In a CLI process the entitlements Provider is
-// always the Static (everything off) default (see main.go's
-// dispatchCLI/ee.Install ordering), so this always refuses there; in the
-// daemon process the real Provider decides.
+// with the run's identity. An empty registered feature denotes a core
+// extension and skips only the entitlement gate; source pause still applies.
+// Licensed extensions require the run's org to hold their feature.
 func callExtension(ctx context.Context, rt Runtime, namespace, method string, args json.RawMessage) (json.RawMessage, error) {
 	reg, ok := extensionRegistry[namespace]
 	if !ok {
@@ -108,12 +110,14 @@ func callExtension(ctx context.Context, rt Runtime, namespace, method string, ar
 	// relays to the orchestrator (the sidecar process has no entitlements
 	// provider); on all/local it checks in-process. rt satisfies the narrower
 	// ExtensionRuntime the handler receives.
-	allowed, err := rt.CheckEntitlement(ctx, string(reg.feature))
-	if err != nil {
-		return nil, fmt.Errorf("%s: check entitlement: %w", namespace, err)
-	}
-	if !allowed {
-		return nil, &SourceRefusal{Kind: namespace, State: domain.SourceUnlicensed}
+	if reg.feature != "" {
+		allowed, err := rt.CheckEntitlement(ctx, string(reg.feature))
+		if err != nil {
+			return nil, fmt.Errorf("%s: check entitlement: %w", namespace, err)
+		}
+		if !allowed {
+			return nil, &SourceRefusal{Kind: namespace, State: domain.SourceUnlicensed}
+		}
 	}
 	// Gate on the org's source pause the same way, and here rather than in any
 	// one provider's handler: an extension namespace IS its event-source kind

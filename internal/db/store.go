@@ -502,6 +502,9 @@ type Stores struct {
 	// JWT-less readers.
 	OrgEventSources OrgEventSourceStore
 
+	// VikunjaProjects owns the installation-scoped project-to-team routes.
+	VikunjaProjects VikunjaProjectStore
+
 	// RateLimitReadings owns the rate_limit_readings table — the latest
 	// reading of every rate-limit bucket an org's credentials are metered on,
 	// written by each serving process's flusher so any control pod can answer
@@ -643,6 +646,7 @@ type TxStores struct {
 	ConversationPendingInput ConversationPendingInputStore
 	Permissions              PermissionStore
 	OrgEventSources          OrgEventSourceStore
+	VikunjaProjects          VikunjaProjectStore
 	RateLimitReadings        RateLimitReadingStore
 	ModelAvailability        ModelAvailabilityStore
 	OrgCommitSigners         OrgCommitSignerStore

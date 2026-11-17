@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"strconv"
 	"strings"
 	"time"
 )
@@ -94,6 +95,13 @@ func EntityRefForExternal(provider, target, externalID string) (ref EntityRef, k
 			return EntityRef{}, "", false
 		}
 		return EntityRef{Source: provider, SourceID: identifier, ExternalID: externalID}, "issue", true
+	case ProviderVikunja:
+		id, err := strconv.ParseInt(target, 10, 64)
+		if err != nil || id <= 0 {
+			return EntityRef{}, "", false
+		}
+		key := strconv.FormatInt(id, 10)
+		return EntityRef{Source: provider, SourceID: key, ExternalID: key}, "task", true
 	case ProviderSlack:
 		if target == "" {
 			return EntityRef{}, "", false
@@ -169,6 +177,9 @@ type Entity struct {
 	// snapshot's project, so it follows a move; a project key rename moves
 	// nothing, and clearing the snapshot leaves it.
 	JiraProjectID string `json:"jira_project_id,omitempty"`
+	// VikunjaProjectID is the installation-local project id from the latest
+	// snapshot. It survives a source pause so tracked-set reads remain scoped.
+	VikunjaProjectID int64 `json:"vikunja_project_id,omitempty"`
 	// Kind is "pr" | "issue" | "epic" for the poller-backed sources. For
 	// Slack, kind encodes thread engagement: "thread" when the bot is why
 	// the thread exists (its root message was a mention, or a conversation posted

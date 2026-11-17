@@ -1,5 +1,5 @@
-export type TaskSource = 'github' | 'jira' | 'linear' | 'slack'
-export type EntityKind = 'pr' | 'issue' | 'epic' | 'message'
+export type TaskSource = 'github' | 'jira' | 'linear' | 'slack' | 'vikunja'
+export type EntityKind = 'pr' | 'issue' | 'epic' | 'message' | 'task'
 
 export interface Task {
   id: string

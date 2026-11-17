@@ -341,16 +341,29 @@ const factoryLinearTeamTrackedExists = `EXISTS (
 	  AND lr.linear_workspace_id = (SELECT os.linear_workspace_id FROM org_settings os WHERE os.org_id = e.org_id)
 )`
 
+// Org admins can configure every route, but the belt remains a membership read.
+// A claims-less system read on the admin pool has no viewer to narrow it to.
+const factoryVikunjaProjectTrackedQuery = `
+	SELECT 1 FROM vikunja_project_routes vr
+	JOIN teams vt ON vt.id = vr.team_id AND vt.org_id = vr.org_id
+	WHERE vr.org_id = e.org_id AND vr.scope = e.scope
+	  AND vr.project_id = e.vikunja_project_id AND vt.deleted_at IS NULL
+	  AND (tf.current_user_id() IS NULL OR tf.user_in_team(vr.team_id))
+`
+
+const factoryVikunjaProjectTrackedExists = `EXISTS (` + factoryVikunjaProjectTrackedQuery + `)`
+
 // factoryEntityTrackedExists is the combined tracked-set membership
 // predicate correlated against an entities row (alias e): a github entity
-// in a tracked repo, a jira entity in a tracked project, or a linear entity
-// in a tracked Linear team. Entities of any other source (slack) have no
+// in a tracked repo, a Jira or Vikunja entity in a tracked project, or a Linear
+// entity in a tracked Linear team. Entities of other sources (slack) have no
 // tracked-set notion and never match — they are off the factory belt by
 // construction.
 const factoryEntityTrackedExists = `(
 	(e.source = 'github' AND ` + factoryGitHubRepoTrackedExists + `)
 	OR (e.source = 'jira' AND ` + factoryJiraProjectTrackedExists + `)
 	OR (e.source = 'linear' AND ` + factoryLinearTeamTrackedExists + `)
+	OR (e.source = 'vikunja' AND ` + factoryVikunjaProjectTrackedExists + `)
 )`
 
 // factoryGitHubRepoTrackedForTeams / factoryJiraProjectTrackedForTeams /
@@ -390,11 +403,16 @@ func factoryLinearTeamTrackedForTeams(placeholders string) string {
 	)`
 }
 
+func factoryVikunjaProjectTrackedForTeams(placeholders string) string {
+	return `EXISTS (` + factoryVikunjaProjectTrackedQuery + ` AND vr.team_id IN (` + placeholders + `))`
+}
+
 func factoryEntityTrackedForTeams(placeholders string) string {
 	return `(
 		(e.source = 'github' AND ` + factoryGitHubRepoTrackedForTeams(placeholders) + `)
 		OR (e.source = 'jira' AND ` + factoryJiraProjectTrackedForTeams(placeholders) + `)
 		OR (e.source = 'linear' AND ` + factoryLinearTeamTrackedForTeams(placeholders) + `)
+		OR (e.source = 'vikunja' AND ` + factoryVikunjaProjectTrackedForTeams(placeholders) + `)
 	)`
 }
 

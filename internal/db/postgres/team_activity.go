@@ -35,7 +35,7 @@ var _ db.TeamActivityStore = (*teamActivityStore)(nil)
 // teamActivityEventSources mirrors factoryEntityTrackedExists's arms: the
 // sources for which a tracked set — and therefore a team event count —
 // exists.
-var teamActivityEventSources = []string{"github", "jira", "linear"}
+var teamActivityEventSources = []string{"github", "jira", "linear", "vikunja"}
 
 // teamActivityTaskTeamPredicate scopes a tasks row (alias t) to the subject
 // team, bound at $4: owned by it, or visible to it through task_teams while
@@ -59,6 +59,7 @@ const pgTeamActivityUnitKey = `COALESCE(CASE e.source
 		WHEN 'github' THEN e.repository_id::text
 		WHEN 'jira' THEN e.jira_project_id::text
 		WHEN 'linear' THEN e.linear_team_id
+		WHEN 'vikunja' THEN e.scope || '/projects/' || e.vikunja_project_id::text
 	END, '')`
 
 // pgTeamActivityTrackedSet lists the subject team's tracked set, bound at $1
@@ -79,7 +80,12 @@ const pgTeamActivityTrackedSet = `
 	FROM linear_team_rules lr
 	JOIN teams tm ON tm.id = lr.team_id
 	WHERE tm.org_id = $1 AND lr.team_id = $2
-	  AND lr.linear_workspace_id = (SELECT os.linear_workspace_id FROM org_settings os WHERE os.org_id = $1)`
+	  AND lr.linear_workspace_id = (SELECT os.linear_workspace_id FROM org_settings os WHERE os.org_id = $1)
+	UNION ALL
+	SELECT 'vikunja', vr.scope || '/projects/' || vr.project_id::text
+	FROM vikunja_project_routes vr
+	JOIN teams vt ON vt.id = vr.team_id AND vt.org_id = vr.org_id
+	WHERE vr.org_id = $1 AND vr.team_id = $2 AND vt.deleted_at IS NULL`
 
 func (s *teamActivityStore) TeamActivity(ctx context.Context, orgID, teamID string, since, until time.Time) (domain.TeamActivity, error) {
 	sinceArg, untilArg := since.UTC(), until.UTC()

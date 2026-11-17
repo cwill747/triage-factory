@@ -89,7 +89,7 @@ export const OBJECT_KINDS = Object.keys(OBJECT_META) as ObjectKind[]
 // OBJECT_PROVIDERS backs the Objects lens's provider filter: the systems a
 // run's change can land in. 'network' (an egress denial) never names an
 // object.
-export const OBJECT_PROVIDERS = ['github', 'jira', 'linear', 'slack'] as const
+export const OBJECT_PROVIDERS = ['github', 'jira', 'linear', 'slack', 'vikunja'] as const
 
 // PROVIDER_LABEL names the external systems for the activity feed's provider
 // filters (internal/domain Provider*), across both lenses' vocabularies.
@@ -98,6 +98,7 @@ export const PROVIDER_LABEL: Record<string, string> = {
   jira: 'Jira',
   slack: 'Slack',
   linear: 'Linear',
+  vikunja: 'Vikunja',
   network: 'Network',
 }
 

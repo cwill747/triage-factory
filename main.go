@@ -18,6 +18,8 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/runmode"
 	"github.com/sky-ai-eng/triage-factory/internal/secretenv"
 
+	_ "github.com/sky-ai-eng/triage-factory/internal/vikunja"
+
 	// Enterprise Edition SSO: registers its store factories, route installer,
 	// and LoginExtension via init(). Gated at runtime on the `sso` entitlement.
 	_ "github.com/sky-ai-eng/triage-factory/ee/sso"

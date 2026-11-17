@@ -178,6 +178,7 @@ func (s *Store) txStoresFromTx(tx *sql.Tx) db.TxStores {
 		ConversationPendingInput: newConversationPendingInputStore(tx),
 		Permissions:              newPermissionStore(tx),
 		OrgEventSources:          newOrgEventSourceStore(tx),
+		VikunjaProjects:          newVikunjaProjectStore(tx, tx),
 		RateLimitReadings:        newRateLimitReadingStore(tx),
 		ModelAvailability:        newModelAvailabilityStore(tx),
 		OrgCommitSigners:         newOrgCommitSignerStore(tx),

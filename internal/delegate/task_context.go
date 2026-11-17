@@ -79,6 +79,8 @@ func BuildTaskContext(task domain.Task, container, metadataJSON, skeleton string
 		add("Project", container)
 	case "linear":
 		add("Issue", task.EntitySourceID)
+	case "vikunja":
+		add("Vikunja task", task.EntitySourceID)
 	}
 
 	var meta map[string]any

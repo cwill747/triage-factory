@@ -107,10 +107,11 @@ func (a Deliverable) Actionable() bool {
 // Provider discriminators, shared by deliverables (always github) and the
 // external-action ledger.
 const (
-	ProviderGitHub = "github"
-	ProviderJira   = "jira"
-	ProviderLinear = "linear"
-	ProviderSlack  = "slack"
+	ProviderGitHub  = "github"
+	ProviderJira    = "jira"
+	ProviderLinear  = "linear"
+	ProviderSlack   = "slack"
+	ProviderVikunja = "vikunja"
 	// ProviderNetwork is the provider for an action whose target is a
 	// bare network destination rather than an object in a named system — the
 	// sandbox egress proxy's refused CONNECT, whose host is arbitrary
@@ -155,7 +156,7 @@ const (
 func Providers() []string {
 	return []string{
 		ProviderGitHub, ProviderJira, ProviderLinear,
-		ProviderSlack, ProviderNetwork,
+		ProviderSlack, ProviderVikunja, ProviderNetwork,
 	}
 }
 
@@ -256,7 +257,7 @@ func EntityResource(source, scope, externalID string) string {
 	if externalID == "" {
 		return ""
 	}
-	if source == ProviderJira {
+	if source == ProviderJira || source == ProviderVikunja {
 		return JiraIssueResource(scope, externalID)
 	}
 	return externalID

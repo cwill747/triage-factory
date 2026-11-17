@@ -150,6 +150,12 @@ const (
 	EventLinearIssueIdentifierChanged = "linear:issue:identifier_changed"
 )
 
+const (
+	EventVikunjaTaskAvailable = "vikunja:task:available"
+	EventVikunjaTaskUpdated   = "vikunja:task:updated"
+	EventVikunjaTaskCompleted = "vikunja:task:completed"
+)
+
 // Slack events. Registered from ee/slack (an out-of-core source; see
 // internal/domain/events.NewSchema) — the ID constant and catalog entry
 // still live here, universal-seed like every other event type (TFAC-524's
@@ -243,6 +249,7 @@ func EntityTerminatingEventTypes() []string {
 		EventJiraIssueUnreachable,
 		EventLinearIssueCompleted,
 		EventLinearIssueUnreachable,
+		EventVikunjaTaskCompleted,
 	}
 }
 
@@ -316,6 +323,11 @@ func AllEventTypes() []EventType {
 		{ID: EventGitHubPRMerged, Source: "github", Category: "pr", Label: "PR Merged", Description: "A pull request was merged"},
 		{ID: EventGitHubPRClosed, Source: "github", Category: "pr", Label: "PR Closed", Description: "A pull request was closed without merging"},
 		{ID: EventGitHubPRUnreachable, Source: "github", Category: "pr", Label: "PR Unreachable", Description: "Triage Factory no longer follows a tracked pull request — the org's GitHub base URL now names another host, which cannot vouch for the old host's objects. Never asked of GitHub"},
+
+		// --- Vikunja ---
+		{ID: EventVikunjaTaskAvailable, Source: "vikunja", Category: "task", Label: "Task Available", Description: "An open task was discovered in a tracked Vikunja project"},
+		{ID: EventVikunjaTaskUpdated, Source: "vikunja", Category: "task", Label: "Task Updated", Description: "The title, description or priority of a tracked Vikunja task changed"},
+		{ID: EventVikunjaTaskCompleted, Source: "vikunja", Category: "task", Label: "Task Completed", Description: "A tracked Vikunja task was marked done"},
 
 		// --- Jira ---
 		{ID: EventJiraIssueAssigned, Source: "jira", Category: "issue", Label: "Issue Assigned", Description: "Issue was assigned to you"},

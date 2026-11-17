@@ -28,6 +28,7 @@ const sqliteTeamActivityUnitKey = `COALESCE(CASE e.source
 		WHEN 'github' THEN e.repository_id
 		WHEN 'jira' THEN e.jira_project_id
 		WHEN 'linear' THEN e.linear_team_id
+		WHEN 'vikunja' THEN e.scope || '/projects/' || CAST(e.vikunja_project_id AS TEXT)
 	END, '')`
 
 func (s *teamActivityStore) TeamActivity(ctx context.Context, orgID, _ string, since, until time.Time) (domain.TeamActivity, error) {
@@ -134,8 +135,13 @@ func (s *teamActivityStore) TeamActivity(ctx context.Context, orgID, _ string, s
 		UNION
 		SELECT 'linear', lr.linear_team_id FROM linear_team_rules lr
 		WHERE lr.linear_workspace_id <> ''
-		  AND lr.linear_workspace_id = (SELECT os.linear_workspace_id FROM org_settings os WHERE os.org_id = ?)`,
-		orgID)
+		  AND lr.linear_workspace_id = (SELECT os.linear_workspace_id FROM org_settings os WHERE os.org_id = ?)
+		UNION
+		SELECT 'vikunja', vr.scope || '/projects/' || CAST(vr.project_id AS TEXT)
+		FROM vikunja_project_routes vr
+		JOIN teams vt ON vt.id = vr.team_id AND vt.org_id = vr.org_id
+		WHERE vr.org_id = ? AND vt.deleted_at IS NULL`,
+		orgID, orgID)
 	if err != nil {
 		return domain.TeamActivity{}, err
 	}
