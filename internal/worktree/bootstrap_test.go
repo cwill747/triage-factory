@@ -50,6 +50,9 @@ func withTestHome(t *testing.T) string {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
+	// XDG/global Git config can live outside HOME (notably on NixOS).
+	t.Setenv("GIT_CONFIG_GLOBAL", os.DevNull)
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
 	t.Setenv("TMPDIR", t.TempDir())
 	return home
 }

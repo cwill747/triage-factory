@@ -40,6 +40,53 @@ State lives in SQLite, credentials live in the OS keychain or an encrypted file,
 
 **Self-hosted (multi-tenant)** — your whole org, on Linux hosts you control. The same binary and schema, deployed with Docker Compose as a control + executor split: Postgres with per-org row-level security, SSO/SAML sign-in, audit logs, and Slack ingest via the [Enterprise Edition](ee/), a `/usage` dashboard with per-team and org-wide spend caps, and every agent run confined to its own gVisor sandbox. See [self-hosting](docs/users/self-hosting/README.md) to stand one up.
 
+## Pi coding agent (local, experimental)
+
+This fork also supports the Pi coding-agent SDK for local runs. Claude remains
+the default; select Pi explicitly when starting the server:
+
+```bash
+TF_AGENT_RUNTIME=pi \
+  TF_PI_MODEL=anthropic/claude-sonnet-4-5 triagefactory
+```
+
+Install `@earendil-works/pi-coding-agent` and configure its provider credentials
+first (for example, with Pi's `/login` or provider API-key environment variables).
+The adapter discovers the SDK from `pi` on `PATH`, including Nix installations.
+Set `TF_PI_SDK_PATH` to the package directory containing `dist/index.js` if
+automatic discovery is unavailable. Node.js must also be on `PATH`.
+
+`TF_PI_MODEL` accepts a Pi `provider/model-id` and overrides TF's Claude-oriented
+model selection for all Pi calls, including background one-shot calls. If omitted,
+TF's configured model must match an installed Pi model ID. Pi uses its own provider
+configuration and credentials; stored TF Claude credentials and Claude AI
+connectors are not supported. Earendil Works' **Radius** gateway is supported:
+run `/login radius` in Pi, choose a model from `/model`, and set
+`TF_PI_MODEL=radius/<model-id>`. `RADIUS_API_KEY` is also supported by Pi. Radius
+catalogs are read from Pi's cache and can refresh over the network at startup.
+
+The adapter supports TF tools, permission approval, tool-batch context, live
+follow-up messages, interruption, usage reporting, and Pi session resume. Pi and
+Claude sessions are not interchangeable. Pi sessions live under the run's
+`_tfac/pi/sessions` directory. Operator/repository extensions, skills, prompt
+templates, context files, and settings are not automatically loaded; TF supplies
+the system prompt and tool policy. Restricted Bash grants deliberately require
+approval for compound shell commands rather than approximating Claude's shell
+parser.
+
+**Pi retains TF's default-on Linux local bubblewrap sandbox for delegated runs.**
+It masks the operator's home, TF state, temporary directories and `/run`, keeps a
+private PID namespace, and exposes only this run's tree and explicit grants.
+Pi's `auth.json` is bound writable for OAuth refresh; `models.json` and the cached
+model catalog are read-only. Settings/extensions and Claude credentials remain
+masked. `PI_CODING_AGENT_DIR` selects a non-default Pi configuration directory;
+prefer keeping it under your home so its parent is private inside the sandbox.
+Catalog updates stay in memory, while session transcripts persist in the run tree.
+As with TF's Claude local runtime, this is courtesy isolation (same user, shared
+network), not the multi-tenant gVisor security boundary. Toolless background jobs
+remain direct calls. Pi is still unsupported in multi-tenant mode. Set
+`TF_AGENT_RUNTIME=claude` (or unset it) to return to the existing runtime.
+
 ## Security & isolation
 
 Triage Factory runs code written by an AI agent acting on untrusted input such as repository contents, issue text, and tool output. Confining that agent, isolating tenants from one another, and keeping real credentials out of reach is central to the product's design. The model below is the self-hosted, multi-tenant posture on Linux; local mode is a single user on their own machine, where runs execute in isolated git worktrees and most security features don't apply.

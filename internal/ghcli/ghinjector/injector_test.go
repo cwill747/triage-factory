@@ -524,6 +524,11 @@ func TestInjector_WriteAuditReadsCreatedObject(t *testing.T) {
 	gotReq := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		b, _ := io.ReadAll(r.Body)
+		if r.Method != http.MethodPost {
+			// Enrichment reads are not the write whose body is asserted.
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		gotReq <- string(b)
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(respBody))
@@ -807,6 +812,13 @@ func TestInjector_RESTWritesAreUnaffectedByTheGraphQLCapture(t *testing.T) {
 	const reqBody = `{"body":"a REST comment"}`
 	gotReq := make(chan string, 1)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Identity enrichment may GET the linked PR before the write audit
+		// is delivered. Only the original POST belongs in gotReq; sending
+		// enrichment into its one-slot channel can deadlock server cleanup.
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		b, _ := io.ReadAll(r.Body)
 		gotReq <- string(b)
 		w.WriteHeader(http.StatusCreated)

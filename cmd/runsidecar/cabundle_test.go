@@ -3,6 +3,7 @@ package runsidecar
 import (
 	"context"
 	"crypto/x509"
+	"encoding/asn1"
 	"encoding/pem"
 	"slices"
 	"testing"
@@ -78,7 +79,19 @@ func TestRuntime_StartProxiesWritesTheCABundle(t *testing.T) {
 				if block == nil {
 					break
 				}
-				c, err := x509.ParseCertificate(block.Bytes)
+				if block.Type != "CERTIFICATE" && block.Type != "TRUSTED CERTIFICATE" {
+					continue
+				}
+				der := block.Bytes
+				if block.Type == "TRUSTED CERTIFICATE" {
+					// OpenSSL appends X509_AUX trust metadata to the certificate.
+					var cert asn1.RawValue
+					if _, err := asn1.Unmarshal(der, &cert); err != nil {
+						t.Fatalf("invalid trusted certificate: %v", err)
+					}
+					der = cert.FullBytes
+				}
+				c, err := x509.ParseCertificate(der)
 				if err != nil {
 					t.Fatalf("bundle holds an unparsable certificate: %v", err)
 				}

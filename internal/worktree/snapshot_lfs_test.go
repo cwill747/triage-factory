@@ -270,6 +270,11 @@ func TestCaptureUncommitted_FetchedLFSFileStaysOut(t *testing.T) {
 					}
 				}
 
+				// The planted clean-only filter tests capture, not restore. It
+				// lives in the shared bare config and must not rewrite the patch
+				// during restore (or require an undefined smudge filter).
+				gitAt(t, wtDir, "config", "--unset", "filter.lfs.clean")
+				gitAt(t, wtDir, "config", "--unset", "filter.lfs.required")
 				if err := os.RemoveAll(wtDir); err != nil {
 					t.Fatal(err)
 				}

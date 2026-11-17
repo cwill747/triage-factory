@@ -45,6 +45,16 @@ func withCaptureJailEnv(t *testing.T, fn func()) {
 	}
 	defer setAll(saved)
 	setAll(sandbox.CaptureJailEnv())
+	// These tests run on the host, not the jail image with git in /usr/bin.
+	// Keep all capture security overrides but use the host tool search path.
+	for _, kv := range saved {
+		if path, ok := strings.CutPrefix(kv, "PATH="); ok {
+			if err := os.Setenv("PATH", path); err != nil {
+				t.Fatal(err)
+			}
+			break
+		}
+	}
 	fn()
 }
 

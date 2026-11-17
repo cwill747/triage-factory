@@ -62,7 +62,7 @@ func TestSandbox_IsolationProperties(t *testing.T) {
 
 	claudeDir := filepath.Join(home, ".claude")
 	projectDir := filepath.Join(claudeDir, "projects", "-run")
-	host := Host{Home: home, ClaudeDir: claudeDir, StateRoot: stateRoot, TempDir: tempDir, Cwd: runRoot}
+	host := Host{Home: home, ClaudeDir: claudeDir, StateRoot: stateRoot, TempDir: tempDir, Cwd: runRoot, Path: VisiblePath(os.Getenv("PATH"))}
 	spec := Spec{RunRoot: runRoot, ClaudeProjectDir: projectDir, AddDirs: []string{grant}}
 	if err := Preflight(spec, host); err != nil {
 		t.Fatalf("Preflight: %v", err)
@@ -363,6 +363,10 @@ func TestSandbox_ProcessGroupKillReachesDetachedDescendants(t *testing.T) {
 	if err != nil {
 		t.Skipf("no setsid: %v", err)
 	}
+	setsid, err = filepath.EvalSymlinks(setsid)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	base := t.TempDir()
 	home := filepath.Join(base, "home")
@@ -373,7 +377,7 @@ func TestSandbox_ProcessGroupKillReachesDetachedDescendants(t *testing.T) {
 	if err := os.MkdirAll(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	host := Host{Home: home, ClaudeDir: filepath.Join(home, ".claude"), StateRoot: filepath.Join(home, ".triagefactory"), TempDir: filepath.Join(base, "tmp"), Cwd: runRoot}
+	host := Host{Home: home, ClaudeDir: filepath.Join(home, ".claude"), StateRoot: filepath.Join(home, ".triagefactory"), TempDir: filepath.Join(base, "tmp"), Cwd: runRoot, Path: VisiblePath(os.Getenv("PATH"))}
 	spec := Spec{RunRoot: runRoot, ClaudeProjectDir: filepath.Join(home, ".claude", "projects", "-run")}
 	if err := Preflight(spec, host); err != nil {
 		t.Fatalf("Preflight: %v", err)

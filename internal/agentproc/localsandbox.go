@@ -57,6 +57,25 @@ func directArgv(opts RunOptions, nodeArgs []string) ([]string, error) {
 	// back and must not accumulate the last spawn's resolved host paths.
 	spec := *opts.LocalSandbox
 	spec.ReadOnly = append(append([]string(nil), spec.ReadOnly...), hostToolPaths(nodePath)...)
+	if piEnabled() {
+		tools, err := piToolPaths()
+		if err != nil {
+			return nil, err
+		}
+		dir, err := piAgentDir()
+		if err != nil {
+			return nil, err
+		}
+		spec.SkipClaude = true
+		spec.PiAuthFile = filepath.Join(dir, "auth.json")
+		spec.ReadOnly = append(spec.ReadOnly, tools...)
+		spec.ReadOnly = append(spec.ReadOnly, filepath.Join(dir, "models.json"), filepath.Join(dir, "models-store.json"))
+	}
+	path := os.Getenv("PATH")
+	if opts.GHChannel != nil && opts.GHChannel.BinDir != "" {
+		path = opts.GHChannel.BinDir + string(os.PathListSeparator) + path
+	}
+	host.Path = localsandbox.VisiblePath(path)
 	// The resolver files, which the /run mask would otherwise take with it —
 	// see localsandbox.DNSPaths. They are resolved there rather than here
 	// because the boot probe builds the same bind-backs into its smoke argv,
@@ -157,6 +176,9 @@ func gitLFSBinary() string {
 	abs, err := filepath.Abs(p)
 	if err != nil {
 		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved
 	}
 	return abs
 }

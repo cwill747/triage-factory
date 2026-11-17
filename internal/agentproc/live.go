@@ -251,7 +251,7 @@ func RunInteractive(ctx context.Context, opts RunOptions, sink Sink, perms Permi
 	// the process group via cmd.Cancel without touching the caller's ctx.
 	runCtx, cancel := context.WithCancel(ctx)
 
-	wrapperPath, err := ensureSDKTraced(runCtx)
+	wrapperPath, err := runtimeWrapper(runCtx)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("agent runtime: %w", err)
