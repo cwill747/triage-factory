@@ -482,4 +482,4 @@ export const ACTION_OPTIONS = Object.keys(ACTION_META).map((value) => ({
 // filter for exactly that reason. A refused connection is the row an operator
 // most wants to isolate, and it is the only one no other provider value can
 // reach. A branch push is a github action.
-export const ACTION_PROVIDERS = ['github', 'jira', 'linear', 'slack', 'network'] as const
+export const ACTION_PROVIDERS = ['github', 'jira', 'linear', 'slack', 'vikunja', 'network'] as const

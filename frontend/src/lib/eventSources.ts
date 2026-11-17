@@ -17,6 +17,7 @@ const labels: Record<string, string> = {
   jira: 'Jira',
   slack: 'Slack',
   linear: 'Linear',
+  vikunja: 'Vikunja',
   schedule: 'Schedule',
 }
 

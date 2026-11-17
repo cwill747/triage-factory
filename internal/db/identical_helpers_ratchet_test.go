@@ -139,6 +139,7 @@ var identicalHelperRatchet = map[string]helperTier{
 	"newRepositoryDependabotAccessStore": tierConstructor,
 	"newScoreStore":                      tierConstructor,
 	"newTeamActivityStore":               tierConstructor,
+	"newVikunjaProjectStore":             tierConstructor,
 }
 
 func TestRatchet_IdenticalDialectHelpersStayConverged(t *testing.T) {

@@ -272,6 +272,12 @@ var closeRelations = []closeRelation{
 		terminatesEntity: true,
 		closeReason:      "entity_closed",
 	},
+	{
+		onEvents:         []string{domain.EventVikunjaTaskCompleted},
+		closes:           []string{domain.EventVikunjaTaskAvailable, domain.EventVikunjaTaskUpdated},
+		terminatesEntity: true,
+		closeReason:      "entity_closed",
+	},
 	// The poll observed a terminal snapshot on an entity still active with
 	// no close in flight → the close that was lost, performed now. An
 	// entity has one source, so the union of the terminal sets is
@@ -371,6 +377,7 @@ func closeOwedCloseTypes() []string {
 	seen := map[string]bool{}
 	var out []string
 	sets := [][]string{
+		{domain.EventVikunjaTaskAvailable, domain.EventVikunjaTaskUpdated},
 		githubPRTerminalCloseTypes(), githubPRCloseTypesExcept(domain.EventGitHubPRUnreachable),
 		jiraIssueTerminalCloseTypes(), jiraIssueUnreachableCloseTypes(),
 		linearCloseTypesExcept(domain.EventLinearIssueCompleted), linearCloseTypesExcept(domain.EventLinearIssueUnreachable),

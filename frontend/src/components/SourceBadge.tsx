@@ -9,6 +9,7 @@ export default function SourceBadge({ task, size = 'sm' }: { task: Task; size?: 
   const isGitHub = task.source === 'github'
   const isSlack = task.source === 'slack'
   const isLinear = task.source === 'linear'
+  const isVikunja = task.source === 'vikunja'
   const label = isGitHub
     ? task.entity_kind === 'pr'
       ? 'PR'
@@ -17,7 +18,9 @@ export default function SourceBadge({ task, size = 'sm' }: { task: Task; size?: 
       ? 'Slack'
       : isLinear
         ? 'Linear'
-        : 'Jira'
+        : isVikunja
+          ? 'Vikunja'
+          : 'Jira'
   const labelLg = isGitHub
     ? task.entity_kind === 'pr'
       ? 'Pull Request'
@@ -26,7 +29,9 @@ export default function SourceBadge({ task, size = 'sm' }: { task: Task; size?: 
       ? 'Slack'
       : isLinear
         ? 'Linear'
-        : 'Jira'
+        : isVikunja
+          ? 'Vikunja'
+          : 'Jira'
 
   // Slack aubergine (#4A154B) and Linear indigo (#5E6AD2) at the same tint
   // treatment as the Jira pill.

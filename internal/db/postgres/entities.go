@@ -56,7 +56,7 @@ const pgEntitySelectCols = `id, source, scope, source_id, COALESCE(external_id, 
        COALESCE(title, ''), COALESCE(url, ''),
        COALESCE(snapshot_json::text, ''), COALESCE(description, ''), state,
        created_at, last_polled_at, closed_at, poll_seq, COALESCE(linear_team_id, ''),
-       COALESCE(repository_id::text, ''), COALESCE(jira_project_id::text, '')`
+       COALESCE(repository_id::text, ''), COALESCE(jira_project_id::text, ''), COALESCE(vikunja_project_id, 0)`
 
 // pgContainersFromSnapshot is the SET clause every snapshot write carries, so a
 // row's container moves with the snapshot that observed it, in the same
@@ -74,7 +74,10 @@ func pgContainersFromSnapshot(param string) string {
 		                WHERE p.org_id = entities.org_id AND p.site = entities.scope
 		                  AND p.external_id = (` + param + `::jsonb->>'project_id')),
 		              jira_project_id)
-		ELSE jira_project_id END`
+		ELSE jira_project_id END,
+		vikunja_project_id = CASE WHEN source = 'vikunja'
+		THEN COALESCE((` + param + `::jsonb->>'project_id')::bigint, vikunja_project_id)
+		ELSE vikunja_project_id END`
 }
 
 // pgEntityKeyOrder is the key lookup's preference among rows sharing a key:
@@ -1353,7 +1356,7 @@ func scanEntityRow(row *sql.Row) (*domain.Entity, error) {
 	var e domain.Entity
 	err := row.Scan(&e.ID, &e.Source, &e.Scope, &e.SourceID, &e.ExternalID, &e.Kind, &e.Title, &e.URL,
 		&e.SnapshotJSON, &e.Description, &e.State,
-		&e.CreatedAt, &e.LastPolledAt, &e.ClosedAt, &e.PollSeq, &e.LinearTeamID, &e.RepositoryID, &e.JiraProjectID)
+		&e.CreatedAt, &e.LastPolledAt, &e.ClosedAt, &e.PollSeq, &e.LinearTeamID, &e.RepositoryID, &e.JiraProjectID, &e.VikunjaProjectID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1369,7 +1372,7 @@ func scanEntityList(rows *sql.Rows) ([]domain.Entity, error) {
 		var e domain.Entity
 		if err := rows.Scan(&e.ID, &e.Source, &e.Scope, &e.SourceID, &e.ExternalID, &e.Kind, &e.Title, &e.URL,
 			&e.SnapshotJSON, &e.Description, &e.State,
-			&e.CreatedAt, &e.LastPolledAt, &e.ClosedAt, &e.PollSeq, &e.LinearTeamID, &e.RepositoryID, &e.JiraProjectID); err != nil {
+			&e.CreatedAt, &e.LastPolledAt, &e.ClosedAt, &e.PollSeq, &e.LinearTeamID, &e.RepositoryID, &e.JiraProjectID, &e.VikunjaProjectID); err != nil {
 			return nil, err
 		}
 		out = append(out, e)

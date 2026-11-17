@@ -8,9 +8,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	_ "modernc.org/sqlite"
 
 	"github.com/sky-ai-eng/triage-factory/internal/db"
+	"github.com/sky-ai-eng/triage-factory/internal/db/dbseed"
 	"github.com/sky-ai-eng/triage-factory/internal/db/dbtest"
 	sqlitestore "github.com/sky-ai-eng/triage-factory/internal/db/sqlite"
 	"github.com/sky-ai-eng/triage-factory/internal/db/workitem"
@@ -123,16 +125,18 @@ func TestMigrate_PRMergeabilityBackfill_SQLite(t *testing.T) {
 	}
 	stores := sqlitestore.New(conn)
 	org := runmode.LocalDefaultOrgID
+	// Current stores require the latest schema; seed the historical version
+	// directly so this test exercises the upgrade from its declared version.
+	repositoryID := dbseed.GitHubRepository(t, conn, org, dbtest.TestGitHubHost, "octo", "up")
 	seed := func(number string, snap map[string]any) *domain.Entity {
 		t.Helper()
-		e, _, err := stores.Entities.FindOrCreateSystem(ctx, org, "github", dbtest.TestGitHubHost,
-			"octo/up#"+number, "PR_up"+number, domain.EntityKindPullRequest, "t", "")
-		if err != nil {
-			t.Fatalf("seed entity: %v", err)
-		}
+		e := &domain.Entity{ID: uuid.NewString(), SourceID: "octo/up#" + number}
 		raw, _ := json.Marshal(snap)
-		if ok, err := stores.Entities.UpdateSnapshotCASSystem(ctx, org, e.ID, string(raw), e.PollSeq); err != nil || !ok {
-			t.Fatalf("seed snapshot: ok=%v err=%v", ok, err)
+		if _, err := conn.ExecContext(ctx, `INSERT INTO entities
+			(id, org_id, source, scope, source_id, external_id, kind, title, snapshot_json, repository_id, last_polled_at)
+			VALUES (?, ?, 'github', ?, ?, ?, 'pr', 't', ?, ?, ?)`,
+			e.ID, org, dbtest.TestGitHubHost, e.SourceID, "PR_up"+number, string(raw), repositoryID, time.Now().UTC()); err != nil {
+			t.Fatalf("seed historical entity: %v", err)
 		}
 		return e
 	}
@@ -140,7 +144,7 @@ func TestMigrate_PRMergeabilityBackfill_SQLite(t *testing.T) {
 	noBase := seed("2", map[string]any{"number": 2, "head_sha": "head-2", "mergeable": domain.MergeableMergeable})
 	seed("3", map[string]any{"number": 3, "head_sha": "head-3", "base_ref": "main", "mergeable": domain.MergeableUnknown})
 	closed := seed("4", map[string]any{"number": 4, "head_sha": "head-4", "base_ref": "main", "mergeable": domain.MergeableConflicting})
-	if _, err := stores.Entities.CloseSystem(ctx, org, closed.ID); err != nil {
+	if _, err := conn.ExecContext(ctx, `UPDATE entities SET state = 'closed', closed_at = ? WHERE id = ?`, time.Now().UTC(), closed.ID); err != nil {
 		t.Fatalf("close entity: %v", err)
 	}
 

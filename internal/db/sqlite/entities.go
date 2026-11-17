@@ -43,7 +43,7 @@ const entitySelectCols = `id, source, scope, source_id, COALESCE(external_id, ''
        COALESCE(title, ''), COALESCE(url, ''),
        COALESCE(snapshot_json, ''), COALESCE(description, ''), state,
        created_at, last_polled_at, closed_at, poll_seq, COALESCE(linear_team_id, ''),
-       COALESCE(repository_id, ''), COALESCE(jira_project_id, '')`
+       COALESCE(repository_id, ''), COALESCE(jira_project_id, ''), COALESCE(vikunja_project_id, 0)`
 
 // containersFromSnapshot is the SET clause every snapshot write carries, so a
 // row's container moves with the snapshot that observed it, in the same
@@ -51,7 +51,7 @@ const entitySelectCols = `id, source, scope, source_id, COALESCE(external_id, ''
 // Jira row jira_project_id takes the registry row on the entity's own site
 // carrying the snapshot's project_id. Each keeps its value when the snapshot
 // names none, is not JSON, or (for Jira) names a project the registry has no
-// row for; every other row keeps its NULLs. It binds the snapshot four times,
+// row for; every other row keeps its NULLs. It binds the snapshot six times,
 // after whatever the statement binds before it.
 const containersFromSnapshot = `linear_team_id = CASE WHEN source = 'linear' AND json_valid(?)
 		THEN COALESCE(NULLIF(json_extract(?, '$.team_id'), ''), linear_team_id)
@@ -61,7 +61,10 @@ const containersFromSnapshot = `linear_team_id = CASE WHEN source = 'linear' AND
 		                WHERE p.org_id = entities.org_id AND p.site = entities.scope
 		                  AND p.external_id = CAST(json_extract(?, '$.project_id') AS TEXT)),
 		              jira_project_id)
-		ELSE jira_project_id END`
+		ELSE jira_project_id END,
+		vikunja_project_id = CASE WHEN source = 'vikunja' AND json_valid(?)
+		THEN COALESCE(json_extract(?, '$.project_id'), vikunja_project_id)
+		ELSE vikunja_project_id END`
 
 // entityKeyOrder is the key lookup's preference among rows sharing a key: the
 // active one (there is at most one), otherwise the most recently closed. id
@@ -797,7 +800,7 @@ func updateSnapshotCAS(ctx context.Context, q queryer, id, snapshotJSON string, 
 		SET snapshot_json = ?, last_polled_at = ?, poll_seq = poll_seq + 1,
 		    `+containersFromSnapshot+`
 		WHERE id = ? AND poll_seq = ?
-	`, snapshotJSON, time.Now().UTC(), snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, id, expectedPollSeq)
+	`, snapshotJSON, time.Now().UTC(), snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, id, expectedPollSeq)
 	if err != nil {
 		return false, err
 	}
@@ -1072,7 +1075,7 @@ func (s *entityStore) ReactivateWithSnapshotCASSystem(ctx context.Context, orgID
 		SET state = 'active', closed_at = NULL, snapshot_json = ?, last_polled_at = ?, poll_seq = poll_seq + 1,
 		    `+containersFromSnapshot+`
 		WHERE id = ? AND state = 'closed' AND poll_seq = ?
-	`, snapshotJSON, time.Now().UTC(), snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, id, expectedPollSeq)
+	`, snapshotJSON, time.Now().UTC(), snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, id, expectedPollSeq)
 	if err != nil {
 		return false, err
 	}
@@ -1097,7 +1100,7 @@ func (s *entityStore) CloseWithSnapshotCASSystem(ctx context.Context, orgID, id,
 		SET state = 'closed', closed_at = COALESCE(closed_at, ?), snapshot_json = ?, last_polled_at = ?, poll_seq = poll_seq + 1,
 		    `+containersFromSnapshot+`
 		WHERE id = ? AND poll_seq = ?
-	`, now, snapshotJSON, now, snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, id, expectedPollSeq)
+	`, now, snapshotJSON, now, snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, snapshotJSON, id, expectedPollSeq)
 	if err != nil {
 		return false, err
 	}
@@ -1361,7 +1364,7 @@ func scanEntityRow(row *sql.Row) (*domain.Entity, error) {
 	var e domain.Entity
 	err := row.Scan(&e.ID, &e.Source, &e.Scope, &e.SourceID, &e.ExternalID, &e.Kind, &e.Title, &e.URL,
 		&e.SnapshotJSON, &e.Description, &e.State,
-		&e.CreatedAt, &e.LastPolledAt, &e.ClosedAt, &e.PollSeq, &e.LinearTeamID, &e.RepositoryID, &e.JiraProjectID)
+		&e.CreatedAt, &e.LastPolledAt, &e.ClosedAt, &e.PollSeq, &e.LinearTeamID, &e.RepositoryID, &e.JiraProjectID, &e.VikunjaProjectID)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -1375,7 +1378,7 @@ func scanEntityFromRows(rows *sql.Rows) (*domain.Entity, error) {
 	var e domain.Entity
 	if err := rows.Scan(&e.ID, &e.Source, &e.Scope, &e.SourceID, &e.ExternalID, &e.Kind, &e.Title, &e.URL,
 		&e.SnapshotJSON, &e.Description, &e.State,
-		&e.CreatedAt, &e.LastPolledAt, &e.ClosedAt, &e.PollSeq, &e.LinearTeamID, &e.RepositoryID, &e.JiraProjectID); err != nil {
+		&e.CreatedAt, &e.LastPolledAt, &e.ClosedAt, &e.PollSeq, &e.LinearTeamID, &e.RepositoryID, &e.JiraProjectID, &e.VikunjaProjectID); err != nil {
 		return nil, err
 	}
 	return &e, nil

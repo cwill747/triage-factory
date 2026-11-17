@@ -325,7 +325,7 @@ func ObjectKeyEntityIdentity(provider, key string) (scope, externalID string, ok
 	}
 	resource, _, _ := strings.Cut(rest, ":")
 	switch provider {
-	case ProviderJira:
+	case ProviderJira, ProviderVikunja:
 		return ParseJiraIssueResource(resource)
 	case ProviderLinear:
 		return "", resource, resource != ""

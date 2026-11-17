@@ -20,6 +20,12 @@ import (
 // source TF keys no entities under — and a caller records, creates and finds
 // nothing for it.
 func Of(ctx context.Context, stores db.Stores, orgID, source string) (string, error) {
+	resolverMu.RLock()
+	r := scopeResolvers[source]
+	resolverMu.RUnlock()
+	if r != nil {
+		return r(ctx, stores, orgID)
+	}
 	if stores.Orgs == nil {
 		return "", errors.New("entityscope: no org store to read settings from")
 	}
@@ -38,9 +44,23 @@ func Of(ctx context.Context, stores db.Stores, orgID, source string) (string, er
 type Resolver func(ctx context.Context, stores db.Stores, orgID, sourceID, kind, url string) (*domain.Entity, error)
 
 var (
-	resolverMu sync.RWMutex
-	resolvers  = map[string]Resolver{}
+	resolverMu     sync.RWMutex
+	resolvers      = map[string]Resolver{}
+	scopeResolvers = map[string]ScopeResolver{}
 )
+
+// ScopeResolver resolves namespaces configured outside org_settings.
+type ScopeResolver func(context.Context, db.Stores, string) (string, error)
+
+// RegisterScopeResolver installs a source's scope lookup at startup.
+func RegisterScopeResolver(source string, r ScopeResolver) {
+	resolverMu.Lock()
+	defer resolverMu.Unlock()
+	if source == "" || r == nil || scopeResolvers[source] != nil {
+		panic("entityscope.RegisterScopeResolver: invalid or duplicate registration")
+	}
+	scopeResolvers[source] = r
+}
 
 // RegisterResolver installs source's Resolver. A resolver is handed the
 // stores of the process resolving — an executor installs no routes, and it

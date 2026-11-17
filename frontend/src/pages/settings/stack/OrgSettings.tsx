@@ -64,6 +64,7 @@ import LinearOAuthAppCard from '../LinearOAuthAppCard'
 import LinearSwitchDialog from '../LinearSwitchDialog'
 import { useLinearSwitchWarning } from '../linearSwitchWarning'
 import SlackWorkspacesCard from '../SlackWorkspacesCard'
+import VikunjaSettings from '../VikunjaSettings'
 import TeamManagementSection from '../../../components/TeamManagementSection'
 import {
   dailyCapError,
@@ -853,6 +854,8 @@ export default function OrgSettings({
           <SlackWorkspacesCard orgId={orgId} />
         </SettingsSection>
       )}
+
+      <VikunjaSettings key={orgId ?? 'local'} orgId={orgId} />
 
       {/* ── Event sources ── Which sources may produce events for the org.
           An action section: each switch commits inline through
