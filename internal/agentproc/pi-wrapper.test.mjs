@@ -31,7 +31,7 @@ test("Pi assistant content and usage map to the existing parser", () => {
 })
 
 // Exercise the wrapper without provider credentials or model requests.
-function fakeSDK({ failure = false, withTool = false } = {}) {
+function fakeSDK({ failure = false, withTool = false, toolLoop = false } = {}) {
   let listener
   let configured
   const message = { role: "assistant", model: "fake", stopReason: failure ? "error" : "stop", errorMessage: failure ? "provider failed" : undefined, content: [{ type: "text", text: "answer" }], usage: { cost: { total: 0.25 } } }
@@ -45,7 +45,11 @@ function fakeSDK({ failure = false, withTool = false } = {}) {
         await assert.rejects(tool.execute("denied", { command: "evil" }), /not allowed/)
         await tool.execute("allowed", { command: "pwd" })
         listener({ type: "message_end", message: { role: "toolResult", toolCallId: "allowed", content: [{ type: "text", text: "ok" }] } })
-        await session.agent.finishTurn({ toolResults: [{ toolCallId: "allowed" }] })
+        if (toolLoop) {
+          listener({ type: "message_end", message: { ...message, stopReason: "toolUse" } })
+        }
+        const decision = await session.agent.finishTurn({ toolResults: [{ toolCallId: "allowed" }] })
+        if (toolLoop && decision?.action === "end") return
       }
       listener({ type: "message_end", message })
     },
@@ -89,6 +93,20 @@ test("one-shot emits init, transcript, usage and success", async () => {
   assert.equal(result.is_error, false)
   assert.equal(result.total_cost_usd, 0.25)
   assert.equal(result.result, "answer")
+})
+
+test("turn-limit exhaustion is an error, not a successful tool-only answer", async () => {
+  const lines = await capture(() => run(parseArgs(["-p", "hello", "--max-turns", "1", "--allowedTools", "Bash(pwd)"]), fakeSDK({ withTool: true, toolLoop: true })))
+  const result = lines.at(-1)
+  assert.equal(result.is_error, true)
+  assert.equal(result.subtype, "error_max_turns")
+  assert.equal(result.stop_reason, "tool_use")
+})
+
+test("a final answer at the turn limit still succeeds", async () => {
+  const lines = await capture(() => run(parseArgs(["-p", "hello", "--max-turns", "1"]), fakeSDK()))
+  assert.equal(lines.at(-1).is_error, false)
+  assert.equal(lines.at(-1).subtype, "success")
 })
 
 test("catalog store tolerates missing cache and keeps writes in memory", async () => {

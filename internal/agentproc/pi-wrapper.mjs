@@ -90,6 +90,7 @@ export async function run(options, sdk) {
   let cost = 0
   let turns = 0
   let turnCount = 0
+  let turnLimitReached = false
   let last
   const started = Date.now()
   const request = (key, event, signal) => new Promise((resolve) => {
@@ -192,17 +193,22 @@ export async function run(options, sdk) {
     if (previous?.action === "end") return previous
     if (turn.toolResults.length) {
       const decision = await batch(turn.toolResults.map((result) => result.toolCallId), signal)
-      if (decision?.action === "end" || (options.maxTurns && turnCount >= options.maxTurns)) return { action: "end" }
+      if (decision?.action === "end") return { action: "end" }
+      if (options.maxTurns && turnCount >= options.maxTurns) {
+        turnLimitReached = true
+        return { action: "end" }
+      }
     }
     return previous
   }
   const prompt = async (text) => {
     last = undefined
     turnCount = 0
+    turnLimitReached = false
     try {
       await session.prompt(text, { expandPromptTemplates: false })
-      const failed = !last || ["error", "aborted", "length"].includes(last.stopReason)
-      emit({ type: "result", subtype: failed ? "error_during_execution" : "success", is_error: failed,
+      const failed = !last || turnLimitReached || ["error", "aborted", "length"].includes(last.stopReason)
+      emit({ type: "result", subtype: turnLimitReached ? "error_max_turns" : failed ? "error_during_execution" : "success", is_error: failed,
         result: last?.errorMessage ?? session.getLastAssistantText() ?? "", total_cost_usd: cost,
         duration_ms: Date.now() - started, num_turns: turns, session_id: sessionID,
         stop_reason: ({ stop: "end_turn", toolUse: "tool_use", length: "max_tokens" })[last?.stopReason] ?? last?.stopReason })
