@@ -2,7 +2,7 @@
 
 Most of Triage Factory's settings live in the database and are edited in-app.
 This covers where state is kept on disk, how credentials reach agents, the
-Linux agent sandbox, and the clone protocol.
+Linux agent sandbox, the repositories an agent reaches, and the clone protocol.
 
 ## Where state lives
 
@@ -22,7 +22,9 @@ Everything is under `~/.triagefactory/`:
 
 GitHub, Jira, and Linear credentials are entered in the app and stored in the OS
 keychain or the encrypted file. Local mode never reads them from environment
-variables.
+variables. `GITHUB_TOKEN`, `GITHUB_ENTERPRISE_TOKEN`, and every `GH_` variable
+in Triage Factory's environment are removed before a delegated agent starts.
+Every other variable is passed through, including tokens under other names.
 
 The exception is Claude Code. Delegated agents can use your own Claude login,
 making use of your existing subscription. Choose under **Claude credentials**:
@@ -66,6 +68,23 @@ sandbox off, for example when Triage Factory itself runs in a container:
 ```bash
 TF_LOCAL_SANDBOX=off triagefactory
 ```
+
+## Repositories an agent reaches
+
+An agent's `gh` reaches the repositories its run works in: the one its task is
+about, and any it adds with `workspace add`. A run that starts without one, such
+as a run on a Jira issue, reaches every repository its team tracks. So an agent
+can't reach a private repository your team doesn't track, and needs
+`workspace add` for a tracked one its run doesn't work in. A request naming any
+other repository fails with `repo <owner>/<repo> is not one this run works in`.
+A public repository stays readable, but not writable. The `exec gh` verbs
+follow the same rule, except that a run without a repository has to
+`workspace add` one before it uses them.
+
+Like the sandbox, this guards against accidents, not attacks. A request can
+reach a repository it doesn't name, through a search, a lookup by GraphQL node
+id, or a link from a repository the run works in, and on macOS, or with the
+sandbox off, an agent runs as you and can use your own GitHub credentials.
 
 ## Clone protocol
 

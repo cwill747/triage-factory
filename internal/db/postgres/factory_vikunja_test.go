@@ -89,10 +89,12 @@ func TestFactoryReadStore_Postgres_VikunjaTrackingAndRLS(t *testing.T) {
 		pgtest.MustExec(t, h.AdminDB, `UPDATE tasks SET team_id = $1 WHERE id = $2`, team, taskID)
 		pgtest.MustExec(t, h.AdminDB, `INSERT INTO task_teams (task_id, team_id) VALUES ($1, $2)`, taskID, team)
 	}
-	read := func(user, tenant string, teamIDs []string, wanted ...string) {
+	read := func(user, tenant string, teamIDs []string) {
 		t.Helper()
 		err := h.WithUser(t, user, tenant, func(tx *sql.Tx) error {
 			factory := pgstore.NewForTx(tx, pgtest.SecretKey).Factory
+			// Upstream's factory belt now carries pull requests only.
+			// Vikunja remains scoped through the shared tracked-set reads.
 			rows, err := factory.Entities(ctx, tenant, 100, teamIDs)
 			if err != nil {
 				return err
@@ -101,25 +103,21 @@ func TestFactoryReadStore_Postgres_VikunjaTrackingAndRLS(t *testing.T) {
 			for _, row := range rows {
 				got[row.Entity.ID] = true
 			}
-			if len(got) != len(wanted) {
-				return fmt.Errorf("belt = %v, want %v", got, wanted)
+			if len(got) != 0 {
+				return fmt.Errorf("PR-only belt includes Vikunja tasks: %v", got)
 			}
-			for _, id := range wanted {
-				if !got[id] {
-					return fmt.Errorf("belt missing %s", id)
-				}
-			}
+
 			return nil
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	read(alice, org, nil, a.ID)
-	read(bob, org, nil, b.ID)
-	read(alice, org, []string{teamA}, a.ID)
+	read(alice, org, nil)
+	read(bob, org, nil)
+	read(alice, org, []string{teamA})
 	read(alice, org, []string{teamB})
-	read(bob, org, []string{teamB}, b.ID)
+	read(bob, org, []string{teamB})
 	read(otherUser, otherOrg, nil)
 	// Counters have the same population as the belt, including for the org
 	// admin who can configure (but is not a member of) the other team.
@@ -138,7 +136,7 @@ func TestFactoryReadStore_Postgres_VikunjaTrackingAndRLS(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			if events[domain.EventVikunjaTaskAvailable] != 1 || lifetime[domain.EventVikunjaTaskAvailable] != 1 || tasks[domain.EventVikunjaTaskAvailable] != 1 {
+			if events[domain.EventVikunjaTaskAvailable] != 0 || lifetime[domain.EventVikunjaTaskAvailable] != 0 || tasks[domain.EventVikunjaTaskAvailable] != 0 {
 				return fmt.Errorf("counters leaked or omitted work: events=%v lifetime=%v tasks=%v", events, lifetime, tasks)
 			}
 			return nil
@@ -149,15 +147,15 @@ func TestFactoryReadStore_Postgres_VikunjaTrackingAndRLS(t *testing.T) {
 	if _, err := stores.Entities.ClearSnapshotsForSourceSystem(ctx, org, "vikunja"); err != nil {
 		t.Fatal(err)
 	}
-	read(alice, org, nil, a.ID)
-	read(bob, org, nil, b.ID)
+	read(alice, org, nil)
+	read(bob, org, nil)
 	// A project move changes ownership in the same CAS that writes the snapshot.
 	a, _ = stores.Entities.GetSystem(ctx, org, a.ID)
 	if won, err := stores.Entities.UpdateSnapshotCASSystem(ctx, org, a.ID, `{"project_id":8,"done":false}`, a.PollSeq); err != nil || !won {
 		t.Fatalf("move = %t, %v", won, err)
 	}
 	read(alice, org, nil)
-	read(bob, org, nil, a.ID, b.ID)
+	read(bob, org, nil)
 	if err := stores.VikunjaProjects.Replace(ctx, org, scope, routes[:1]); err != nil {
 		t.Fatal(err)
 	}

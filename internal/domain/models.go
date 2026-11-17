@@ -12,13 +12,11 @@ import (
 // reaches the provider on that path, so nothing downstream translates a stored
 // value.
 //
-// Haiku is the dated spelling, which is what the vendor publishes it under and
-// what the pricing datasheet carries; Sonnet and Opus are the undated current
-// ids. A test in internal/llm/modelcatalog pins all three to native registry keys,
-// which is what keeps a value the settings UI offers from being one the ledger
-// cannot price.
+// All three are the vendor's undated current ids. A test in
+// internal/llm/modelcatalog pins them to native registry keys, which is what
+// keeps a value the settings UI offers from being one the ledger cannot price.
 const (
-	ModelHaiku  = "claude-haiku-4-5-20251001"
+	ModelHaiku  = "claude-haiku-5-5"
 	ModelSonnet = "claude-sonnet-5"
 	ModelOpus   = "claude-opus-5"
 )
@@ -170,6 +168,11 @@ func (s ModelSet) String() string {
 // the set that excludes it, because those two facts are the whole fix.
 var ErrModelNotEnabled = errors.New("model is not enabled for this team")
 
+// ErrNoDefaultModel is a team that has picked no default model, so an unset
+// step has nothing to inherit. Distinct from ErrModelNotEnabled because nothing
+// excludes a model here: there is none to exclude, and the fix is to pick one.
+var ErrNoDefaultModel = errors.New("this team has no default model")
+
 // TeamModels is one team's resolved model configuration at a moment in time:
 // the model an unset step inherits, and the set every model that team runs has
 // to belong to.
@@ -231,7 +234,7 @@ func (m TeamModels) RequireModel(model string) error {
 func (m TeamModels) RequireDefault() (string, error) {
 	model := strings.TrimSpace(m.def)
 	if model == "" {
-		return "", errors.New("this team has no default model — pick one in Settings")
+		return "", fmt.Errorf("%w — pick one in Settings", ErrNoDefaultModel)
 	}
 	if !m.enabled.Has(model) {
 		return "", fmt.Errorf(

@@ -1,8 +1,12 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import { render, screen } from '@testing-library/react'
 import { TelemetryRail } from './StationInstruments'
 import { stationState } from './stationStyle'
 import { QUEUE_DWELL_VISIBLE_MS } from '../../lib/conversationStatus'
+import { refreshModelCatalog, resetModelCatalogForTest } from '../../hooks/useModelCatalog'
+import { LOCAL_DEFAULT_ORG_ID } from '../../lib/githubApp'
+import type { ModelCatalogEntry } from '../../lib/models'
+import { jsonBody } from '../../test/apiResponse'
 import type { Conversation, Message } from '../../types'
 
 const T0 = new Date('2026-06-25T00:00:00Z').getTime()
@@ -10,18 +14,18 @@ const iso = (offsetMs: number) => new Date(T0 + offsetMs).toISOString()
 
 const conversation = (over: Partial<Conversation>): Conversation =>
   ({
-    ID: 'r1',
-    TaskID: 't1',
-    Status: 'running',
-    Model: 'claude-opus-4-8',
-    StartedAt: iso(0),
-    ResultSummary: '',
+    id: 'r1',
+    task_id: 't1',
+    status: 'running',
+    model: 'claude-opus-4-8',
+    started_at: iso(0),
+    result_summary: '',
     ...over,
   }) as Conversation
 
-function renderRail(over: Partial<Conversation>, now: number = T0 + 60_000) {
+function renderRail(over: Partial<Conversation>, now = T0 + 60_000, messages: Message[] = []) {
   const r = conversation(over)
-  render(<TelemetryRail conversation={r} messages={[]} state={stationState(r)} now={now} />)
+  render(<TelemetryRail conversation={r} messages={messages} state={stationState(r)} now={now} />)
 }
 
 // The rail's settled queued readout keys on the shared visibility threshold
@@ -30,22 +34,22 @@ function renderRail(over: Partial<Conversation>, now: number = T0 + 60_000) {
 describe('TelemetryRail queued readout', () => {
   it('hides a settled dwell below the shared threshold (normal dispatch latency)', () => {
     renderRail({
-      QueuedAt: iso(0),
-      ClaimedAt: iso(QUEUE_DWELL_VISIBLE_MS - 1),
+      queued_at: iso(0),
+      claimed_at: iso(QUEUE_DWELL_VISIBLE_MS - 1),
     })
     expect(screen.queryByText('queued')).not.toBeInTheDocument()
   })
 
   it('shows a settled dwell at the shared threshold', () => {
     renderRail({
-      QueuedAt: iso(0),
-      ClaimedAt: iso(QUEUE_DWELL_VISIBLE_MS),
+      queued_at: iso(0),
+      claimed_at: iso(QUEUE_DWELL_VISIBLE_MS),
     })
     expect(screen.getByText('queued')).toBeInTheDocument()
   })
 
   it('always shows the live wait while the conversation is still queued, even below the threshold', () => {
-    renderRail({ Status: 'queued', QueuedAt: iso(0) }, T0 + 2000)
+    renderRail({ status: 'queued', queued_at: iso(0) }, T0 + 2000)
     expect(screen.getByText('queued')).toBeInTheDocument()
     expect(screen.getByText('2s')).toBeInTheDocument()
   })
@@ -99,7 +103,7 @@ describe('TelemetryRail token readouts', () => {
 })
 
 // The idle readout is the live claim's activity stamp against the rail's own
-// clock. The stamp sits a minute after StartedAt so the idle value (2m 0s)
+// clock. The stamp sits a minute after started_at so the idle value (2m 0s)
 // never matches the running readout (3m 0s).
 describe('TelemetryRail idle readout', () => {
   const at3m = T0 + 180_000
@@ -118,7 +122,7 @@ describe('TelemetryRail idle readout', () => {
 
   it('shows while the engagement is still setting up', () => {
     renderRail(
-      { Status: 'cloning', claim_last_activity_at: iso(60_000), claim_current_op: 'clone' },
+      { status: 'cloning', claim_last_activity_at: iso(60_000), claim_current_op: 'clone' },
       at3m,
     )
     expect(screen.getByText('idle')).toBeInTheDocument()
@@ -127,7 +131,7 @@ describe('TelemetryRail idle readout', () => {
 
   it('is hidden once the engagement is not live', () => {
     renderRail(
-      { Status: 'open', claim_last_activity_at: iso(60_000), claim_current_op: 'tool:bash' },
+      { status: 'open', claim_last_activity_at: iso(60_000), claim_current_op: 'tool:bash' },
       at3m,
     )
     expect(screen.queryByText('idle')).not.toBeInTheDocument()
@@ -138,5 +142,29 @@ describe('TelemetryRail idle readout', () => {
     renderRail({ claim_current_op: 'provider' }, at3m)
     expect(screen.queryByText('idle')).not.toBeInTheDocument()
     expect(screen.queryByText(/provider/)).not.toBeInTheDocument()
+  })
+})
+
+// The gauge's denominator is the catalog's window for the model; the pattern
+// answers only for a key the catalog does not carry.
+describe('TelemetryRail context gauge', () => {
+  async function renderGauge(model: string, items: ModelCatalogEntry[]) {
+    resetModelCatalogForTest()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: true, ...jsonBody({ items }) }))
+    await refreshModelCatalog(LOCAL_DEFAULT_ORG_ID)
+    renderRail({ model }, T0, [{ id: 1, role: 'assistant', input_tokens: 500_000 } as Message])
+  }
+
+  it('measures against the window the catalog carries for the model', async () => {
+    // The pattern reads this key as 200k, so only the catalog makes it 1M.
+    await renderGauge('claude-next', [
+      { key: 'claude-next', display_name: 'Claude Next', enabled: true, context_window: 1_000_000 },
+    ])
+    expect(screen.getByText('500k / 1M')).toBeInTheDocument()
+  })
+
+  it('falls back to the pattern for a key the catalog does not carry', async () => {
+    await renderGauge('claude-haiku-5-5', [{ key: 'haiku', display_name: 'Haiku', enabled: true }])
+    expect(screen.getByText('500k / 1M')).toBeInTheDocument()
   })
 })

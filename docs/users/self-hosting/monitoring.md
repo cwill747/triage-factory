@@ -176,23 +176,69 @@ there), or untrack them.
 
 ### GitHub changes no webhook announced
 
-With a GitHub App, Triage Factory refreshes a pull request a few seconds after
-GitHub sends a webhook about it. The scheduled poll still refreshes pull
-requests on three timers, which catch a change whose webhook never arrived.
+With a GitHub App, Triage Factory refreshes a pull request, or lists a
+repository's Dependabot alerts, a few seconds after GitHub sends a webhook
+about it. The scheduled poll still refreshes pull requests on three timers,
+and lists alerts on every poll, which catch a change whose webhook never
+arrived.
 
-`tf_github_missed_hints_total` counts, by `org_id` and `rule`, the refreshes a
-timer made that found a change, one that produced an event, which no webhook
-had announced since the pull request was last refreshed:
+`tf_github_missed_hints_total` counts, by `org_id` and `rule`, the refreshes
+the poll made that found a change, one that produced an event, which no
+webhook had announced since the pull request was last refreshed or the
+alerts last listed:
 
-| `rule`          | The timer                                                                |
-| --------------- | ------------------------------------------------------------------------ |
-| `change_window` | Every poll for 5 minutes after the pull request last changed             |
-| `floor`         | A pull request not refreshed for 10 minutes                              |
-| `in_flight_ci`  | Every poll while one of the pull request's check runs is still running   |
+| `rule`               | The refresh                                                              |
+| -------------------- | ------------------------------------------------------------------------ |
+| `change_window`      | Every poll for 5 minutes after the pull request last changed             |
+| `floor`              | A pull request not refreshed for 10 minutes                              |
+| `in_flight_ci`       | Every poll while one of the pull request's check runs is still running   |
+| `dependabot_listing` | Every poll's listing of a tracked repository's Dependabot alerts         |
+
+A repository's first alert listing is not counted, since its alerts were open
+before any webhook could announce them.
 
 An org whose webhooks arrive reads close to 0. An org connected with a token,
 or with an App that has no webhook URL, receives no webhooks, so every change
 its timers find is counted.
+
+### Dependabot alert listings
+
+Each GitHub poll lists the open Dependabot alerts of every tracked repository
+whose alerts the org's credential can read.
+`tf_github_dependabot_listings_total` counts those listings by `outcome`:
+
+| `outcome`      | Meaning                                                                    |
+| -------------- | -------------------------------------------------------------------------- |
+| `listed`       | Returned in full: the alerts changed, or there was no ETag to send         |
+| `not_modified` | Unchanged since the previous listing; the request costs no rate limit      |
+| `refused`      | GitHub refused the repository; it is skipped until access is rechecked     |
+| `failed`       | Unreadable listing (skipped), or a failure that ends the poll's listings   |
+
+A repository's listing has no ETag to send the first time it is listed, and
+never when it has more than 100 open alerts, so such a repository counts as
+`listed` on every poll. A listing a webhook asked for sends no ETag either, and
+counts as `listed`. A steady rate of `failed` means alerts are not
+reaching Triage Factory, from one repository or from all of them. A
+repository whose alerts get `refused` every poll has lost access, which the
+org's GitHub access settings page shows within a day.
+
+The poll also reads what Dependabot did about each repository's open alerts:
+when an alert opens, then less often as the alerts age, at least once a day,
+and at most 25 repositories per poll for each GitHub credential.
+`tf_github_dependabot_update_reads_total` counts those reads by `outcome`:
+
+| `outcome`    | Meaning                                                                           |
+| ------------ | --------------------------------------------------------------------------------- |
+| `read`       | GitHub answered for every alert                                                   |
+| `incomplete` | GitHub answered but left out alerts the listing holds; they keep their last state |
+| `failed`     | No usable answer; the repository is read again later                              |
+| `deferred`   | Due, but the poll had already made its 25 reads; read on a later poll             |
+
+A steady rate of `failed` means "Dependabot Cannot Fix" events are not being
+emitted. A steady `incomplete` with no `read` usually means the credential
+can list the alerts but GitHub's GraphQL API hides them from it. A steady
+`deferred` means more repositories have young alerts than the poll reads in
+one pass, so failures reach Triage Factory a few polls late.
 
 ### Mergeability probes
 
@@ -244,6 +290,7 @@ of the same events:
 | `tf_sandbox_memory_kills_total` | What memory ended, by `org_id` and `kind`: `bash_budget` (a command over the per-command budget; the sandbox kept running), `ceiling` (a process the kernel killed to hold the sandbox at its limit, usually one left running in the background), `jail_lost` (a sandbox the limit ended, losing every process in it; the run continues in a new sandbox on the same files). |
 | `tf_sandbox_peak_memory_ratio` | A histogram, per sandbox, of its peak memory as a share of its limit, read when it exits. A share near 1 means the sandbox came close to its limit. Sandboxes with no limit are not counted. |
 | `tf_conversations_sandbox_lost_parks_total` | Runs paused for a person after losing their sandbox three times in a row, by `org_id` and `memory_limit` (`true` when the limit ended the last one). A paused run waits for someone to send it a message. |
+| `tf_workspace_restore_missing_commits_total` | Checkouts a run's workspace could not be rebuilt with because the git host no longer had a commit its snapshot needs, by `kind`: `head` (the commit the checkout was at) or `prerequisite` (a commit the snapshot's saved commits build on). The usual cause is a branch rewritten or deleted while the run was paused. The run stays paused for a person. |
 
 A steady `bash_budget` rate is the budget doing its job. If `ceiling` and
 `jail_lost` kills are frequent, or the `p95` of
@@ -344,10 +391,28 @@ TLS, but the endpoint variables don't turn tracing on (TF logs
 
 Spans are pushed, so the backend must be reachable from each pod, and an
 unreachable one loses spans silently; look for `opentelemetry sdk error` in the
-logs. Spans carry opaque ids, not repo names or message text, but are
-unauthenticated without TLS, so keep the backend internal. Log lines written
+logs. Spans carry opaque ids, not repo names, message text, or error text, but
+are unauthenticated without TLS, so keep the backend internal. Log lines written
 inside a span carry `trace_id` and `span_id`, and `/metrics` serves exemplars
 to a scraper that negotiates OpenMetrics.
+
+Each process exports its spans, and its `target_info` metric, under
+`service.name` `triagefactory-control` or `triagefactory-executor`
+(`triagefactory` in local mode), with `service.instance.id` set to the
+instance id the [fleet console](fleet-console.md) shows. To see one executor's
+spans, search `{ resource.service.instance.id = "…" }`.
+
+**Why a span failed.** A failed span's status names the step that failed, never
+the error, because an error's text can name repositories, branches, and git
+remotes. The error is logged on a line carrying the same `trace_id`. Copy the
+trace id from the span and search the logs of the service its `service.name`
+names, `control` or `executor`:
+
+```sh
+docker compose logs executor | grep <trace_id>
+```
+
+A failed run setup's whole error is on its `engagement setup failed` line.
 
 ### The bundled trace stack
 
@@ -419,6 +484,11 @@ menu.
 - **An event.** A poll cycle's trace ends when it emits events. Each event's
   routing is its own `route.event` trace, linked back to the poll. A trigger
   that delegates carries the run's `conversation.id` on `route.delegate`.
+- **A write to a run.** The server span of a message, a stop, a permission
+  answer, or a deliverable refresh
+  (`POST /api/agent/conversations/{conversationID}/…`) carries
+  `conversation.id`, so the request shows up beside the run's other traces.
+  Reads of a run carry none.
 - **A run's setup.** Each attempt is one trace rooted at `engagement.setup`,
   from claim to agent start, numbered by `claim.attempt`. Its `outcome` is
   `agent_live`, `cancelled`, `shutdown`, `fenced`, `loss_budget_spent`, or
@@ -429,7 +499,18 @@ menu.
 - **A slow resume.** `engagement.workspace.ensure` carries
   `workspace.provenance` (`warm`, `rehydrated`, `fresh`) and
   `snapshot.waited_ms`. Waiting the full `TF_SNAPSHOT_WAIT_SEC` and then
-  `fresh` means the previous executor never wrote its snapshot.
+  `fresh` means the previous executor never wrote its snapshot. A
+  `rehydrated` workspace has one `engagement.workspace.restore_checkout` span
+  per checkout, and under it a `worktree.git` span per git command, whose `op`
+  is the subcommand (`fetch`, `worktree`, `index-pack`, …). A git command that
+  fails has `outcome` `failed`, not an error status, because some are expected
+  to fail; the checkout that failed is the error.
 - **Credentials and signatures** are made on a control pod while the executor
   waits (`credentials.provision`, `commit_signing.decide`). They aren't linked
-  to the run's trace; search by `conversation.id`.
+  to the run's trace; search by `conversation.id`. A seal's `reason` says what
+  ran it: `cred_request` (a run started waiting for credentials, or a running
+  run added a repository), `awaiting_sweep` (the periodic pass over runs still
+  waiting), or `refresh_sweep` (the periodic re-seal of a running run). The
+  awaiting pass also seals a run whose first seal hasn't been picked up yet,
+  so an `awaiting_sweep` seal beside a `cred_request` one doesn't by itself
+  mean a request was lost.

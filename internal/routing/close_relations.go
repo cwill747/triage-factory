@@ -240,6 +240,24 @@ var closeRelations = []closeRelation{
 		terminatesEntity: true,
 		closeReason:      "entity_closed",
 	},
+	// A vulnerable package has no open alert left → close every task on it
+	// and flip it closed. A later alert on the package creates a new entity,
+	// so nothing reopens this one.
+	{
+		onEvents:         []string{domain.EventGitHubVulnerabilityResolved},
+		closes:           vulnerablePackageCloseTypesExcept(domain.EventGitHubVulnerabilityResolved),
+		terminatesEntity: true,
+		closeReason:      "entity_closed",
+	},
+	// TF stopped following a vulnerable package (its host is no longer the
+	// org's) → the same entity-wide close + terminate, sparing only its own
+	// type, as a pull request's unreachable does.
+	{
+		onEvents:         []string{domain.EventGitHubVulnerabilityUnreachable},
+		closes:           vulnerablePackageCloseTypesExcept(domain.EventGitHubVulnerabilityUnreachable),
+		terminatesEntity: true,
+		closeReason:      "entity_closed",
+	},
 	// A Jira issue completed → same entity-wide close + terminate.
 	{
 		onEvents:         []string{domain.EventJiraIssueCompleted},
@@ -347,6 +365,24 @@ func githubPRCloseTypesExcept(terminators ...string) []string {
 	return append(out, requestedPartyGitHubEventTypes...)
 }
 
+// vulnerablePackageCloseTypesExcept builds a vulnerable package's entity-wide
+// close set: every type of the package's events minus the terminating event's
+// own, so the lifecycle task that event mints afterwards survives.
+func vulnerablePackageCloseTypesExcept(terminator string) []string {
+	var out []string
+	for _, et := range []string{
+		domain.EventGitHubVulnerabilityAlertOpened,
+		domain.EventGitHubVulnerabilityDependabotCannotFix,
+		domain.EventGitHubVulnerabilityResolved,
+		domain.EventGitHubVulnerabilityUnreachable,
+	} {
+		if et != terminator {
+			out = append(out, et)
+		}
+	}
+	return out
+}
+
 // jiraIssueTerminalCloseTypes is the Jira analog: every assignee-centric type
 // EXCEPT the terminating completed event, plus the unassigned pool task.
 func jiraIssueTerminalCloseTypes() []string {
@@ -362,8 +398,9 @@ func jiraIssueUnreachableCloseTypes() []string {
 }
 
 // closeOwedCloseTypes is what the poll's close obligation cleans up: the
-// union of the GitHub terminal and unreachable sets and the Jira and Linear
-// completed and unreachable sets, deduplicated, minus every terminating event's own type.
+// union of the GitHub terminal and unreachable sets, the vulnerable-package
+// set, and the Jira and Linear completed and unreachable sets, deduplicated,
+// minus every terminating event's own type.
 // An entity has one source, so the types of the other sources are no-ops.
 // The subtraction is explicit rather than inherited, because each issue
 // source's two sets spare only their own terminator: the obligation does not
@@ -379,6 +416,8 @@ func closeOwedCloseTypes() []string {
 	sets := [][]string{
 		{domain.EventVikunjaTaskAvailable, domain.EventVikunjaTaskUpdated},
 		githubPRTerminalCloseTypes(), githubPRCloseTypesExcept(domain.EventGitHubPRUnreachable),
+		vulnerablePackageCloseTypesExcept(domain.EventGitHubVulnerabilityResolved),
+		vulnerablePackageCloseTypesExcept(domain.EventGitHubVulnerabilityUnreachable),
 		jiraIssueTerminalCloseTypes(), jiraIssueUnreachableCloseTypes(),
 		linearCloseTypesExcept(domain.EventLinearIssueCompleted), linearCloseTypesExcept(domain.EventLinearIssueUnreachable),
 	}
@@ -574,9 +613,6 @@ func (r *Router) runTerminatingClose(ctx context.Context, orgID string, evt doma
 	}
 	for _, h := range res.HeldTasks {
 		routerLog.InfoContext(ctx, "held task close: a deliverable awaits a person", "task_id", h.TaskID, "on_event", evt.EventType, "newly_held", h.NewlyHeld)
-		if h.NewlyHeld {
-			r.spawner.TellTaskCloseHeld(ctx, orgID, h.TaskID, h.WorkingConversationIDs)
-		}
 	}
 	// The close obligation stands in for a close that was lost, so it is not
 	// what a reader would recognize as the closer: to them the entity closed.
@@ -858,11 +894,10 @@ func keepReassign(poolType string) func(domain.Event, closeContext, closeTarget)
 // (TaskStore.CloseOrHoldSystem). Without, it closes at once
 // (TaskStore.CloseOnEventSystem), which a reassignment needs.
 //
-// The close stops nothing. The conversations working on the task are told,
-// after the commit: that the task closed, or, the first time the close
-// holds, that the event resolved the situation and the task stays open for
-// a person. A closing event that finds the close already held only takes
-// its place.
+// The close stops nothing. When the task closed, the conversations working
+// on it are told so after the commit. A held close tells nothing: the task
+// stays open, so the agent's instructions have not changed. A closing event
+// that finds the close already held only takes its place.
 func (r *Router) closeTaskOnEvent(ctx context.Context, orgID, taskID string, evt domain.Event, closeReason string, mayHold bool) (dbpkg.TaskCloseOutcome, error) {
 	closeFn := r.tasks.CloseOnEventSystem
 	if mayHold {
@@ -872,11 +907,8 @@ func (r *Router) closeTaskOnEvent(ctx context.Context, orgID, taskID string, evt
 	if err != nil {
 		return dbpkg.TaskCloseOutcome{}, err
 	}
-	switch {
-	case out.Closed:
+	if out.Closed {
 		r.spawner.TellTaskClosed(ctx, orgID, taskID, out.WorkingConversationIDs)
-	case out.NewlyHeld:
-		r.spawner.TellTaskCloseHeld(ctx, orgID, taskID, out.WorkingConversationIDs)
 	}
 	return out, nil
 }

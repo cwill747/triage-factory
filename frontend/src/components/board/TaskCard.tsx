@@ -8,6 +8,7 @@ import { CrateMark } from './CrateMark'
 import {
   pendingCount,
   type ArtifactTotals,
+  type CardFact,
   type EventTone,
   type Lifecycle,
   type PendingTotals,
@@ -87,6 +88,9 @@ export interface TaskCardProps {
    *  from `task.event_type` rather than looked up here: the card reads what
    *  it is handed, and every other derivation on it lives in that one file. */
   event?: { label: string; description: string; tone: EventTone }
+  /** Facts about the entity its title does not carry, on one readout line
+   *  under the title. */
+  facts?: CardFact[]
   /** The agent's live command. Scans. Ignored unless `working`. */
   command?: string
   /** A blocked run. Its presence removes the activity row. */
@@ -105,6 +109,9 @@ export interface TaskCardProps {
   liveState?: 'running' | 'idle'
   /** The task is waiting on the memory its last conversation owes. */
   waiting?: boolean
+  /** The holder's own conversation on the task, before it has run: the way
+   *  in to talk to the agent. The memory wait links here too. */
+  chat?: { href: string }
   /** A delegation the bot took that never fired, and the way to try again. */
   retry?: { message: string; onRetry: () => void }
   /** False removes the verbs a reader may not use — Allow, Deny. */
@@ -363,6 +370,7 @@ export function TaskCard({
   summary,
   summaryPending = false,
   event,
+  facts,
   command,
   permission,
   artifacts,
@@ -374,6 +382,7 @@ export function TaskCard({
   chain,
   liveState = 'running',
   waiting = false,
+  chat,
   retry,
   interactive = true,
   assigneeSlot,
@@ -467,9 +476,10 @@ export function TaskCard({
     </span>
   )
 
-  // The activity slot: a blocked run's plate, the memory wait, a delegation
-  // that never fired, or the working run's live line. Nothing on a queued or
-  // settled card — the settled footer carries its own row.
+  // The activity slot: a blocked run's plate, the memory wait, the holder's
+  // way into a chat that has not started, a delegation that never fired, or
+  // the working run's live line. Nothing else on a queued or settled card —
+  // the settled footer carries its own row.
   let slot: ReactNode = null
   if (blocked && permission) {
     slot = (
@@ -484,11 +494,16 @@ export function TaskCard({
     )
   } else if (waiting) {
     // The run page is where the wait is explained; the card only names it.
-    slot = href ? (
-      <ActivityRow label="Waiting on memory" href={href} />
+    // A holder's chat is where their message will run once the memory lands,
+    // so the wait links there.
+    const waitHref = chat?.href ?? href
+    slot = waitHref ? (
+      <ActivityRow label="Waiting on memory" href={waitHref} />
     ) : (
       <span className="tc-readout">Waiting on memory</span>
     )
+  } else if (chat) {
+    slot = <ActivityRow label="Start chat" href={chat.href} />
   } else if (retry) {
     slot = (
       <button type="button" className="tc-retry" onClick={retry.onRetry} title={retry.message}>
@@ -556,6 +571,19 @@ export function TaskCard({
       </div>
 
       <Chain chain={chain} working={working} />
+
+      {/* Facts the title cannot carry, as a readout rather than prose: they
+          are the system's data about the entity, and the summary below is
+          the scorer's sentence about the work. */}
+      {facts && facts.length > 0 && (
+        <div className="tc-facts">
+          {facts.map((f, i) => (
+            <span key={i} className="tc-fact" data-tone={f.tone} title={f.title}>
+              {f.text}
+            </span>
+          ))}
+        </div>
+      )}
 
       {/* What the work IS, in the scorer's own words rather than the run's,
           opened by the event that made the task. Shown in every state: the

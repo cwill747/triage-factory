@@ -20,7 +20,7 @@ import (
 	"github.com/sky-ai-eng/triage-factory/internal/systemjob/systemllm"
 )
 
-const testModel = "claude-haiku-4-5-20251001"
+const testModel = "claude-haiku-5-5"
 
 // fakeCompleter stands in for the recorder's completion. It writes the ledger
 // row the real one would (from the caller-minted RunID), so the attempt's link
@@ -157,7 +157,7 @@ func newFixture(t *testing.T) *fixture {
 // from newFixture for the doorbell cases that need a second one — in particular
 // one that was never Run.
 func (f *fixture) newManager(notify func(orgID, taskID, taskStatus string)) *Manager {
-	m := NewManager(f.stores, nil, testModels, nil, nil, notify)
+	m := NewManager(f.stores, nil, testModels, nil, nil, notify, nil)
 	m.complete = f.fake
 	return m
 }
@@ -304,8 +304,135 @@ func TestFulfil_GeneratesFromTheTranscript(t *testing.T) {
 	if f.taskPending() {
 		t.Error("the task must stop waiting once its memory lands")
 	}
-	if len(f.notified) != 1 || !strings.HasPrefix(f.notified[0], f.taskID+":") {
-		t.Errorf("notifications = %v, want one for the task", f.notified)
+	if len(f.notified) != 2 || !strings.HasPrefix(f.notified[0], f.taskID+":") || !strings.HasPrefix(f.notified[1], f.taskID+":") {
+		t.Errorf("notifications = %v, want two for the task: the attempt opening and closing", f.notified)
+	}
+}
+
+// TestFulfil_AnnouncesWhenAnAttemptOpensAndWhenItCloses: every write to the
+// attempts ledger reaches the task's watchers, so a person watching a wait
+// sees it being worked, and sees it fail as surely as they see it end. Each
+// announcement is checked against the ledger as it stood when it was made.
+func TestFulfil_AnnouncesWhenAnAttemptOpensAndWhenItCloses(t *testing.T) {
+	noModel := fmt.Errorf("%w: the background jobs model setting is empty — pick one in Settings", systemllm.ErrNoModel)
+	for _, tc := range []struct {
+		name        string
+		ran         bool
+		resolve     systemllm.ModelFunc
+		wantOutcome domain.MemoryAttemptOutcome
+		wantMemory  bool
+	}{
+		{name: "a generated memory", ran: true, wantOutcome: domain.MemoryAttemptGenerated, wantMemory: true},
+		{name: "an empty memory", wantOutcome: domain.MemoryAttemptEmpty, wantMemory: true},
+		{
+			name: "a failed attempt with no model", ran: true,
+			resolve:     func(context.Context, string) (string, error) { return "", noModel },
+			wantOutcome: domain.MemoryAttemptFailed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.message(roleUser, "", "do the thing")
+			if tc.ran {
+				f.message(roleAssistant, "", "worked on it")
+			}
+			f.end()
+			if tc.resolve != nil {
+				f.mgr.models = tc.resolve
+			}
+
+			// What the ledger and the memory row read at each announcement.
+			type seen struct {
+				task    string
+				outcome domain.MemoryAttemptOutcome
+				open    bool
+				memory  bool
+			}
+			var announced []seen
+			f.mgr.notify = func(_, taskID, _ string) {
+				attempt := f.newestAttempt()
+				if attempt == nil {
+					t.Errorf("announced with no attempt row on the conversation")
+					return
+				}
+				announced = append(announced, seen{
+					task: taskID, outcome: attempt.Outcome, open: attempt.CompletedAt == nil, memory: f.memory() != nil,
+				})
+			}
+
+			if err := f.mgr.Fulfil(t.Context(), f.orgID, f.conversationID); err != nil {
+				t.Fatalf("Fulfil: %v", err)
+			}
+
+			if len(announced) != 2 {
+				t.Fatalf("announcements = %+v, want two: one when the attempt opens and one when it closes", announced)
+			}
+			opened, closed := announced[0], announced[1]
+			if opened.task != f.taskID || closed.task != f.taskID {
+				t.Errorf("announced tasks = %q, %q; want %q both times", opened.task, closed.task, f.taskID)
+			}
+			if !opened.open || opened.memory {
+				t.Errorf("first announcement saw %+v, want the attempt still open and no memory row yet", opened)
+			}
+			if closed.open || closed.outcome != tc.wantOutcome {
+				t.Errorf("second announcement saw %+v, want the attempt closed as %q", closed, tc.wantOutcome)
+			}
+			if closed.memory != tc.wantMemory {
+				t.Errorf("second announcement saw memory = %v, want %v: a memory row is filed ahead of the close that reports it",
+					closed.memory, tc.wantMemory)
+			}
+		})
+	}
+}
+
+// TestFulfil_ReportsEachMemoryRowItFiles: a filed row is what makes the task's
+// queued conversation claimable, so the report follows the write for a
+// generated row and an empty one alike, and a failed model call, which files
+// nothing, reports nothing.
+func TestFulfil_ReportsEachMemoryRowItFiles(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		ran       bool
+		callErr   error
+		wantFiled int
+	}{
+		{name: "a generated row", ran: true, wantFiled: 1},
+		{name: "an empty row", wantFiled: 1},
+		{name: "a failed model call", ran: true, callErr: errors.New("500 from upstream")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.message(roleUser, "", "do the thing")
+			if tc.ran {
+				f.message(roleAssistant, "", "worked on it")
+			}
+			f.end()
+			f.fake.err = tc.callErr
+
+			var filed []string
+			f.mgr.filed = func(orgID string) {
+				if f.memory() == nil {
+					t.Error("reported a filed row before the memory row was written")
+				}
+				if f.memoryEntityRoles()[f.entityID] != string(domain.MemoryRolePrimary) {
+					t.Error("reported a filed row before its entity link was written; a conversation woken now would not find the memory")
+				}
+				filed = append(filed, orgID)
+			}
+
+			if err := f.mgr.Fulfil(t.Context(), f.orgID, f.conversationID); err != nil {
+				t.Fatalf("Fulfil: %v", err)
+			}
+
+			if len(filed) != tc.wantFiled {
+				t.Fatalf("filed reports = %v, want %d", filed, tc.wantFiled)
+			}
+			for _, orgID := range filed {
+				if orgID != f.orgID {
+					t.Errorf("reported org %q, want %q", orgID, f.orgID)
+				}
+			}
+		})
 	}
 }
 

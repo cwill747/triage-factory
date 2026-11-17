@@ -7,13 +7,18 @@
 // lives only in the capless sidecar that runs this proxy and never enters the
 // jail's env, argv, or any file (placeholder only).
 //
-// # One traffic policy
+// # Two traffic policies
 //
-// Most of the scope is carried by the credential: an App-org token is minted
-// scoped to the team's authorized repo set, so a request for a repo outside
-// that set gets GitHub's own 404 masking, verbatim. There is no path allowlist,
-// and a request for a repo the run may work in is forwarded whatever it asks
-// of it — with one exception, which is the whole of this proxy's traffic policy.
+// Which repositories a request reaches is carried by the credential where the
+// credential can carry it: a multi-mode App org's token is minted scoped to
+// the run's authorized repo set, so a request for a repo outside that set gets
+// GitHub's own 404 masking, verbatim. Every other credential — a token org's,
+// and any in local mode — reaches further than the run does, and for those the
+// repository gate (repos.go) refuses a request that names a repository outside
+// the run's set. That gate is courtesy isolation, not a boundary: it stops the
+// ordinary case, and repos.go lists what it does not see. A request for a repo
+// the run may work in is forwarded whatever it asks of it — with one
+// exception, the second policy.
 //
 // Three families of write are refused before they are forwarded: submitting a
 // review, creating a repository, and opening a pull request. So is any GraphQL
@@ -46,10 +51,13 @@
 //
 // Requests are READ in exactly one place: a POST to the GraphQL endpoint, whose
 // body is buffered under maxRequestBody and parsed for the name of the mutation
-// it performs. That is a deliberate, bounded exception to what used to be a
-// blanket invariant, and it is not free — this is the one process that holds a
-// run's live GitHub credential while parsing hostile upstream output, and it
-// now also parses outbound documents an agent composed from that same text.
+// it performs, or, when it performs none, for the repositories its query names
+// and the pull requests, issues, branches and node ids it addresses (see "Read
+// touches" below). That is a deliberate, bounded
+// exception to reading no request at all, and it is not free — this
+// is the one process that holds a run's live GitHub credential while parsing
+// hostile upstream output, and it now also parses outbound documents an agent
+// composed from that same text.
 //
 // The exception exists because the alternative was a governance hole rather
 // than a policy: nearly every write gh's porcelain performs — a comment, a
@@ -59,10 +67,13 @@
 // known members, the top level of the operation that runs — including the
 // fragments it spreads into that top level, since moving a mutation behind one
 // would otherwise be the cheapest way to perform a write nothing could name —
-// and a node id from the variables. No argument value and no free text is
-// interpreted (internal/ghcli/ghwrite gqldoc.go states what the reader refuses to look
-// at), and a document that does not parse is recorded as unreadable rather than
-// guessed at.
+// and a node id from the variables. For a mutation, no argument value and no
+// free text is interpreted (internal/ghcli/ghwrite gqldoc.go states what the reader
+// refuses to look at), and a document that does not parse is recorded as
+// unreadable rather than guessed at. For a query, five argument values are
+// read and no others: a repository's owner and name, an object's number, a
+// branch's name and a node's id, each accepted only in the shape of what it
+// names (internal/ghcli/ghwrite read.go).
 //
 // Anything beyond that shape still has to re-derive the cost. REST request
 // bodies remain unread — a REST path already names its act — so the classifier
@@ -71,12 +82,12 @@
 //
 // # What this channel cannot see at all
 //
-// GH_HOST redirects the base URL, so it reaches only the requests gh BUILDS
-// from that base. A command that takes an absolute URL out of a response body
-// and follows it — the release asset commands do this, using the upload_url and
-// the release object's own url — leaves this channel entirely, and neither its
-// act nor its outcome can be recorded here. Naming those shapes in the write
-// classifier would therefore be a promise it cannot keep.
+// Over TCP, GH_HOST redirects the base URL, so it reaches only the requests gh
+// BUILDS from that base. A command that takes an absolute URL out of a response
+// body and follows it — the release asset commands do this, using the
+// upload_url and the release object's own url — leaves this channel entirely,
+// and neither its act nor its outcome can be recorded here. Naming those shapes
+// in the write classifier would therefore be a promise it cannot keep.
 //
 // In the sandbox they do not merely go unlogged, they fail: the jail has no
 // route to those hosts and no keychain to authenticate them with, so the escape
@@ -85,15 +96,27 @@
 // is in front of, and a probe run outside the jail — on a host with a real
 // keyring — will see such a command succeed with nothing recorded.
 //
+// A gh on the unix socket (ServeUnix) sends those requests here too, since
+// http_unix_socket carries every request whatever host its URL names. gh
+// attaches the placeholder only to requests for GH_HOST, so the caller-auth
+// check refuses the rest, and nothing is recorded for them.
+//
 // # TLS, but no interception
 //
 // gh forces https to any GH_HOST and rejects scheme prefixes, so the injector
-// serves TLS with a per-run self-signed certificate (GenerateCert), published
-// through the trust file SSL_CERT_FILE points at (cabundle.WithSystemRoots —
-// the system roots plus this run's leaf, since that env var is process-global).
+// serves TLS with a per-run self-signed certificate (proxycert.Generate),
+// published through the trust file SSL_CERT_FILE points at
+// (cabundle.WithSystemRoots — the system roots plus this run's leaf, since that
+// env var is process-global).
 // There is no TLS interception of GitHub anywhere — the
 // injector terminates gh's connection with its own per-run cert and opens its
 // own TLS connection to the real upstream.
+//
+// A gh configured with http_unix_socket is the exception: it sends every
+// request down that socket in plain HTTP, whatever its URL's scheme and host,
+// and ServeUnix serves the same handler there. That hop has no TLS, so it is
+// only as private as the socket file, and whoever binds the socket has to
+// place it where no other account can reach it.
 //
 // # Path surface
 //
@@ -118,7 +141,9 @@
 // and every repo-contextual command needed an explicit -R. Pointing both at one
 // origin is the fix, and it is why the run's listener lives on port 443: gh
 // strips the port from a remote's host before comparing, so a ported GH_HOST is
-// unmatchable no matter what the remote says.
+// unmatchable no matter what the remote says. A local run cannot bind 443, so
+// its git stays on the ported listener and its gh reaches the same handler
+// over a unix socket (ServeUnix), under a GH_HOST that drops the port.
 //
 // Nothing about the git half is reimplemented here. It is gitproxy's own
 // handler — its ref gate, its base-branch push policy, its per-repo authorize
@@ -163,6 +188,54 @@
 // The callback is not a policy: reporting a write neither permits nor prevents
 // it. It fires after the request has already transited, so a refused request
 // never reaches it — its one row is the refusal, written by the gate.
+//
+// # Read touches
+//
+// A run's touched entities include the pull requests and issues it read, and
+// the exec verbs report their own. A read through this channel is reported by
+// a second callback (ObserveRead), under the exec verbs' rule: an object the
+// request addressed is touched, one returned in a set is not. A REST GET
+// addresses the pull request or issue its path numbers, or the one a comment
+// its path names by the comment's own id is on, and a GraphQL query the ones it
+// selects by number under a repository it names, and the ones it selects by
+// node id (ghwrite.ClassifyRead, ghwrite.ClassifyCommentRead,
+// ghwrite.ParseGraphQLRead). A list and a search address none.
+//
+// A comment and a node id name no number, so the injector asks GitHub which
+// object they are on or name, with the credential the read was made under:
+// it reads the comment by its id over REST, or asks GraphQL what the node id
+// names (a pull request, an issue, or a comment, review or review thread on
+// one), and touches that object as if the read had named it by number. A node
+// id that names anything else touches nothing. Each comment and each node id
+// is asked about once per run, and the response the agent receives is not
+// read for either.
+//
+// A GraphQL lookup of a branch's pull requests addresses the branch. It is how
+// `gh pr view`, `gh pr status` and `gh pr checks` find the pull request of the
+// current branch when they are given no number. The injector looks the branch
+// up itself, asking GitHub for the open pull requests whose head is that branch
+// of the repository the query names, and touches the pull request if GitHub
+// answers exactly one; none or several touch nothing. The lookup asks for the
+// repository's own branches, so a pull request from a fork's branch is not
+// found. The request does not say whose branch gh meant, so when gh is looking
+// at a fork's branch whose name a branch of the repository shares, the pull
+// request open on the repository's branch is the one touched. The lookup is
+// made once per branch per run, whatever it answers, and the response the
+// agent receives is not read for it.
+//
+// What the request spelled is not what is reported. Once the upstream has
+// accepted the read, the injector reads what GitHub calls the object, with the
+// credential the read was made under, exactly as it does for a write
+// (fillIdentity), and reports the object with those ids. An object GitHub does
+// not answer for is not reported, so a request that only spells an object,
+// without reading anything, touches what a real read of it would and nothing
+// else. Each object is read and reported once per run; that one read is made
+// before the agent's response is released, and every later read of the object
+// costs nothing of the injector's own. A pull request a branch lookup found,
+// and an object found through a comment or a node id, is reported under the
+// same rule, once, whichever way the run reached it.
+//
+// A read is not an act and leaves no audit row.
 package ghinjector
 
 import (
@@ -180,6 +253,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -241,6 +315,13 @@ type TokenSource func(ctx context.Context) (string, error)
 // from drifting.
 type ObservedWrite = ghwrite.Observation
 
+// ObservedRead is one pull request or issue a read through this channel
+// addressed, with what GitHub answered the injector for it. It is the
+// classifier package's ReadObservation under this package's name, for the
+// reason ObservedWrite is its Observation: the sidecar relays it and the
+// orchestrator records the run's touch from it.
+type ObservedRead = ghwrite.ReadObservation
+
 // Config bundles the per-run injector inputs. One Server per run.
 type Config struct {
 	// Upstream is the org's real REST API base — "https://api.github.com" or a
@@ -257,7 +338,7 @@ type Config struct {
 	IncomingToken string
 
 	// Cert is the per-run self-signed certificate the injector serves TLS with
-	// (from GenerateCert). Required — gh forces https.
+	// (from proxycert.Generate). Required — gh forces https.
 	Cert tls.Certificate
 
 	// ObserveWrite, when non-nil, is called for every mutating REST request the
@@ -267,11 +348,27 @@ type Config struct {
 	// (fillIdentity), so the observation carries them.
 	ObserveWrite func(ctx context.Context, w ObservedWrite)
 
+	// ObserveRead, when non-nil, is called once per run for each pull request
+	// or issue a read the upstream accepted addressed, or found by the branch
+	// lookup it addressed, with what GitHub calls it (ObservedRead). Called
+	// inline on the response path, so the callback must not block.
+	ObserveRead func(ctx context.Context, r ObservedRead)
+
 	// AuthorizeWrite decides the gated shapes and records their refusals. See
 	// the type's own doc: nil refuses every gated shape without recording one,
 	// which is the fail-closed reading of "no decision source is wired" and
 	// never the production shape — both modes supply it.
 	AuthorizeWrite AuthorizeWrite
+
+	// Repositories, when non-nil, is the run's authorized repository set the
+	// repository gate refuses a request outside of (repos.go). nil applies no
+	// gate, which leaves the repositories a request reaches to the credential.
+	Repositories RepositorySource
+
+	// DenyRepository, when non-nil, is called for each request the repository
+	// gate refuses, before the refusal is answered, to record its denial.
+	// Called inline, so the callback must not block.
+	DenyRepository func(ctx context.Context, d DeniedRepository)
 
 	// ConversationID names the conversation this injector serves, for log
 	// attribution only. It is never sent upstream and never reaches an audit
@@ -296,7 +393,7 @@ type Config struct {
 	// caller-auth gate below, because the two halves authenticate differently —
 	// git presents the git proxy's per-run Basic password, gh presents
 	// GH_ENTERPRISE_TOKEN — and each half validates its own. nil keeps this
-	// listener API-only, which is what local mode and every existing test get.
+	// listener API-only.
 	GitHandler http.Handler
 }
 
@@ -313,14 +410,30 @@ type Server struct {
 	misses *credmiss.Responder
 
 	// reads is the REST upstream the injector's own reads go through, with the
-	// credential every forwarded request is given, and identities the run's
-	// cache of what GitHub calls the objects its writes name.
+	// credential every forwarded request is given, queries the GraphQL
+	// upstream its node lookups go through, with the same credential, and
+	// identities the run's cache of what GitHub calls the objects its writes
+	// and reads name.
 	reads      ghclient.Getter
+	queries    ghclient.Querier
 	identities *ghclient.IdentityReader
+
+	// addressed is the objects this run's reads have already been reported
+	// for (ghwrite.ObjectRef.Key), so each is read and reported once, and
+	// lookedUp the branches the injector has looked up for them
+	// (ghwrite.BranchRef.Key), so each is looked up once.
+	addressedMu sync.Mutex
+	addressed   map[string]bool
+	lookedUp    map[string]bool
 
 	listener net.Listener
 	httpSrv  *http.Server
 	serveErr chan error
+
+	// unixSrv serves the same handler in plain HTTP on unixLn, a unix socket
+	// (ServeUnix).
+	unixSrv *http.Server
+	unixLn  net.Listener
 }
 
 // New validates the config and constructs a Server without listening.
@@ -349,6 +462,7 @@ func New(cfg Config) (*Server, error) {
 		ModifyResponse: s.modifyResponse,
 	}
 	s.reads = ghclient.NewTokenGetter(rest.String(), cfg.TokenSource, proxyTransport{s})
+	s.queries = ghclient.NewTokenQuerier(gql.String(), cfg.TokenSource, proxyTransport{s})
 	return s, nil
 }
 
@@ -402,8 +516,9 @@ const dotcomAPIHost = "api.github.com"
 // wrapper to the Rewrite hook (off the inbound header set, so it never logs).
 type authCtxKey struct{}
 
-// Handler exposes the proxy as an http.Handler (production Start wraps it in
-// TLS; tests can drive it via httptest.NewUnstartedServer + StartTLS).
+// Handler exposes the proxy as an http.Handler (Start and Serve wrap it in TLS,
+// ServeUnix serves it in plain HTTP; tests can drive it via
+// httptest.NewUnstartedServer + StartTLS).
 func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Git first, and before the API caller-auth gate: a git request carries
@@ -422,7 +537,7 @@ func (s *Server) Handler() http.Handler {
 		// an aliased one says nothing at all. The gate below needs it for the
 		// same reason — on this transport the act is named in the request or
 		// nowhere.
-		facts := s.captureGraphQLWrite(r)
+		facts, addressed := s.captureGraphQL(r)
 		// Before the credential is resolved, so a refused request never reaches
 		// the credential pipeline at all.
 		if s.refused(w, r, facts) {
@@ -438,9 +553,17 @@ func (s *Server) Handler() http.Handler {
 			s.misses.Respond(w, err)
 			return
 		}
+		// After the credential, which the gate's own lookup of a name it does
+		// not know is made with.
+		if s.refusedRepository(w, r, addressed) {
+			return
+		}
 		ctx := context.WithValue(r.Context(), authCtxKey{}, tok)
 		if facts != nil {
 			ctx = context.WithValue(ctx, graphQLFactsKey{}, facts)
+		}
+		if !addressed.Empty() {
+			ctx = context.WithValue(ctx, graphQLReadsKey{}, addressed)
 		}
 		r = r.WithContext(ctx)
 		s.proxy.ServeHTTP(w, r)
@@ -453,28 +576,37 @@ func (s *Server) Handler() http.Handler {
 // only place its outcome is, so one write's row needs both ends of the hop.
 type graphQLFactsKey struct{}
 
-// captureGraphQLWrite buffers a GraphQL request body, re-presents it unchanged,
-// and reads the act out of it. nil for everything that is not a GraphQL
-// mutation — a different endpoint, a read — and that is the overwhelming
-// majority of what passes through here.
+// graphQLReadsKey carries the objects, branches and node ids a GraphQL query
+// addressed from the capture in Handler to the read touch in ModifyResponse,
+// which reports them once the upstream has accepted the request.
+type graphQLReadsKey struct{}
+
+// captureGraphQL buffers a GraphQL request body, re-presents it unchanged, and
+// reads it: the act out of a mutation, or the pull requests, issues, branches
+// and node ids a query addresses. Both are empty for everything else — a
+// different endpoint, a read that addresses nothing.
 //
-// One return value rather than a (facts, ok) pair, because both the audit and
-// the refusal policy branch on "is there anything to say about this request",
-// and a boolean that only ever means "the pointer is non-nil" is one place for
-// the two to disagree.
+// facts is one value rather than a (facts, ok) pair, because both the audit
+// and the refusal policy branch on "is there anything to say about this
+// request", and a boolean that only ever means "the pointer is non-nil" is one
+// place for the two to disagree.
 //
-// It runs whether or not the write audit is wired, because the refusal policy
-// reads the same facts and a run with no audit callback is still a run that may
-// not merge.
+// The mutation read runs whether or not the write audit is wired, because the
+// refusal policy reads the same facts and a run with no audit callback is still
+// a run that may not merge. The addressed read runs only for a request that is
+// not a write, and only when something reads it: the read touch, or the
+// repository gate.
 //
 // The buffering is unconditional for POSTs to the GraphQL endpoint, because
 // whether a body is a read cannot be known before reading it. What stays cheap
 // is the parse: ParseGraphQLRequest decodes the envelope and stops at a
-// document with no mutation keyword in it, so ordinary query traffic costs one
-// copy and one JSON decode and never reaches the document reader.
-func (s *Server) captureGraphQLWrite(r *http.Request) *ghwrite.GraphQLFacts {
+// document with no mutation keyword in it, and ParseGraphQLRead stops at one
+// that never mentions a repository or a node, so query traffic that addresses
+// nothing costs one copy and two JSON decodes and never reaches the document
+// reader.
+func (s *Server) captureGraphQL(r *http.Request) (facts *ghwrite.GraphQLFacts, addressed ghwrite.AddressedReads) {
 	if r.Method != http.MethodPost || !isGraphQLPath(r.URL.Path) {
-		return nil
+		return nil, addressed
 	}
 
 	body, unread := bufferRequest(r)
@@ -485,14 +617,17 @@ func (s *Server) captureGraphQLWrite(r *http.Request) *ghwrite.GraphQLFacts {
 		// this side chose, against a caller that stopped sending — and a
 		// refusal in this band that is not vanishingly rare means something
 		// operational rather than someone probing.
-		return &ghwrite.GraphQLFacts{Unreadable: unread}
+		return &ghwrite.GraphQLFacts{Unreadable: unread}, addressed
 	}
 
-	facts, isWrite := ghwrite.ParseGraphQLRequest(body)
-	if !isWrite {
-		return nil
+	write, isWrite := ghwrite.ParseGraphQLRequest(body)
+	if isWrite {
+		return &write, addressed
 	}
-	return &facts
+	if s.cfg.ObserveRead == nil && s.cfg.Repositories == nil {
+		return nil, addressed
+	}
+	return nil, ghwrite.ParseGraphQLRead(body)
 }
 
 // isGraphQLPath reports whether an INBOUND path addresses the GraphQL endpoint,
@@ -654,7 +789,8 @@ func singleJoiningSlash(a, b string) string {
 
 // writeMethods is the set of REST methods that mutate. A method outside it is
 // a read, and reads are outside the audit charter (a refused GET is
-// indistinguishable from an ordinary 404).
+// indistinguishable from an ordinary 404); touchReads reports the object an
+// accepted one addressed.
 var writeMethods = map[string]bool{
 	http.MethodPost:   true,
 	http.MethodPatch:  true,
@@ -840,7 +976,181 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 		// names a created object.
 		s.auditWrite(resp, graphql, buf)
 	}
+	s.touchReads(resp, graphql)
 	return nil
+}
+
+// touchReads reports the pull requests and issues a read the upstream accepted
+// addressed: the one a REST GET's path names, or the one the comment it names
+// is on, or the ones the capture in Handler read out of a GraphQL query, the
+// pull request open on each branch the query looked pull requests up by, and
+// the object each node id it selected names. A request the upstream refused
+// addressed nothing the run was shown. GraphQL answers a query for an object
+// that does not exist with a 200, which the identity read in touchRead
+// settles, the branch lookup in touchBranch settles a branch's, and the node
+// lookup in touchNode a node id's.
+//
+// The agent's response waits on the injector's reads for what the run has not
+// addressed before, so they share one identityReadTimeout however many the
+// request named.
+func (s *Server) touchReads(resp *http.Response, graphql bool) {
+	if s.cfg.ObserveRead == nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return
+	}
+	var reads ghwrite.AddressedReads
+	var comment ghwrite.CommentRef
+	var commented bool
+	if graphql {
+		reads, _ = resp.Request.Context().Value(graphQLReadsKey{}).(ghwrite.AddressedReads)
+	} else if ref, ok := ghwrite.ClassifyRead(resp.Request.Method, resp.Request.URL.Path); ok {
+		reads.Objects = []ghwrite.ObjectRef{ref}
+	} else {
+		comment, commented = ghwrite.ClassifyCommentRead(resp.Request.Method, resp.Request.URL.Path)
+	}
+	if reads.Empty() && !commented {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), identityReadTimeout)
+	defer cancel()
+	if commented {
+		s.touchComment(ctx, comment)
+	}
+	for _, ref := range reads.Objects {
+		s.touchRead(ctx, ref)
+	}
+	for _, ref := range reads.Branches {
+		s.touchBranch(ctx, ref)
+	}
+	for _, id := range reads.Nodes {
+		s.touchNode(ctx, id)
+	}
+}
+
+// touchRead reports one object a read addressed, the first time the run
+// addresses it. It reads what GitHub calls the object with the credential the
+// read was made under (ghclient.IdentityReader), the way fillIdentity does for
+// a write, and reports it only on an answer: an object GitHub does not answer
+// for, or a read that failed, is not reported and not remembered, so a later
+// read of the same object asks again. No later read of a reported object costs
+// a read of the injector's own. ctx bounds the identity read.
+func (s *Server) touchRead(ctx context.Context, ref ghwrite.ObjectRef) {
+	s.addressedMu.Lock()
+	seen := s.addressed[ref.Key()]
+	s.addressedMu.Unlock()
+	if seen {
+		return
+	}
+	id, err := s.identities.Object(ctx, s.reads, ref.Owner, ref.Repo, ref.Number)
+	if err != nil {
+		// Ordinary for a query that named a number GitHub has nothing at.
+		injectorLog.Debug("read what GitHub calls an addressed object failed; not recording the touch",
+			"conversation", s.cfg.ConversationID, "repo", ref.Owner+"/"+ref.Repo, "number", ref.Number, "error", err)
+		return
+	}
+	s.reportRead(ref, id)
+}
+
+// touchComment reports the object a read of a comment by its own id is on. It
+// reads the comment with the credential the read was made under
+// (ghclient.IdentityReader.CommentSubject), for the number of the pull request
+// or issue it is on, and reports that object as touchRead does, spelled under
+// the repository the request named. The reader remembers each comment it has
+// read, so a comment is read once per run; one GitHub does not answer for, or
+// whose read failed, is not reported and not remembered. ctx bounds both
+// reads.
+func (s *Server) touchComment(ctx context.Context, c ghwrite.CommentRef) {
+	number, err := s.identities.CommentSubject(ctx, s.reads, c.Owner, c.Repo, c.Space, c.ID)
+	if err != nil {
+		injectorLog.Debug("read the object an addressed comment is on failed; not recording the touch",
+			"conversation", s.cfg.ConversationID, "repo", c.Owner+"/"+c.Repo, "comment", c.ID, "space", c.Space, "error", err)
+		return
+	}
+	s.touchRead(ctx, ghwrite.ObjectRef{Owner: c.Owner, Repo: c.Repo, Number: number})
+}
+
+// touchNode reports the object a read named by node id: the pull request or
+// issue it names, or the one the comment, review or review thread it names is
+// on. It asks GitHub's GraphQL API which object that is, with the credential
+// the read was made under (ghclient.IdentityReader.NodeSubject), and reports
+// the object as touchRead does, under the repository name GitHub answered. A node id that
+// names anything else touches nothing. The reader remembers each node id it
+// had an answer for, so a node id is asked about once per run; one GitHub
+// answers null for, or whose lookup failed, is not remembered. ctx bounds the
+// lookup and the read.
+func (s *Server) touchNode(ctx context.Context, id string) {
+	subject, err := s.identities.NodeSubject(ctx, s.queries, id)
+	if err != nil {
+		injectorLog.Debug("look up the object an addressed node id names failed; not recording a touch",
+			"conversation", s.cfg.ConversationID, "node", id, "error", err)
+		return
+	}
+	ref := ghwrite.ObjectRef{Owner: subject.Owner, Repo: subject.Repo, Number: subject.Number}
+	// The repository goes into the path of the identity read, so it is held
+	// to the shape a request's spelling is.
+	if subject.Number == 0 || !ghwrite.ValidRepository(ref.Owner, ref.Repo) {
+		return
+	}
+	s.touchRead(ctx, ref)
+}
+
+// touchBranch reports the pull request open on a branch a read looked pull
+// requests up by, the first time the run looks the branch up. The injector
+// asks GitHub itself, with the credential the read was made under
+// (ghclient.IdentityReader.OpenPullForBranch), for the open pull requests
+// whose head is that branch of the repository, and reports the pull request
+// when there is exactly one. What the upstream answered the agent's own lookup
+// is not read: a read's response is streamed to the agent unbuffered, and its
+// shape is the agent's own selection, which can alias any field under the name
+// a reader would look for.
+//
+// An answer is remembered for the run whatever it was, so a branch is looked
+// up once: a pull request opened on it after that is not found by a later
+// lookup in the run. A failed lookup is not remembered, and a later read of the
+// branch asks again. ctx bounds the lookup.
+func (s *Server) touchBranch(ctx context.Context, ref ghwrite.BranchRef) {
+	key := ref.Key()
+	s.addressedMu.Lock()
+	seen := s.lookedUp[key]
+	s.addressedMu.Unlock()
+	if seen {
+		return
+	}
+	pull, err := s.identities.OpenPullForBranch(ctx, s.reads, ref.Owner, ref.Repo, ref.Branch)
+	if err != nil {
+		injectorLog.Debug("look up the pull request open on an addressed branch failed; not recording a touch",
+			"conversation", s.cfg.ConversationID, "repo", ref.Owner+"/"+ref.Repo, "branch", ref.Branch, "error", err)
+		return
+	}
+	// Two concurrent first lookups of one branch both reach here; one goes on.
+	s.addressedMu.Lock()
+	if s.lookedUp == nil {
+		s.lookedUp = map[string]bool{}
+	}
+	answered := s.lookedUp[key]
+	s.lookedUp[key] = true
+	s.addressedMu.Unlock()
+	if answered || pull.Number == 0 {
+		return
+	}
+	s.reportRead(ghwrite.ObjectRef{Owner: ref.Owner, Repo: ref.Repo, Number: pull.Number}, pull.Identity)
+}
+
+// reportRead reports one object, with what GitHub calls it, unless the run has
+// already reported it. Two concurrent first reads of one object both reach
+// here; one reports.
+func (s *Server) reportRead(ref ghwrite.ObjectRef, id domain.GitHubIdentity) {
+	key := ref.Key()
+	s.addressedMu.Lock()
+	if s.addressed == nil {
+		s.addressed = map[string]bool{}
+	}
+	reported := s.addressed[key]
+	s.addressed[key] = true
+	s.addressedMu.Unlock()
+	if reported {
+		return
+	}
+	s.cfg.ObserveRead(context.Background(), ObservedRead{ObjectRef: ref, Identity: id})
 }
 
 // parseCreatedObject reads the id, node id, and html url of the object a create
@@ -963,15 +1273,65 @@ func (s *Server) Serve(ln net.Listener) (string, error) {
 	return ln.Addr().String(), nil
 }
 
+// ServeUnix takes ownership of an ALREADY-BOUND unix listener and serves the
+// same handler on it in plain HTTP until Shutdown, beside whatever Start or
+// Serve serves. It is for a gh configured with http_unix_socket, which sends
+// every request down the socket without TLS whatever its URL says, so that a
+// local run's GH_HOST can drop the port (see "The shared origin" above).
+//
+// The handler is the one TLS requests reach, so the caller-auth check, the
+// repository gate, the write refusals, and the observations apply to a socket
+// request exactly as they do to one over TLS. The binder sets the socket
+// file's mode.
+//
+// A listener that is not a unix listener is refused and stays the caller's.
+// Ownership otherwise transfers: Shutdown closes it.
+func (s *Server) ServeUnix(ln net.Listener) error {
+	if ln == nil {
+		return errors.New("ghinjector: ServeUnix requires a bound listener")
+	}
+	if network := ln.Addr().Network(); network != "unix" {
+		return fmt.Errorf("ghinjector: ServeUnix requires a unix listener, got %q", network)
+	}
+	if s.unixSrv != nil {
+		return errors.New("ghinjector: already serving a unix socket; create a new Server per run")
+	}
+	s.unixLn = ln
+	s.unixSrv = &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: 30 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	go func() {
+		// Serve returns only on Shutdown or an accept failure. The latter
+		// leaves gh with connection errors on the socket, which it reports as
+		// it would any unreachable host, so it is logged rather than surfaced
+		// through Err, which reports the TLS listener the git half also uses.
+		if err := s.unixSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			injectorLog.Warn("unix socket listener stopped", "conversation", s.cfg.ConversationID, "error", err)
+		}
+	}()
+	return nil
+}
+
 // Err returns the first unexpected Serve error (channel closes on exit).
 func (s *Server) Err() <-chan error { return s.serveErr }
 
-// Shutdown stops serving and drains in-flight requests. Idempotent.
+// Shutdown stops serving on every listener and drains in-flight requests.
+// Idempotent.
 func (s *Server) Shutdown(ctx context.Context) error {
-	if s.httpSrv == nil {
-		return nil
+	var errs []error
+	if s.httpSrv != nil {
+		errs = append(errs, s.httpSrv.Shutdown(ctx))
 	}
-	return s.httpSrv.Shutdown(ctx)
+	if s.unixSrv != nil {
+		errs = append(errs, s.unixSrv.Shutdown(ctx))
+		// The server closes only a listener its Serve goroutine has taken up,
+		// and one that has not run yet would leave the socket accepting after
+		// Shutdown returned. Closing it twice is harmless.
+		_ = s.unixLn.Close()
+	}
+	return errors.Join(errs...)
 }
 
 // RequestCount returns how many upstream responses the proxy has observed.

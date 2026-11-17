@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/sky-ai-eng/triage-factory/internal/agentproc"
@@ -110,6 +109,7 @@ type Manager struct {
 	secrets  agentproc.SecretsReader
 	llm      func(ctx context.Context, orgID, model string) (map[string]string, error)
 	notify   func(orgID, taskID, taskStatus string)
+	filed    func(orgID string)
 
 	// attemptTimeout is AttemptTimeout, held as a field so a test can watch
 	// the bound fire without waiting out the real one.
@@ -142,8 +142,16 @@ type Manager struct {
 // models resolves the org's background-jobs model per attempt; secrets and llm
 // are the credential seams every system call takes (llm nil keeps agentproc's
 // raw-secret resolution, which is what local passes). notify announces the
-// task whose wait just ended; nil is a Manager that generates memory and tells
-// nobody, which is only ever a test.
+// task after every write to its memory attempts, an attempt opening and every
+// way one closes; nil is a Manager that generates memory and tells nobody,
+// which is only ever a test.
+//
+// filed reports each memory row this Manager writes, generated or empty, with
+// the row's org. The claim filter holds a task's queued conversation while an
+// ended conversation on that task has no memory row, so a filed row is the
+// moment that conversation becomes claimable, and a caller that wakes the
+// dispatcher on the report has it claimed before the next scan. The report
+// follows the row's entity link as well as the row. nil reports nothing.
 func NewManager(
 	stores db.Stores,
 	recorder *systemllm.Recorder,
@@ -151,6 +159,7 @@ func NewManager(
 	secrets agentproc.SecretsReader,
 	llm func(ctx context.Context, orgID, model string) (map[string]string, error),
 	notify func(orgID, taskID, taskStatus string),
+	filed func(orgID string),
 ) *Manager {
 	m := &Manager{
 		stores:         stores,
@@ -158,6 +167,7 @@ func NewManager(
 		secrets:        secrets,
 		llm:            llm,
 		notify:         notify,
+		filed:          filed,
 		attemptTimeout: AttemptTimeout,
 		syncEvery:      failingSyncEvery,
 		inflight:       make(map[string]struct{}),
@@ -193,8 +203,9 @@ func (m *Manager) Fulfil(ctx context.Context, orgID, conversationID string) (err
 		trace.WithAttributes(telemetry.ConversationID(conversationID), telemetry.OrgID(orgID)))
 	defer func() {
 		if err != nil {
-			span.RecordError(err)
-			span.SetStatus(codes.Error, err.Error())
+			telemetry.RecordSpanError(span, err, "settling the conversation's memory failed")
+			log.WarnContext(ctx, "settling the conversation's memory failed",
+				"conversation", conversationID, "org", orgID, "error", err)
 		}
 		span.End()
 	}()
@@ -255,6 +266,9 @@ func (m *Manager) Fulfil(ctx context.Context, orgID, conversationID string) (err
 	if err != nil {
 		return fmt.Errorf("memoryprovision: open a memory attempt on conversation %s: %w", conversationID, err)
 	}
+	// The task's read now carries an attempt in flight, so its watchers are
+	// told: a person waiting on this memory sees it being generated.
+	m.announce(orgID, taskID, taskStatus)
 
 	// Nothing to remember. A conversation that never reached an assistant turn
 	// — failed before the model's first turn, cancelled while still queued —
@@ -265,12 +279,11 @@ func (m *Manager) Fulfil(ctx context.Context, orgID, conversationID string) (err
 	if !hasAssistantTurn(rows) {
 		span.SetAttributes(telemetry.Outcome(string(domain.MemoryAttemptEmpty)))
 		if ferr := m.file(ctx, orgID, conv, "", domain.MemorySourceNone, primaryEntityID); ferr != nil {
-			m.closeAttempt(ctx, orgID, attempt.ID, domain.MemoryAttemptFailed,
+			m.closeAttempt(ctx, orgID, attempt.ID, taskID, taskStatus, domain.MemoryAttemptFailed,
 				domain.MemoryAttemptErrOther, "the memory row could not be written", "", len(rows), 0)
 			return ferr
 		}
-		m.closeAttempt(ctx, orgID, attempt.ID, domain.MemoryAttemptEmpty, "", "", "", len(rows), 0)
-		m.announce(orgID, taskID, taskStatus)
+		m.closeAttempt(ctx, orgID, attempt.ID, taskID, taskStatus, domain.MemoryAttemptEmpty, "", "", "", len(rows), 0)
 		return nil
 	}
 
@@ -284,12 +297,12 @@ func (m *Manager) Fulfil(ctx context.Context, orgID, conversationID string) (err
 		span.SetAttributes(telemetry.Outcome(string(domain.MemoryAttemptErrNoModel)))
 		log.WarnContext(ctx, "memory generation skipped; no usable background jobs model",
 			"org", orgID, "conversation", conversationID, "error", err)
-		m.closeAttempt(ctx, orgID, attempt.ID, domain.MemoryAttemptFailed,
+		m.closeAttempt(ctx, orgID, attempt.ID, taskID, taskStatus, domain.MemoryAttemptFailed,
 			domain.MemoryAttemptErrNoModel, strings.TrimPrefix(err.Error(), systemllm.ErrNoModel.Error()+": "),
 			"", len(rows), 0)
 		return nil
 	case err != nil:
-		m.closeAttempt(ctx, orgID, attempt.ID, domain.MemoryAttemptFailed,
+		m.closeAttempt(ctx, orgID, attempt.ID, taskID, taskStatus, domain.MemoryAttemptFailed,
 			domain.MemoryAttemptErrOther, "the background-jobs model could not be resolved", "", len(rows), 0)
 		return fmt.Errorf("memoryprovision: resolve the background jobs model for org %s: %w", orgID, err)
 	}
@@ -305,7 +318,7 @@ func (m *Manager) Fulfil(ctx context.Context, orgID, conversationID string) (err
 		span.SetAttributes(telemetry.Outcome(string(kind)))
 		log.WarnContext(ctx, "memory generation failed", "org", orgID, "conversation", conversationID,
 			"kind", string(kind), "reason", reason)
-		m.closeAttempt(ctx, orgID, attempt.ID, domain.MemoryAttemptFailed,
+		m.closeAttempt(ctx, orgID, attempt.ID, taskID, taskStatus, domain.MemoryAttemptFailed,
 			kind, reason, systemLLMRunID, win.rowsTotal, win.rowsSent)
 		return nil
 	case ctx.Err() != nil:
@@ -318,13 +331,12 @@ func (m *Manager) Fulfil(ctx context.Context, orgID, conversationID string) (err
 
 	content := generatedHeader(win.rowsSent, win.rowsTotal) + "\n\n" + text
 	if ferr := m.file(ctx, orgID, conv, content, domain.MemorySourceGenerated, primaryEntityID); ferr != nil {
-		m.closeAttempt(ctx, orgID, attempt.ID, domain.MemoryAttemptFailed,
+		m.closeAttempt(ctx, orgID, attempt.ID, taskID, taskStatus, domain.MemoryAttemptFailed,
 			domain.MemoryAttemptErrOther, "the memory row could not be written", systemLLMRunID, win.rowsTotal, win.rowsSent)
 		return ferr
 	}
 	span.SetAttributes(telemetry.Outcome(string(domain.MemoryAttemptGenerated)))
-	m.closeAttempt(ctx, orgID, attempt.ID, domain.MemoryAttemptGenerated, "", "", systemLLMRunID, win.rowsTotal, win.rowsSent)
-	m.announce(orgID, taskID, taskStatus)
+	m.closeAttempt(ctx, orgID, attempt.ID, taskID, taskStatus, domain.MemoryAttemptGenerated, "", "", systemLLMRunID, win.rowsTotal, win.rowsSent)
 	return nil
 }
 
@@ -399,10 +411,16 @@ func (m *Manager) file(ctx context.Context, orgID string, conv *domain.Conversat
 	if _, err := m.stores.TaskMemory.UpsertAgentMemorySystem(ctx, orgID, conv.ID, conv.BlueprintRunID, content, source); err != nil {
 		return fmt.Errorf("memoryprovision: file the memory of conversation %s: %w", conv.ID, err)
 	}
-	if primaryEntityID == "" {
-		return nil
+	if primaryEntityID != "" {
+		memoryentities.Attach(ctx, m.stores.TaskMemory, orgID, conv.ID, primaryEntityID)
 	}
-	memoryentities.Attach(ctx, m.stores.TaskMemory, orgID, conv.ID, primaryEntityID)
+	// After the attach, never between the two writes: the row makes the
+	// task's next conversation claimable, and the entity link is how that
+	// conversation finds the row, so a wake sent before the link could start
+	// it without the memory it was held for.
+	if m.filed != nil {
+		m.filed(orgID)
+	}
 	return nil
 }
 
@@ -410,7 +428,12 @@ func (m *Manager) file(ctx context.Context, orgID string, conv *domain.Conversat
 // it records has already happened, and a task whose memory landed must not read
 // as still waiting because the ledger write failed — the next sweep finds the
 // memory row and settles nothing further.
-func (m *Manager) closeAttempt(ctx context.Context, orgID, attemptID string,
+//
+// It announces on every outcome, with the task the attempt's conversation
+// belongs to. A memory row is always filed ahead of the close that reports it,
+// so a wait that ended and a wait that failed both reach the task's watchers
+// from here.
+func (m *Manager) closeAttempt(ctx context.Context, orgID, attemptID, taskID, taskStatus string,
 	outcome domain.MemoryAttemptOutcome, kind domain.MemoryAttemptErrorKind,
 	reason, systemLLMRunID string, rowsTotal, rowsSent int) {
 	if _, err := m.stores.MemoryAttempts.CompleteAttemptSystem(ctx, orgID, attemptID,
@@ -418,10 +441,13 @@ func (m *Manager) closeAttempt(ctx context.Context, orgID, attemptID string,
 		log.Warn("close out memory attempt failed", "attempt", attemptID, "outcome", string(outcome), "error", err)
 	}
 	m.touch(orgID)
+	m.announce(orgID, taskID, taskStatus)
 }
 
-// announce tells the task's watchers its wait is over, so the composer
-// re-enables without polling.
+// announce tells the task's watchers that what its read says about the memory
+// it waits on has changed: an attempt opened, failed, or ended the wait. The
+// same ping for all three, so a screen showing the wait refetches the task
+// without polling.
 func (m *Manager) announce(orgID, taskID, taskStatus string) {
 	if m.notify == nil || taskID == "" {
 		return

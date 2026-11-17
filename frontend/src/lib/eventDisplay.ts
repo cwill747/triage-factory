@@ -7,9 +7,10 @@
 // warm semantic tones so the event reads as a quiet uppercase label, not a
 // 2018 pastel pill.
 //
-// This is a user-facing subset/override of AllEventTypes() in
-// internal/domain/event.go — labels may differ and backend-only types fall
-// back to the default badge.
+// The map carries an entry for every non-system type in AllEventTypes()
+// (internal/domain/event.go), with labels that may differ from the catalog's;
+// feature_parity_test.go fails when the two drift. FALLBACK_EVENT serves system
+// types and a type a newer server sends to an older client.
 
 export interface EventInfo {
   label: string
@@ -47,6 +48,11 @@ const EVENT_DISPLAY: Record<string, EventInfo> = {
     label: 'Review Requested',
     description: 'Someone requested your review on a PR',
     color: 'bg-amber-500/10 text-amber-700',
+  },
+  'github:pr:review_request_removed': {
+    label: 'Review Request Removed',
+    description: 'Your review request was removed from a PR',
+    color: 'bg-slate-500/10 text-slate-600',
   },
 
   // --- GitHub PR: per-check CI events (split on conclusion) ---
@@ -131,6 +137,47 @@ const EVENT_DISPLAY: Record<string, EventInfo> = {
     color: 'bg-slate-500/10 text-slate-600',
   },
 
+  // --- GitHub: vulnerable packages (Dependabot alerts) ---
+  'github:vulnerability:alert_opened': {
+    label: 'Vulnerability',
+    description: 'A Dependabot alert opened on a package in a tracked repository',
+    color: 'bg-red-500/10 text-red-600',
+  },
+  'github:vulnerability:dependabot_cannot_fix': {
+    label: 'Dependabot Cannot Fix',
+    description:
+      'Dependabot cannot fix an open alert on the package: no patched version exists, or its update failed',
+    color: 'bg-orange-500/10 text-orange-700',
+  },
+  'github:vulnerability:resolved': {
+    label: 'Vulnerability Resolved',
+    description: 'The package has no open Dependabot alert left',
+    color: 'bg-emerald-500/10 text-emerald-700',
+  },
+  'github:vulnerability:unreachable': {
+    label: 'Vulnerability Unreachable',
+    description:
+      "Triage Factory no longer follows this package: the organization points at another GitHub host, or the repository's Dependabot alerts can no longer be read. Says nothing about whether the alerts were fixed",
+    color: 'bg-slate-500/10 text-slate-600',
+  },
+
+  // --- Vikunja ---
+  'vikunja:task:available': {
+    label: 'Task Available',
+    description: 'An open task was discovered in a tracked Vikunja project',
+    color: 'bg-slate-500/10 text-slate-600',
+  },
+  'vikunja:task:updated': {
+    label: 'Task Updated',
+    description: 'The title, description or priority of a tracked Vikunja task changed',
+    color: 'bg-blue-500/10 text-blue-600',
+  },
+  'vikunja:task:completed': {
+    label: 'Task Completed',
+    description: 'A tracked Vikunja task was marked done',
+    color: 'bg-emerald-500/10 text-emerald-700',
+  },
+
   // --- Jira ---
   'jira:issue:body_updated': {
     label: 'Issue Body Updated',
@@ -180,6 +227,12 @@ const EVENT_DISPLAY: Record<string, EventInfo> = {
   'jira:issue:label_removed': {
     label: 'Label Removed',
     description: 'A label was removed from an issue',
+    color: 'bg-slate-500/10 text-slate-600',
+  },
+  'jira:issue:unreachable': {
+    label: 'Unreachable',
+    description:
+      'Triage Factory no longer follows this issue: Jira will not resolve it, it moved to a project no rule configures, or the organization now points at another Jira site',
     color: 'bg-slate-500/10 text-slate-600',
   },
   'jira:issue:key_changed': {
@@ -254,6 +307,13 @@ const EVENT_DISPLAY: Record<string, EventInfo> = {
     label: 'Identifier Changed',
     description: 'Issue moved to another team, or its team key was renamed',
     color: 'bg-violet-500/10 text-violet-600',
+  },
+
+  // --- Slack ---
+  'slack:message': {
+    label: 'Slack Message',
+    description: 'Someone addressed the Triage Factory bot in a Slack channel',
+    color: 'bg-blue-500/10 text-blue-600',
   },
 }
 

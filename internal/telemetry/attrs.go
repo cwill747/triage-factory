@@ -51,7 +51,6 @@ const (
 	keySnapBundle     = attribute.Key("snapshot.bundle_bytes")
 	keySnapPatch      = attribute.Key("snapshot.patch_bytes")
 	keySnapLFS        = attribute.Key("snapshot.lfs_bytes")
-	keySnapTranscript = attribute.Key("snapshot.transcript_bytes")
 	keySnapRaw        = attribute.Key("snapshot.raw_bytes")
 	keySnapWaitedMS   = attribute.Key("snapshot.waited_ms")
 	keyAgentCostUSD   = attribute.Key("agent.cost_usd")
@@ -73,6 +72,7 @@ const (
 	keyLLMCostUSD     = attribute.Key("llm.cost_usd")
 	keyFirstChunkMS   = attribute.Key("llm.first_chunk_ms")
 	keyMemoryKills    = attribute.Key("memory.kills")
+	keyURLTemplate    = attribute.Key("url.template")
 )
 
 // Opaque row identifiers, the backbone of the set. Each is the id and
@@ -120,7 +120,8 @@ func EventType(kind string) attribute.KeyValue { return keyEventType.String(kind
 //     dispatching switch, which is what keeps it an enum rather than a
 //     name the caller chose. Also the name a GraphQL document gives its
 //     operation (Linear's "IssuesByID"), where every document is a
-//     constant in its client.
+//     constant in its client, and the terminal write a work-queue row
+//     failed at ("complete", "requeue"), each a literal at its call site.
 //   - Workspace — how a run's worktree came to exist ("fresh", "warm",
 //     "rehydrated"), i.e. domain.WorkspaceProvenance. Never the path.
 //   - Bucket — which of an upstream's rate-limit budgets a reading is of,
@@ -149,11 +150,11 @@ func Credential(id string) attribute.KeyValue     { return keyCredential.String(
 // WorkKind names an adopting work table by its registered kind name, and
 // Reason says why something happened where Outcome alone does not: why a work
 // item was parked, why a conversation's memory link to an entity went
-// unwritten, why a native turn parked, why a compaction ran, and what ended a
-// tool call (a lost tool host's cause, the bash memory budget). Both are
-// closed vocabularies TF declares itself: kind names are registry
-// identifiers, reasons are the typed outcomes and each package's own
-// constants, never a notice or an error's text.
+// unwritten, why a native turn parked, why a compaction ran, what ran a
+// credential seal, and what ended a tool call (a lost tool host's cause, the
+// bash memory budget). Both are closed vocabularies TF declares itself: kind
+// names are registry identifiers, reasons are the typed outcomes and each
+// package's own constants, never a notice or an error's text.
 func WorkKind(name string) attribute.KeyValue { return keyWorkKind.String(name) }
 func Reason(value string) attribute.KeyValue  { return keyReason.String(value) }
 
@@ -189,16 +190,15 @@ func SizeBytes(n int64) attribute.KeyValue { return keySizeBytes.Int64(n) }
 // The workspace-snapshot member sizes, one per thing the snapshot carries,
 // plus the pre-compression total. They exist because SizeBytes alone could
 // not say where a slow snapshot's bytes came from: the git delta and its Git
-// LFS objects, the scratch tree, or the transcript are captured, archived, and uploaded by
+// LFS objects, and the scratch tree, are captured, archived, and uploaded by
 // three different phases, and sizing a fix (shallower delta, faster codec,
 // multipart PUT) needs the split. snapshot.raw_bytes against the archive
 // span's SizeBytes is the compression ratio. All magnitudes — the member
 // NAMES are fixed format strings, so no key here can carry tenant data.
-func SnapshotBundleBytes(n int64) attribute.KeyValue     { return keySnapBundle.Int64(n) }
-func SnapshotPatchBytes(n int64) attribute.KeyValue      { return keySnapPatch.Int64(n) }
-func SnapshotLFSBytes(n int64) attribute.KeyValue        { return keySnapLFS.Int64(n) }
-func SnapshotTranscriptBytes(n int64) attribute.KeyValue { return keySnapTranscript.Int64(n) }
-func SnapshotRawBytes(n int64) attribute.KeyValue        { return keySnapRaw.Int64(n) }
+func SnapshotBundleBytes(n int64) attribute.KeyValue { return keySnapBundle.Int64(n) }
+func SnapshotPatchBytes(n int64) attribute.KeyValue  { return keySnapPatch.Int64(n) }
+func SnapshotLFSBytes(n int64) attribute.KeyValue    { return keySnapLFS.Int64(n) }
+func SnapshotRawBytes(n int64) attribute.KeyValue    { return keySnapRaw.Int64(n) }
 
 // SnapshotWaitedMs is how long a workspace ensure spent waiting on a persist
 // that was still in flight, on the ensure span beside the provenance. Zero on
@@ -278,3 +278,11 @@ func Tool(name string) attribute.KeyValue        { return keyTool.String(name) }
 func Turn(n int) attribute.KeyValue              { return keyTurn.Int(n) }
 func StopReason(class string) attribute.KeyValue { return keyStopReason.String(class) }
 func MemoryKills(n int) attribute.KeyValue       { return keyMemoryKills.Int(n) }
+
+// URLTemplate is the endpoint an outbound request called, as a path template
+// whose every segment is either the upstream's own path word or a placeholder
+// ("/repos/{owner}/{repo}/pulls/{}/reviews"), never a path with a name in it.
+// A template comes from a normalizer that keeps a segment only when it is on
+// a fixed list of the upstream's words (githubURLTemplate), so a repository,
+// branch, or file name reaches it only by equalling one of those words.
+func URLTemplate(template string) attribute.KeyValue { return keyURLTemplate.String(template) }

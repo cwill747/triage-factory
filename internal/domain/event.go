@@ -103,6 +103,36 @@ const (
 	EventGitHubPRUnreachable = "github:pr:unreachable"
 )
 
+// GitHub vulnerable-package events: a package in a repository with open
+// Dependabot alerts (domain.EntityKindVulnerablePackage). Split on whether the
+// package needs attention: an alert opening says it does, the last alert
+// closing says it no longer does, and Dependabot being unable to fix an alert
+// says it needs someone other than Dependabot. An alert closing while another
+// stays open changes nothing that needs attention and emits nothing; severity,
+// scope and the rest stay metadata.
+const (
+	// One per alert that is open now and was not open on the previous
+	// listing: created, reopened, or reintroduced. The dedup key is empty, so
+	// a second alert on a package folds into the task the first one made.
+	EventGitHubVulnerabilityAlertOpened = "github:vulnerability:alert_opened"
+	// One per open alert that became one Dependabot cannot fix, or whose
+	// reason changed: it has no patched version, or Dependabot's update for
+	// it reported an error (DependabotAlert.DependabotCannotFix). A task of
+	// its own beside the
+	// alert_opened one, so a trigger on it delegates only what Dependabot
+	// leaves undone. The dedup key is empty, as alert_opened's is.
+	EventGitHubVulnerabilityDependabotCannotFix = "github:vulnerability:dependabot_cannot_fix"
+	// The package has no open alert left. Terminating: it closes the entity
+	// and its tasks, and a later alert on the package creates a new entity.
+	EventGitHubVulnerabilityResolved = "github:vulnerability:resolved"
+	// TF no longer follows the package: the org's GitHub base URL now names
+	// another host, whose listings cannot answer for this one's repositories.
+	// Terminating, like resolved, but says nothing about the alerts, so a
+	// handler on resolved never takes a host change for a fix. Emitted without
+	// asking GitHub, as github:pr:unreachable is.
+	EventGitHubVulnerabilityUnreachable = "github:vulnerability:unreachable"
+)
+
 // Jira events
 const (
 	EventJiraIssueAvailable       = "jira:issue:available"
@@ -237,6 +267,7 @@ const (
 
 // EntityTerminatingEventTypes is the set of source transitions that
 // terminate an entity: a merged, closed or unreachable pull request, a
+// vulnerable package with no open alert left or no longer followed, a
 // completed or unreachable Jira or Linear issue. The routing package derives the same set from its
 // close relations; a routing test asserts the two agree, so the store layer
 // can read it without importing the router.
@@ -245,6 +276,8 @@ func EntityTerminatingEventTypes() []string {
 		EventGitHubPRMerged,
 		EventGitHubPRClosed,
 		EventGitHubPRUnreachable,
+		EventGitHubVulnerabilityResolved,
+		EventGitHubVulnerabilityUnreachable,
 		EventJiraIssueCompleted,
 		EventJiraIssueUnreachable,
 		EventLinearIssueCompleted,
@@ -328,6 +361,12 @@ func AllEventTypes() []EventType {
 		{ID: EventVikunjaTaskAvailable, Source: "vikunja", Category: "task", Label: "Task Available", Description: "An open task was discovered in a tracked Vikunja project"},
 		{ID: EventVikunjaTaskUpdated, Source: "vikunja", Category: "task", Label: "Task Updated", Description: "The title, description or priority of a tracked Vikunja task changed"},
 		{ID: EventVikunjaTaskCompleted, Source: "vikunja", Category: "task", Label: "Task Completed", Description: "A tracked Vikunja task was marked done"},
+
+		// --- GitHub vulnerable packages (Dependabot alerts) ---
+		{ID: EventGitHubVulnerabilityAlertOpened, Source: "github", Category: "vulnerability", Label: "Vulnerability Alert Opened", Description: "A Dependabot alert opened on a package in a tracked repository: created, reopened, or reintroduced. Alerts already open when Triage Factory first lists the repository emit too, one event each"},
+		{ID: EventGitHubVulnerabilityDependabotCannotFix, Source: "github", Category: "vulnerability", Label: "Dependabot Cannot Fix", Description: "Dependabot cannot fix an open alert on a package in a tracked repository: no patched version has been released, or Dependabot tried to open a pull request for it and reported an error. An alert emits when it comes to be one, including alerts already in that state when Triage Factory first lists the repository, and again when the reason changes (a patch is released, and Dependabot's update to it fails)"},
+		{ID: EventGitHubVulnerabilityResolved, Source: "github", Category: "vulnerability", Label: "Vulnerability Resolved", Description: "A package in a tracked repository has no open Dependabot alert left: each was fixed or dismissed"},
+		{ID: EventGitHubVulnerabilityUnreachable, Source: "github", Category: "vulnerability", Label: "Vulnerability Unreachable", Description: "Triage Factory no longer follows a vulnerable package: the org's GitHub base URL now names another host, or the org's credential can no longer read the repository's Dependabot alerts, or they were turned off. Says nothing about whether the alerts were fixed"},
 
 		// --- Jira ---
 		{ID: EventJiraIssueAssigned, Source: "jira", Category: "issue", Label: "Issue Assigned", Description: "Issue was assigned to you"},
